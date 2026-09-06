@@ -1,0 +1,41 @@
+# Windows Job Scraper S0.0 development/build dependency lock.
+# Fully resolved exact pins for dev.in plus production.in.
+# Platform markers capture PyInstaller/click Windows dependencies and the
+# PyInstaller macOS dependency without changing the Windows production target.
+
+altgraph==0.17.4
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+certifi==2026.5.20
+click==8.1.8
+colorama==0.4.6; sys_platform == "win32"
+fastapi==0.128.2
+greenlet==3.5.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.17
+iniconfig==2.3.0
+jinja2==3.1.6
+macholib==1.16.4; sys_platform == "darwin"
+markupsafe==3.0.3
+packaging==25.0
+pefile==2024.8.26; sys_platform == "win32"
+playwright==1.57.0
+pluggy==1.6.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+pyee==13.0.1
+pygments==2.20.0
+pyinstaller==6.22.2
+pyinstaller-hooks-contrib==2026.7
+pywin32==312; sys_platform == "win32"
+pywin32-ctypes==0.2.3; sys_platform == "win32"
+pytest==9.0.2
+setuptools==82.0.1
+starlette==0.50.0
+typing-extensions==4.16.0
+typing-inspection==0.4.2
+tzdata==2026.2
+uvicorn==0.48.0

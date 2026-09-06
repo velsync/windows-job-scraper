@@ -1,0 +1,26 @@
+# Windows Job Scraper S0.0 production dependency lock.
+# Fully resolved exact pins for the direct requirements in production.in.
+# Platform markers retain the Windows-only dependency while allowing offline
+# logic tests on non-Windows review hosts. Regenerate deliberately; do not float pins.
+
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+click==8.1.8
+colorama==0.4.6; sys_platform == "win32"
+fastapi==0.128.2
+greenlet==3.5.1
+h11==0.16.0
+idna==3.17
+jinja2==3.1.6
+markupsafe==3.0.3
+playwright==1.57.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+pyee==13.0.1
+pywin32==312; sys_platform == "win32"
+starlette==0.50.0
+typing-extensions==4.16.0
+typing-inspection==0.4.2
+tzdata==2026.2
+uvicorn==0.48.0

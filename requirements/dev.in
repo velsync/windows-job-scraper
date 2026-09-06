@@ -1,0 +1,4 @@
+-r production.in
+httpx==0.28.1
+pyinstaller==6.22.2
+pytest==9.0.2
