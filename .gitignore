@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build/package output
+build-out/
+dist/
+*.egg-info/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Local runtime/user data — never commit
+WindowsJobScraper/
+local-data/
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets/auth/session state
+*.secret
+*.token
+*.cookie
+storage-state*.json
+auth-state/
+
+# Acceptance/runtime artifacts (tracked directory may contain .gitkeep only)
+artifacts/slice0/*
+!artifacts/.gitkeep

@@ -1,0 +1,51 @@
+{
+  "version": "v0.3.1.3-final-corrected-modular",
+  "date": "2026-09-06",
+  "status": "NORMATIVE",
+  "supersedes_day_to_day_reference": "windows_job_scraper_v0312_final_corrected_modular_spec_set_2026-09-05.zip",
+  "integrates_corrective_review": "windows_job_scraper_v0312_review.md",
+  "normative_authority_entrypoint": "00_architecture_overview_and_authority.md",
+  "non_normative_change_ledger": "CORRECTIONS_v0313.md",
+  "files": [
+    {
+      "name": "00_architecture_overview_and_authority.md",
+      "lines": 343,
+      "characters": 14027
+    },
+    {
+      "name": "01_product_and_workflow.md",
+      "lines": 994,
+      "characters": 21336
+    },
+    {
+      "name": "02_acquisition_adapters_and_crawler.md",
+      "lines": 1423,
+      "characters": 31734
+    },
+    {
+      "name": "03_durable_runtime_and_persistence.md",
+      "lines": 1380,
+      "characters": 39048
+    },
+    {
+      "name": "04_security_and_authentication.md",
+      "lines": 413,
+      "characters": 16794
+    },
+    {
+      "name": "05_windows_packaging_and_operations.md",
+      "lines": 606,
+      "characters": 14842
+    },
+    {
+      "name": "06_verification_and_acceptance.md",
+      "lines": 621,
+      "characters": 23201
+    },
+    {
+      "name": "07_implementation_roadmap.md",
+      "lines": 314,
+      "characters": 10267
+    }
+  ]
+}
