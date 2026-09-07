@@ -325,7 +325,7 @@ def inbox_queue(db: Database, profile_id: str, *, limit: int = 100, now: str | N
         " AND s.disposition NOT IN ('DISMISSED','ARCHIVED')"
         " AND (s.disposition != 'SNOOZED' OR s.snoozed_until IS NULL OR s.snoozed_until <= ?)"
         " AND COALESCE(el.verdict, 'UNCLEAR') != 'INELIGIBLE'"
-        " AND COALESCE(sc.score, 0) >= ?"
-        " ORDER BY COALESCE(sc.score, 0) DESC LIMIT ?",
+        " AND sc.score IS NOT NULL AND sc.score >= ?"
+        " ORDER BY sc.score DESC LIMIT ?",
         (profile_id, profile_id, profile_id, now, min_score, limit),
     )

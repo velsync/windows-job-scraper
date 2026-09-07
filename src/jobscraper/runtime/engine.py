@@ -21,15 +21,12 @@ from jobscraper.acquisition import classifier as page_classifier
 from jobscraper.acquisition.adapters.base import scope_key_for_binding
 from jobscraper.acquisition.contracts import (
     AdapterTask,
-    AdapterTaskKind,
     CrawlCursor,
     ExecutionClass,
-    FailureKind,
     PageClass,
     ParseOutcomeKind,
     REQUEST_TYPE_TO_TASK,
     RequestType,
-    Strategy,
     ValidatedResultEnvelope,
 )
 from jobscraper.acquisition.executors.http import HttpExecutor
@@ -98,7 +95,6 @@ class RunEngine:
         source_ids: list[str],
         run_kind: str = "COLLECT",
         query_id: str | None = None,
-        only_viable: bool = True,
     ) -> str:
         """Create a run with immutable RunSourcePlans (pinned fallback order)."""
         run_id = "run-" + secrets.token_hex(10)
@@ -124,6 +120,10 @@ class RunEngine:
             for source_id, b in plans:
                 plan_id = "rsp-" + secrets.token_hex(10)
                 config_snapshot = json.loads(b["config_json"])
+                # A binding without an explicit fallback group forms its own
+                # singleton group: distinct sources must never share a group
+                # (a satisfied group suppresses only its own fallback ladder).
+                group = b["fallback_group"] or f"grp-{source_id}"
                 crawl_policy = {
                     "max_requests_per_plan": self.max_requests_per_plan,
                     "max_pages": 100,
@@ -154,7 +154,7 @@ class RunEngine:
                     " permission_profile_revision, profile_revision, rules_revision, run_config_hash,"
                     " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (plan_id, run_id, source_id, self._source_revision_id(source_id), "{}",
-                     query_id, None, b["fallback_group"], b["fallback_rank"], b["id"],
+                     query_id, None, group, b["fallback_rank"], b["id"],
                      b["binding_revision_id"], b["binding_revision"], b["config_json"],
                      b["adapter_id"], b["adapter_version"], "1", b["strategy"], b["execution_class"],
                      self._cursor_schema(b), json.dumps(crawl_policy, sort_keys=True), "{}",
@@ -277,11 +277,12 @@ class RunEngine:
             budget -= 1
             claim = queue_claims.claim_next_request(
                 self.db, worker_id="service", run_id=run_id,
+                run_source_plan_id=plan["id"],
                 request_types=("LIST_FETCH", "DETAIL_FETCH", "SOURCE_CRAWL"),
             )
             if claim is None:
                 break
-            outcomes.append(self._execute_request(claim, plan, coverage_id))
+            outcomes.append(self._execute_request(run_id, claim, plan, coverage_id))
         final = self._plan_outcome(run_id, plan, coverage_id, outcomes)
         self._set_group_status(plan["id"], final, {"outcomes": outcomes[:20]})
         return final
@@ -300,7 +301,7 @@ class RunEngine:
         return GROUP_POLICY_DENIED
 
     # -------------------------------------------------------- one request
-    def _execute_request(self, claim: queue_claims.Claim, plan, coverage_id: str) -> str:
+    def _execute_request(self, run_id: str, claim: queue_claims.Claim, plan, coverage_id: str) -> str:
         adapter = self._build_adapter(plan)
         task = AdapterTask(
             kind=REQUEST_TYPE_TO_TASK[RequestType(claim.request_type)],
@@ -310,7 +311,7 @@ class RunEngine:
         from jobscraper.acquisition.contracts import PlanningContext
 
         ctx = PlanningContext(
-            run_id=claim.run_id if hasattr(claim, "run_id") else self._run_id_of_request(claim.request_id),
+            run_id=run_id,
             run_source_plan_id=plan["id"],
             source_snapshot_ref=plan["source_revision_id"],
             binding_revision_id=plan["binding_revision_id"],
@@ -442,10 +443,10 @@ class RunEngine:
             idempotency_namespace=claim.request_id,
         )
         outcome = adapter.parse(task, validated, parse_ctx)
-        return self._commit_outcome(claim, plan, coverage_id, result.envelope, outcome, validated)
+        return self._commit_outcome(run_id, claim, plan, coverage_id, result.envelope, outcome, validated)
 
     # -------------------------------------------------------- commit paths
-    def _commit_outcome(self, claim, plan, coverage_id, envelope, outcome, validated) -> str:
+    def _commit_outcome(self, run_id: str, claim, plan, coverage_id, envelope, outcome, validated) -> str:
         """Fenced terminal commit of a parsed outcome (RUN-08)."""
         now = utc_now_s()
         parse_attempt_id = "pa-" + secrets.token_hex(10)
@@ -473,7 +474,7 @@ class RunEngine:
                     " page_cursor_json, enumeration_scope_key, source_rank_or_order, observed_at,"
                     " parse_evidence_ref, observation_unique_key, content_json)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (obs_id, self._run_id_of_request(claim.request_id), claim.request_id,
+                    (obs_id, run_id, claim.request_id,
                      claim.attempt_id, plan["source_id"], plan["binding_id"], plan["adapter_id"],
                      plan["adapter_version"], plan["strategy"], plan["execution_class"], None,
                      draft.source_job_id, draft.raw_url, draft.canonical_url_candidate,
@@ -487,7 +488,7 @@ class RunEngine:
                 # Atomic downstream processing obligation (cancellation-safe).
                 obl.create_obligation(
                     tx, kind="PROCESS_OBSERVATION", observation_id=obs_id,
-                    run_id=self._run_id_of_request(claim.request_id), request_id=claim.request_id,
+                    run_id=run_id, request_id=claim.request_id,
                     payload={"plan_id": plan["id"]}, now=now,
                 )
                 # Coverage membership.
@@ -511,7 +512,7 @@ class RunEngine:
             for child in outcome.discovered_tasks:
                 queue_claims.enqueue_request_tx(
                     tx,
-                    run_id=self._run_id_of_request(claim.request_id),
+                    run_id=run_id,
                     run_source_plan_id=plan["id"],
                     source_id=plan["source_id"],
                     binding_id=plan["binding_id"],
@@ -937,10 +938,6 @@ class RunEngine:
                 (status, json.dumps(detail, sort_keys=True), plan_id),
             )
 
-    def _run_id_of_request(self, request_id: str) -> str:
-        row = self.db.query_one("SELECT run_id FROM scrape_requests WHERE id=?", (request_id,))
-        return (row and row["run_id"]) or "unknown"
-
     def _run_counts(self, run_id: str) -> dict:
         discovered = self.db.query_one(
             "SELECT COUNT(DISTINCT source_id || ':' || ifnull(source_job_id,'')) c FROM job_observations WHERE run_id=?",
@@ -970,18 +967,6 @@ class RunEngine:
             coverage_applied=coverage_applied,
             processing_pending=pending,
         )
-
-
-class _TxAdapter:
-    """Legacy helper retained for callers that need Database-like routing."""
-
-    def __init__(self, db: Database, tx) -> None:
-        self._db = db
-        self._tx = tx
-        self.conn = tx
-
-    def __getattr__(self, name):
-        return getattr(self._db, name)
 
 
 def _has_observations(db: Database, plan_id: str) -> bool:

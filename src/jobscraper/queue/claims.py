@@ -157,6 +157,7 @@ def claim_next_request(
     *,
     worker_id: str,
     run_id: str | None = None,
+    run_source_plan_id: str | None = None,
     execution_classes: tuple[str, ...] = ("HTTP",),
     request_types: tuple[str, ...] | None = None,
     lease_window_s: int = 120,
@@ -167,7 +168,9 @@ def claim_next_request(
     Only one worker can receive the claim: the claim runs inside
     ``BEGIN IMMEDIATE`` and stamps a fresh unique attempt token. Expired
     RUNNING leases are reclaimed first — an expired lease is already lost
-    ownership even if no reclaimer observed it yet.
+    ownership even if no reclaimer observed it yet. ``run_source_plan_id``
+    restricts the claim to one plan's requests (plans execute sequentially;
+    a plan must never consume another plan's request).
     """
     now = now or utc_now_s()
     reclaim_expired_requests(db, now=now)
@@ -184,6 +187,9 @@ def claim_next_request(
     if run_id:
         sql += " AND run_id = ?"
         params.append(run_id)
+    if run_source_plan_id:
+        sql += " AND run_source_plan_id = ?"
+        params.append(run_source_plan_id)
     sql += " AND run_id NOT IN (SELECT id FROM scrape_runs WHERE cancel_requested_at IS NOT NULL)"
     sql += " ORDER BY priority ASC, created_at ASC LIMIT 1"
 

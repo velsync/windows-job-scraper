@@ -135,7 +135,7 @@ def resolve_observation(
         reuse = detect_source_id_reuse(db, source_id=source_id, source_job_id=source_job_id, normalized=normalized)
         if reuse and reuse.get("kind") == "source_id_reuse":
             # SPLIT: new canonical identity under a new generation.
-            job_id = _create_job(db, normalized, company_id, now)
+            job_id = _create_job(db, normalized, company_id, now, evidence_at=_observed_at(observation_row, now))
             return ResolutionDecision("SPLIT", job_id, "stage1_reuse_guard", reuse)
         row = db.query_one(
             "SELECT job_id, source_identity_generation FROM job_sources"
@@ -175,8 +175,18 @@ def resolve_observation(
                     {"similar_to": cand["id"], "title": cand["title"]},
                 )
 
-    job_id = _create_job(db, normalized, company_id, now)
+    job_id = _create_job(db, normalized, company_id, now, evidence_at=_observed_at(observation_row, now))
     return ResolutionDecision("CREATE", job_id, "new_identity", {})
+
+
+def _observed_at(observation_row, default: str) -> str:
+    try:
+        keys = observation_row.keys()
+    except AttributeError:  # pragma: no cover - defensive
+        return default
+    if "observed_at" in keys:
+        return observation_row["observed_at"] or default
+    return default
 
 
 def _days_ago(now: str, days: int) -> str:
@@ -185,8 +195,11 @@ def _days_ago(now: str, days: int) -> str:
     return add_seconds(now, -days * 86400)
 
 
-def _create_job(db: Database, normalized: dict, company_id: str | None, now: str) -> str:
+def _create_job(db: Database, normalized: dict, company_id: str | None, now: str, *, evidence_at: str | None = None) -> str:
     job_id = _new_job_id()
+    # The projection's evidence time: when the creating observation was made
+    # (RUN-21 ordering anchor for the canonical projection).
+    projection_evidence_at = evidence_at or now
     with immediate_transaction(db.conn) as tx:
         tx.execute(
             "INSERT INTO jobs(id, company_id, title, normalized_title, description_md,"
@@ -194,8 +207,8 @@ def _create_job(db: Database, normalized: dict, company_id: str | None, now: str
             " experience_level, remote_mode, remote_worldwide, salary_original_text, salary_min,"
             " salary_max, salary_currency, salary_period, salary_annual_min_ref, salary_annual_max_ref,"
             " salary_ref_currency, salary_confidence, posted_at, discovered_at, first_seen_at,"
-            " last_seen_at, listing_status, fingerprint, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " last_seen_at, listing_status, fingerprint, projection_evidence_at, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 job_id, company_id, normalized.get("title") or "Untitled",
                 (normalized.get("title") or "untitled").lower(),
@@ -208,7 +221,7 @@ def _create_job(db: Database, normalized: dict, company_id: str | None, now: str
                 normalized.get("salary_period"), normalized.get("salary_annual_min"),
                 normalized.get("salary_annual_max"), "USD", normalized.get("salary_confidence"),
                 normalized.get("posted_at"), now, now, now, "ACTIVE", normalized.get("fingerprint"),
-                now, now,
+                projection_evidence_at, now, now,
             ),
         )
     return job_id

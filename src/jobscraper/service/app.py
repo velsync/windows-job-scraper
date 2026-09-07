@@ -369,6 +369,8 @@ def create_service_app(
     app.state.service = state
     app.add_middleware(ServiceSecurityMiddleware, state=state)
     app.mount("/static", StaticFiles(directory=str(_WEB_DIR / "static")), name="static")
+    # Server shutdown drains the run executor and closes the run connection.
+    app.router.add_event_handler("shutdown", state.shutdown)
 
     # ------------------------------------------------------------- deps
     def require_session(request: Request):
@@ -453,7 +455,7 @@ def create_service_app(
             "dispositions": DISPOSITIONS,
         }
 
-    @app.get("/", response_class=None)
+    @app.get("/")
     async def dashboard(request: Request, profile_id: str | None = None, session=Depends(require_session)):
         from jobscraper.workflow.inbox import inbox_queue
 

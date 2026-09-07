@@ -35,23 +35,50 @@ def create_obligation(
     return obligation_id
 
 
-def claim_pending(db: Database, *, limit: int = 50, now: str | None = None):
-    """Claim pending obligations (service is the single processor)."""
+def claim_pending(
+    db: Database,
+    *,
+    limit: int = 50,
+    now: str | None = None,
+    lease_window_s: int = 300,
+    max_attempts: int = 5,
+):
+    """Claim pending obligations (service is the single processor).
+
+    Crash-safety: RUNNING obligations whose lease expired are reclaimed to
+    PENDING first (a crashed drain leaves no live claimer). Poison bound:
+    obligations exceeding ``max_attempts`` attempts become CANCELLED
+    (terminal) — the accepted observation evidence is never deleted.
+    """
     import json
+
+    from jobscraper.timeutil import add_seconds
 
     now = now or utc_now_s()
     claimed = []
     with immediate_transaction(db.conn) as tx:
+        tx.execute(
+            "UPDATE processing_obligations SET status='PENDING', claim_token=NULL"
+            " WHERE status='RUNNING' AND (lease_until IS NULL OR lease_until <= ?)",
+            (now,),
+        )
+        tx.execute(
+            "UPDATE processing_obligations SET status='CANCELLED', lease_until=NULL"
+            " WHERE status='PENDING' AND attempt_count >= ?",
+            (max_attempts,),
+        )
         rows = tx.execute(
             "SELECT * FROM processing_obligations WHERE status='PENDING' ORDER BY created_at LIMIT ?",
             (limit,),
         ).fetchall()
+        lease_until = add_seconds(now, lease_window_s)
         for row in rows:
             token = secrets.token_hex(8)
             tx.execute(
-                "UPDATE processing_obligations SET status='RUNNING', claim_token=?, attempt_count=attempt_count+1"
+                "UPDATE processing_obligations SET status='RUNNING', claim_token=?,"
+                " attempt_count=attempt_count+1, lease_until=?"
                 " WHERE id=? AND status='PENDING'",
-                (token, row["id"]),
+                (token, lease_until, row["id"]),
             )
             data = dict(row)
             data["claim_token"] = token
@@ -64,7 +91,7 @@ def satisfy(db: Database, obligation_id: str, *, claim_token: str, now: str | No
     now = now or utc_now_s()
     with immediate_transaction(db.conn) as tx:
         cur = tx.execute(
-            "UPDATE processing_obligations SET status='SATISFIED', satisfied_at=?"
+            "UPDATE processing_obligations SET status='SATISFIED', satisfied_at=?, lease_until=NULL"
             " WHERE id=? AND status='RUNNING' AND claim_token=?",
             (now, obligation_id, claim_token),
         )
@@ -72,11 +99,11 @@ def satisfy(db: Database, obligation_id: str, *, claim_token: str, now: str | No
 
 
 def fail(db: Database, obligation_id: str, *, claim_token: str, now: str | None = None) -> bool:
-    """Return a failed obligation to PENDING for retry (bounded by caller)."""
+    """Return a failed obligation to PENDING for retry (bounded by claim_pending)."""
     now = now or utc_now_s()
     with immediate_transaction(db.conn) as tx:
         cur = tx.execute(
-            "UPDATE processing_obligations SET status='PENDING', claim_token=NULL"
+            "UPDATE processing_obligations SET status='PENDING', claim_token=NULL, lease_until=NULL"
             " WHERE id=? AND status='RUNNING' AND claim_token=?",
             (obligation_id, claim_token),
         )

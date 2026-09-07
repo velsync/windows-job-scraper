@@ -203,19 +203,38 @@ class ProcessingPipeline:
         job = self.db.query_one("SELECT * FROM jobs WHERE id=?", (job_id,))
         if job is None:
             return
-        new_rev = self._content_revision(normalized)
-        if job["content_revision"] == new_rev and job["fingerprint"] == normalized["fingerprint"]:
-            # Unchanged content: advance verification only (no revision bump).
+        observed_at = observation["observed_at"]
+        if (job["projection_evidence_at"] or "") > observed_at:
+            # RUN-21: an older observation completing later must not regress a
+            # newer projection (evidence-time ordering, not hash ordering).
             with immediate_transaction(self.db.conn) as tx:
                 tx.execute(
-                    "UPDATE jobs SET last_verified_at=?, updated_at=? WHERE id=?",
-                    (now, now, job_id),
+                    "UPDATE jobs SET last_verified_at=MAX(COALESCE(last_verified_at,''), ?),"
+                    " updated_at=? WHERE id=?",
+                    (observed_at, now, job_id),
                 )
             return
-        if job["content_revision"] > new_rev and job["first_seen_at"] < observation["observed_at"]:
-            # Older content cannot regress a newer projection (RUN-21).
+        new_rev = self._content_revision(normalized)
+        if job["fingerprint"] == normalized["fingerprint"]:
+            # Same core content (fingerprint covers title/company/description):
+            # advance verification and refresh the columns the fingerprint does
+            # NOT cover — salary, locations, facts — including the first
+            # processing right after job creation. No revision bump.
             with immediate_transaction(self.db.conn) as tx:
-                tx.execute("UPDATE jobs SET last_verified_at=? WHERE id=?", (now, job_id))
+                tx.execute(
+                    "UPDATE jobs SET salary_original_text=?, salary_min=?, salary_max=?,"
+                    " salary_currency=?, salary_period=?, salary_annual_min_ref=?,"
+                    " salary_annual_max_ref=?, salary_confidence=?,"
+                    " last_verified_at=MAX(COALESCE(last_verified_at,''), ?), updated_at=?"
+                    " WHERE id=?",
+                    (normalized["salary_original_text"], normalized["salary_min"],
+                     normalized["salary_max"], normalized["salary_currency"],
+                     normalized["salary_period"], normalized["salary_annual_min"],
+                     normalized["salary_annual_max"], normalized["salary_confidence"],
+                     observed_at, now, job_id),
+                )
+                self._refresh_derived_detail(tx, job_id, normalized, now)
+            self._update_fts(job_id, normalized)
             return
         old = dict(job)
         with immediate_transaction(self.db.conn) as tx:
@@ -225,37 +244,17 @@ class ProcessingPipeline:
                 " salary_min=?, salary_max=?, salary_currency=?, salary_period=?,"
                 " salary_annual_min_ref=?, salary_annual_max_ref=?, salary_confidence=?,"
                 " posted_at=COALESCE(?, posted_at), last_changed_at=?, content_revision=?,"
-                " fingerprint=?, updated_at=? WHERE id=?",
+                " fingerprint=?, projection_evidence_at=?,"
+                " last_verified_at=MAX(COALESCE(last_verified_at,''), ?), updated_at=? WHERE id=?",
                 (normalized["title"], normalized["description_md"], normalized["description_text"],
                  normalized["description_lang"], normalized["description_hash"],
                  normalized["employment_type"], 1 if normalized["remote_worldwide"] else 0,
                  normalized["salary_original_text"], normalized["salary_min"], normalized["salary_max"],
                  normalized["salary_currency"], normalized["salary_period"], normalized["salary_annual_min"],
                  normalized["salary_annual_max"], normalized["salary_confidence"], normalized["posted_at"],
-                 now, new_rev, normalized["fingerprint"], now, job_id),
+                 now, new_rev, normalized["fingerprint"], observed_at, observed_at, now, job_id),
             )
-            tx.execute("DELETE FROM job_locations WHERE job_id=?", (job_id,))
-            for loc in normalized["locations"]:
-                tx.execute(
-                    "INSERT INTO job_locations(id, job_id, raw_text, country, region, city, remote,"
-                    " confidence) VALUES (?,?,?,?,?,?,?,?)",
-                    ("jl-" + secrets.token_hex(8), job_id, loc.get("raw_text"), loc.get("country"),
-                     loc.get("region"), loc.get("city"), 1 if loc.get("remote") else 0,
-                     loc.get("confidence", 0.4)),
-                )
-            tx.execute("DELETE FROM job_facts WHERE job_id=?", (job_id,))
-            for fact in facts_mod.extract_facts(
-                normalized["title"], normalized["description_text"] or "",
-                employment_hint=normalized.get("employment_type"),
-            ):
-                tx.execute(
-                    "INSERT INTO job_facts(id, job_id, fact_type, value_json, confidence,"
-                    " evidence_text, evidence_start, evidence_end, rule_id, rule_version, observed_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    ("jf-" + secrets.token_hex(8), job_id, fact.fact_type, fact.value_json if hasattr(fact, "value_json") else json.dumps(fact.value),
-                     fact.confidence, fact.evidence_text, fact.evidence_start, fact.evidence_end,
-                     fact.rule_id, fact.rule_version, now),
-                )
+            self._refresh_derived_detail(tx, job_id, normalized, now)
         change_class = self._change_class(old, normalized)
         if change_class != "UNCHANGED":
             with immediate_transaction(self.db.conn) as tx:
@@ -267,6 +266,35 @@ class ProcessingPipeline:
                      observation["id"], observation["source_id"]),
                 )
         self._update_fts(job_id, normalized)
+
+    def _refresh_derived_detail(self, tx, job_id: str, normalized: dict, now: str) -> None:
+        """Replace locations and facts from this observation's normalized data.
+
+        Runs inside the caller's transaction; safe to repeat (idempotent).
+        """
+        tx.execute("DELETE FROM job_locations WHERE job_id=?", (job_id,))
+        for loc in normalized["locations"]:
+            tx.execute(
+                "INSERT INTO job_locations(id, job_id, raw_text, country, region, city, remote,"
+                " confidence) VALUES (?,?,?,?,?,?,?,?)",
+                ("jl-" + secrets.token_hex(8), job_id, loc.get("raw_text"), loc.get("country"),
+                 loc.get("region"), loc.get("city"), 1 if loc.get("remote") else 0,
+                 loc.get("confidence", 0.4)),
+            )
+        tx.execute("DELETE FROM job_facts WHERE job_id=?", (job_id,))
+        for fact in facts_mod.extract_facts(
+            normalized["title"], normalized["description_text"] or "",
+            employment_hint=normalized.get("employment_type"),
+        ):
+            tx.execute(
+                "INSERT INTO job_facts(id, job_id, fact_type, value_json, confidence,"
+                " evidence_text, evidence_start, evidence_end, rule_id, rule_version, observed_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                ("jf-" + secrets.token_hex(8), job_id, fact.fact_type,
+                 fact.value_json if hasattr(fact, "value_json") else json.dumps(fact.value),
+                 fact.confidence, fact.evidence_text, fact.evidence_start, fact.evidence_end,
+                 fact.rule_id, fact.rule_version, now),
+            )
 
     def _change_class(self, old: dict, new: dict) -> str:
         if (old["salary_min"] or 0) != (new["salary_min"] or 0) or (old["salary_max"] or 0) != (new["salary_max"] or 0):
@@ -357,9 +385,13 @@ class ProcessingPipeline:
                     " verdict=excluded.verdict, confidence=excluded.confidence,"
                     " reason_codes_json=excluded.reason_codes_json, evidence_json=excluded.evidence_json,"
                     " evaluated_at=excluded.evaluated_at"
-                    " WHERE excluded.job_content_revision >= job_eligibility.job_content_revision",
+                    # Only an evaluation of the job's CURRENT projection content
+                    # replaces the stored evaluation (content revisions are
+                    # content hashes, not an ordering; recency is evidence-time).
+                    " WHERE excluded.job_content_revision ="
+                    " (SELECT content_revision FROM jobs WHERE id=job_eligibility.job_id)",
                     (job_id, profile["id"], snapshot.get("_revision_id"), "rules-v1",
-                     job["content_revision"], NORMALIZATION_VERSION, eligibility.verdict and "eligibility-v1",
+                     job["content_revision"], NORMALIZATION_VERSION, "eligibility-v1",
                      eligibility.verdict, eligibility.confidence,
                      json.dumps(eligibility.reason_codes), json.dumps(eligibility.evidence, sort_keys=True),
                      "eligibility-rules-v1", now),
@@ -372,7 +404,8 @@ class ProcessingPipeline:
                     " profile_revision_id=excluded.profile_revision_id,"
                     " job_content_revision=excluded.job_content_revision, score=excluded.score,"
                     " breakdown_json=excluded.breakdown_json, scored_at=excluded.scored_at"
-                    " WHERE excluded.job_content_revision >= job_scores.job_content_revision",
+                    " WHERE excluded.job_content_revision ="
+                    " (SELECT content_revision FROM jobs WHERE id=job_scores.job_id)",
                     (job_id, profile["id"], snapshot.get("_revision_id"), "rules-v1",
                      job["content_revision"], NORMALIZATION_VERSION, "scorer-v1", score,
                      json.dumps(breakdown, sort_keys=True), "scoring-rules-v1", now),

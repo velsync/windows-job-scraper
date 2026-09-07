@@ -106,6 +106,7 @@ def _extract(recipe: ExtractionRecipe, html: str, base_url: str) -> ExtractionRe
         cards = _find_cards(root, recipe)
         for card in cards:
             record: dict = {}
+            card_missing: list[str] = []  # required fields missing on THIS card
             for name, spec in recipe.fields.items():
                 value = None
                 for locator in spec.locators:
@@ -119,13 +120,16 @@ def _extract(recipe: ExtractionRecipe, html: str, base_url: str) -> ExtractionRe
                         {"field": name, "locator_kind": locator.kind, "hit": False}
                     )
                 if value is None and spec.required:
+                    card_missing.append(name)
                     result.missing_required.append(
                         {"field": name, "card": card.text()[:120]}
                     )
                 if value is not None:
                     record[name] = value
-            if record and not any(m["field"] in record for m in result.missing_required):
-                record.setdefault("job_url", htmlutil.absolute_url(base_url, "#"))
+            # A card missing its own required fields is dropped with evidence;
+            # other cards are unaffected. Fields absent from the recipe (e.g.
+            # no job_url locator) stay absent — no invented fallback URLs.
+            if record and not card_missing:
                 result.records.append(record)
     elif recipe.mode in ("EMBEDDED_JSON", "API_JSON"):
         try:

@@ -242,8 +242,10 @@ def derive_listing_status(db: Database, job_id: str, *, now: str | None = None) 
 
 
 def _is_trusted(presence_row) -> bool:
-    # Employer ATS/API presences rank higher than aggregator presences.
-    return (presence_row["source_rank"] or 100) <= 100
+    # Employer ATS/API presences (the pipeline ranks provider-native feeds at
+    # 10) are trusted; aggregator/secondary presences (50+) are not — an
+    # aggregator's CLOSED must not close a job its employer still lists.
+    return (presence_row["source_rank"] or 100) < 50
 
 
 def _days_ago(now: str, days: int) -> str:

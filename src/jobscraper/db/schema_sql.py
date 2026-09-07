@@ -1163,6 +1163,14 @@ CREATE INDEX idx_jobs_posted ON jobs(posted_at);
     return sql
 
 
+# --------------------------------------------- v13 canonical projection evidence
+@_step(13, "jobs_projection_evidence_at")
+def _(sql: str = """
+ALTER TABLE jobs ADD COLUMN projection_evidence_at TEXT;
+""") -> None:
+    return sql
+
+
 def _freeze() -> None:
     for version in sorted(_STEP):
         name, sql = _STEP[version]
