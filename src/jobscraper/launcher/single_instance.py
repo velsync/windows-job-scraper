@@ -75,7 +75,10 @@ def acquire_single_instance(runtime_dir: Path) -> SingleInstanceOwnership:
     runtime_dir = Path(runtime_dir)
     runtime_dir.mkdir(parents=True, exist_ok=True)
     if sys.platform == "win32":  # pragma: no cover - Windows native
-        handle = win32event.CreateMutex(None, False, MUTEX_NAME)
+        # Request initial ownership when creating the mutex. The previous
+        # implementation passed False, so it held a kernel handle without
+        # owning the mutex and ReleaseMutex necessarily failed on shutdown.
+        handle = win32event.CreateMutex(None, True, MUTEX_NAME)
         if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
             handle.Close()
             return SingleInstanceOwnership(already_running=True)
