@@ -62,6 +62,7 @@ def harden_auth_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     if W32:  # pragma: no cover - Windows native (CI + native harness)
         import win32con
+        import win32file
         import win32security
 
         user_sid = _current_user_sid()
@@ -73,7 +74,7 @@ def harden_auth_directory(path: Path) -> None:
             win32security.ConvertStringSidToSid(SID_ADMINISTRATORS),
         ):
             dacl.AddAccessAllowedAceEx(
-                win32security.ACL_REVISION_DS, inherit, win32con.FILE_ALL_ACCESS, sid
+                win32security.ACL_REVISION_DS, inherit, win32file.FILE_ALL_ACCESS, sid
             )
         # PROTECTED_DACL disables inheritance from the parent directory.
         win32security.SetNamedSecurityInfo(
@@ -148,8 +149,9 @@ def inspect_auth_directory_acl(path: Path) -> dict[str, object]:
         if dacl is not None:
             for i in range(dacl.GetAceCount()):
                 ace = dacl.GetAce(i)
-                # pywin32: (ace_type, ace_flags, mask, sid) for allowed ACEs.
-                ace_type, _flags, mask, sid = ace[0], ace[1], ace[2], ace[-1]
+                # pywin32 simple ACE shape: ((ace_type, ace_flags), mask, sid).
+                header, mask, sid = ace
+                ace_type, _flags = header
                 if ace_type != 0:  # 0 = ACCESS_ALLOWED_ACE_TYPE
                     # Deny ACEs and others are recorded but not authority.
                     aces.append(
