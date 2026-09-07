@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "arena/**"
+      - "repair/**"
+  pull_request:
+    branches:
+      - main
+      - "repair/**"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Automated test gate (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12"]
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create clean environment
+        run: python -m venv .ci-venv
+
+      - name: Install exact development lock
+        run: .ci-venv/Scripts/python -m pip install -r requirements/dev.lock.txt
+        if: runner.os == 'Windows'
+        shell: pwsh
+
+      - name: Install exact development lock
+        run: .ci-venv/bin/python -m pip install -r requirements/dev.lock.txt
+        if: runner.os != 'Windows'
+
+      - name: Install package without dependency re-resolution
+        run: .ci-venv/Scripts/python -m pip install --no-deps .
+        if: runner.os == 'Windows'
+        shell: pwsh
+
+      - name: Install package without dependency re-resolution
+        run: .ci-venv/bin/python -m pip install --no-deps .
+        if: runner.os != 'Windows'
+
+      - name: Import package
+        run: .ci-venv/Scripts/python -c "import jobscraper; print(jobscraper.APP_NAME, jobscraper.APP_VERSION, jobscraper.SCHEMA_VERSION)"
+        if: runner.os == 'Windows'
+        shell: pwsh
+
+      - name: Import package
+        run: .ci-venv/bin/python -c "import jobscraper; print(jobscraper.APP_NAME, jobscraper.APP_VERSION, jobscraper.SCHEMA_VERSION)"
+        if: runner.os != 'Windows'
+
+      - name: Run automated test suite
+        run: .ci-venv/Scripts/python -m pytest tests -q
+        if: runner.os == 'Windows'
+        shell: pwsh
+
+      - name: Run automated test suite
+        run: .ci-venv/bin/python -m pytest tests -q
+        if: runner.os != 'Windows'
+
+      - name: Check installed dependency consistency
+        run: .ci-venv/Scripts/python -m pip check
+        if: runner.os == 'Windows'
+        shell: pwsh
+
+      - name: Check installed dependency consistency
+        run: .ci-venv/bin/python -m pip check
+        if: runner.os != 'Windows'
+
+      - name: Prove pywin32 resolves from the committed production lock (Windows)
+        run: |
+          .ci-venv/Scripts/python -c "import win32crypt, win32event, win32security, win32file, win32process; print('pywin32 windows primitives importable')"
+          .ci-venv/Scripts/python -m pip check
+        if: runner.os == 'Windows'
+        shell: pwsh
