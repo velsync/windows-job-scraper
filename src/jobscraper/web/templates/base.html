@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Job Scraper{% endblock %}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+<nav class="topnav">
+  <span class="brand">Job Scraper</span>
+  <a href="/">Inbox</a>
+  <a href="/applications{% if profile_id %}?profile_id={{ profile_id }}{% endif %}">Applications</a>
+  <a href="/profiles">Profiles</a>
+  {% if profiles %}
+  <span class="profile-picker">
+    <label for="profile-select">Profile</label>
+    <select id="profile-select" data-profile-nav data-base-url="{{ request.url.path }}">
+      {% for p in profiles %}
+      <option value="{{ p.id }}" {% if p.id == profile_id %}selected{% endif %}>{{ p.name }}</option>
+      {% endfor %}
+    </select>
+  </span>
+  {% endif %}
+</nav>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}{{ job.title }} — Job Scraper{% endblock %}
+{% block content %}
+<h1>{{ job.title }}</h1>
+<p class="subtitle">
+  {% if company %}{{ company.name }} · {% endif %}
+  <span class="chip">{{ job.listing_status }}</span>
+  {% if eligibility %}<span class="chip chip-{{ eligibility.verdict }}">{{ eligibility.verdict }}</span>{% endif %}
+  {% if score %}<span class="chip">score {{ score.score }}</span>{% endif %}
+</p>
+
+{% if job_state %}
+<p>Disposition: <strong>{{ job_state.disposition }}</strong>
+{% if job_state.disposition == "SNOOZED" %} (until {{ job_state.snoozed_until }}){% endif %}
+</p>
+{% endif %}
+
+{% if profile_id %}
+<div class="toolbar">
+  <button type="button" data-api-action data-reload
+          data-url="/api/jobs/{{ job.id }}/disposition"
+          data-body='{"profile_id": "{{ profile_id }}", "disposition": "SHORTLISTED", "expected_row_revision": {{ job_state.row_revision if job_state else 1 }}}'>Shortlist</button>
+  <button type="button" data-api-action data-reload
+          data-url="/api/jobs/{{ job.id }}/disposition"
+          data-body='{"profile_id": "{{ profile_id }}", "disposition": "DISMISSED", "expected_row_revision": {{ job_state.row_revision if job_state else 1 }}}'>Dismiss</button>
+  {% set apply_url = null %}
+  {% for p in provenance %}{% if p.application_url and not apply_url %}{% set apply_url = p.application_url %}{% endif %}{% endfor %}
+  <button type="button" data-api-action data-reload
+          data-url="/api/jobs/{{ job.id }}/applications"
+          data-body='{"profile_id": "{{ profile_id }}"{% if apply_url %}, "applied_via_url": "{{ apply_url }}"{% endif %}}'>Track application</button>
+  {% if apply_url %}
+  <a class="button-link" href="{{ apply_url }}" target="_blank" rel="noopener noreferrer">Open application page ↗</a>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="grid">
+  <section>
+    <h2>Description</h2>
+    <pre class="description">{{ job.description_text or job.description_md or "No description captured." }}</pre>
+  </section>
+
+  <aside>
+    <h2>Details</h2>
+    <dl>
+      <dt>Locations</dt>
+      <dd>
+        {% if locations %}
+        <ul>
+          {% for loc in locations %}
+          <li>{{ loc.raw_text }}{% if loc.country %} ({{ loc.country }}){% endif %}{% if loc.remote %} — remote{% endif %}</li>
+          {% endfor %}
+        </ul>
+        {% else %}—{% endif %}
+      </dd>
+      {% if job.salary_original_text %}
+      <dt>Salary (as posted)</dt>
+      <dd>{{ job.salary_original_text }}
+        {% if job.salary_annual_min_ref %}≈ {{ "%.0f"|format(job.salary_annual_min_ref) }}–{{ "%.0f"|format(job.salary_annual_max_ref or job.salary_annual_min_ref) }} USD/yr (reference){% endif %}
+      </dd>
+      {% else %}
+      <dt>Salary</dt><dd>Not stated</dd>
+      {% endif %}
+      {% if job.employment_type %}<dt>Employment</dt><dd>{{ job.employment_type }}</dd>{% endif %}
+      {% if job.posted_at %}<dt>Posted</dt><dd>{{ job.posted_at }}</dd>{% endif %}
+      <dt>First seen</dt><dd>{{ job.first_seen_at }}</dd>
+      <dt>Last changed</dt><dd>{{ job.last_changed_at or "—" }}</dd>
+    </dl>
+
+    {% if facts %}
+    <h2>Facts (evidence-backed)</h2>
+    <ul class="facts">
+      {% for fact in facts %}
+      <li><code>{{ fact.fact_type }}</code> {{ fact.value_json }}
+        {% if fact.evidence_text %}<span class="evidence">“{{ fact.evidence_text[:160] }}”</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if score %}
+    <h2>Score breakdown</h2>
+    <table class="breakdown">
+      <thead><tr><th>Rule</th><th>Points</th><th>Evidence</th></tr></thead>
+      <tbody>
+      {% for c in score.breakdown %}
+      <tr><td>{{ c.rule }}</td><td class="num">{{ c.points }}</td><td>{{ c.evidence }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+    {% if eligibility %}
+    <h2>Eligibility</h2>
+    <p>{{ eligibility.verdict }} — {{ eligibility.reasons|join(", ") }}</p>
+    {% endif %}
+  </aside>
+</div>
+
+<h2>Provenance</h2>
+<table class="provenance">
+  <thead>
+    <tr><th>Source</th><th>Native ID</th><th>Presence</th><th>First seen</th><th>Last seen</th><th>Links</th></tr>
+  </thead>
+  <tbody>
+  {% for p in provenance %}
+  <tr>
+    <td>{{ p.source_name }}</td>
+    <td><code>{{ p.source_job_id or "—" }}</code></td>
+    <td>{{ p.presence_state }}</td>
+    <td>{{ p.first_seen_at }}</td>
+    <td>{{ p.last_seen_at }}</td>
+    <td>
+      {% if p.application_url %}<a href="{{ p.application_url }}" target="_blank" rel="noopener noreferrer">apply ↗</a> {% endif %}
+      {% if p.canonical_url %}<a href="{{ p.canonical_url }}" target="_blank" rel="noopener noreferrer">canonical ↗</a> {% endif %}
+      {% if p.discovery_url %}<a href="{{ p.discovery_url }}" target="_blank" rel="noopener noreferrer">discovery ↗</a>{% endif %}
+      {% if not p.application_url and not p.canonical_url and not p.discovery_url %}—{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Applications</h2>
+{% if applications %}
+<table class="applications">
+  <thead><tr><th>Status</th><th>Applied at</th><th>Applied via</th><th>Next action</th><th>Transition</th></tr></thead>
+  <tbody>
+  {% for app in applications %}
+  <tr>
+    <td><strong>{{ app.status }}</strong></td>
+    <td>{{ app.applied_at or "—" }}</td>
+    <td>{% if app.applied_via_url %}<a href="{{ app.applied_via_url }}" target="_blank" rel="noopener noreferrer">link ↗</a>{% else %}—{% endif %}</td>
+    <td>{{ app.next_action_text or "—" }}</td>
+    <td>
+      {% if app.allowed_next %}
+      <select data-status-select="{{ app.id }}">
+        {% for s in app.allowed_next %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+      </select>
+      <button type="button" data-api-action data-reload
+              data-url="/api/applications/{{ app.id }}/status"
+              data-body='{"status": "PREPARING"}'
+              data-use-status-select="{{ app.id }}">Apply</button>
+      {% else %}closed{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No application tracked for this job.</p>
+{% endif %}
+{% endblock %}

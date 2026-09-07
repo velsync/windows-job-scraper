@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Applications — Job Scraper{% endblock %}
+{% block content %}
+<h1>Applications</h1>
+<p class="status" data-run-status></p>
+{% if applications %}
+<table class="applications">
+  <thead>
+    <tr><th>Job</th><th>Status</th><th>Applied at</th><th>Next action</th><th>Updated</th><th>Transition</th></tr>
+  </thead>
+  <tbody>
+  {% for app in applications %}
+  <tr>
+    <td><a href="/jobs/{{ app.job_id }}?profile_id={{ profile_id }}">{{ app.job_title or app.job_id }}</a></td>
+    <td><strong>{{ app.status }}</strong></td>
+    <td>{{ app.applied_at or "—" }}</td>
+    <td>{{ app.next_action_text or "—" }}{% if app.next_action_at %} ({{ app.next_action_at }}){% endif %}</td>
+    <td>{{ app.updated_at }}</td>
+    <td>
+      {% if app.allowed_next %}
+      <select data-status-select="{{ app.id }}">
+        {% for s in app.allowed_next %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+      </select>
+      <button type="button" data-api-action data-reload
+              data-url="/api/applications/{{ app.id }}/status"
+              data-body='{"status": "PREPARING"}'
+              data-use-status-select="{{ app.id }}">Apply</button>
+      {% else %}closed{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No applications tracked yet. Track one from a job page.</p>
+{% endif %}
+{% endblock %}

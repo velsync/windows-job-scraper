@@ -1,0 +1,88 @@
+/* Windows Job Scraper — local dashboard styles (CSP: 'self' only). */
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  background: #f5f6f8;
+  color: #1d2430;
+}
+
+.topnav {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1.2rem;
+  background: #14213d;
+  color: #fff;
+}
+
+.topnav a { color: #cfd8f0; text-decoration: none; }
+.topnav a:hover { color: #fff; }
+.brand { font-weight: 700; margin-right: 0.5rem; }
+.profile-picker { margin-left: auto; display: flex; gap: 0.4rem; align-items: center; }
+.profile-picker label { font-size: 0.85rem; color: #9fb0d8; }
+
+main { max-width: 1100px; margin: 1.5rem auto; padding: 0 1.2rem; }
+
+h1 { font-size: 1.5rem; margin: 0 0 0.5rem; }
+h2 { font-size: 1.05rem; margin: 1.4rem 0 0.4rem; }
+
+table { width: 100%; border-collapse: collapse; background: #fff; font-size: 0.92rem; }
+th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid #e3e7ee; vertical-align: top; }
+th { background: #eef1f6; font-weight: 600; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.actions button { margin-right: 0.25rem; }
+
+button, select, input {
+  font: inherit;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid #b9c2d4;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+button { background: #2454c4; border-color: #2454c4; color: #fff; }
+button:disabled { background: #93a3c6; border-color: #93a3c6; cursor: default; }
+.button-link {
+  display: inline-block; padding: 0.3rem 0.6rem; border-radius: 4px;
+  background: #e8ecf5; color: #14213d; text-decoration: none;
+}
+
+.chip {
+  display: inline-block; padding: 0.05rem 0.5rem; border-radius: 10px;
+  background: #e8ecf5; font-size: 0.78rem; margin-right: 0.25rem;
+}
+.chip-ELIGIBLE { background: #d9f0dd; }
+.chip-INELIGIBLE { background: #f7d9dc; }
+.subtitle { color: #4a5568; }
+
+pre.description {
+  white-space: pre-wrap; word-wrap: break-word;
+  background: #fff; border: 1px solid #e3e7ee; border-radius: 6px;
+  padding: 0.8rem 1rem; font: 0.88rem/1.5 inherit; max-height: 30rem; overflow: auto;
+}
+
+.grid { display: grid; grid-template-columns: 2fr 1fr; gap: 1.4rem; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+dl dt { font-weight: 600; margin-top: 0.5rem; }
+dl dd { margin: 0 0 0 0; }
+ul { margin: 0.2rem 0; padding-left: 1.1rem; }
+
+.facts { list-style: none; padding-left: 0; }
+.facts li { margin-bottom: 0.3rem; }
+.evidence { color: #5c6780; font-size: 0.85rem; }
+
+code { background: #eef1f6; padding: 0 0.3rem; border-radius: 3px; font-size: 0.85em; }
+
+.toolbar { display: flex; gap: 0.5rem; align-items: center; margin: 0.8rem 0; flex-wrap: wrap; }
+.status { min-height: 1.2rem; color: #2454c4; }
+.empty { color: #5c6780; font-style: italic; }
+
+details.runs { margin: 0.6rem 0; }
+details.runs summary { cursor: pointer; color: #2454c4; }
+
+.profile-form { display: grid; gap: 0.6rem; max-width: 30rem; background: #fff; padding: 1rem; border: 1px solid #e3e7ee; border-radius: 6px; }
+.profile-form label { display: grid; gap: 0.2rem; font-size: 0.9rem; }

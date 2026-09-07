@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Inbox — Job Scraper{% endblock %}
+{% block content %}
+<h1>Inbox</h1>
+<p class="status" data-run-status></p>
+
+{% if not profiles %}
+<p>No search profile yet. <a href="/profiles">Create one</a> to start collecting.</p>
+{% else %}
+<div class="toolbar">
+  <button type="button" data-api-action data-poll-run
+          data-url="/api/runs" data-method="POST"
+          data-body='{"profile_id": "{{ profile_id }}"}'>
+    Collect now
+  </button>
+</div>
+
+{% if recent_runs %}
+<details class="runs">
+  <summary>Recent runs</summary>
+  <table>
+    <thead><tr><th>Run</th><th>Status</th><th>Created</th><th>Finished</th></tr></thead>
+    <tbody>
+    {% for run in recent_runs %}
+    <tr>
+      <td><code>{{ run.id[:17] }}</code></td>
+      <td>{{ run.status }}</td>
+      <td>{{ run.created_at }}</td>
+      <td>{{ run.finished_at or "" }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</details>
+{% endif %}
+
+{% if inbox %}
+<table class="inbox">
+  <thead>
+    <tr>
+      <th>Title</th><th>Company</th><th>Score</th><th>Eligibility</th>
+      <th>Listing</th><th>Disposition</th><th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in inbox %}
+  <tr>
+    <td>
+      <a href="/jobs/{{ row.id }}?profile_id={{ profile_id }}">{{ row.title }}</a>
+      {% if row.disposition == "SNOOZED" and row.snoozed_until %}
+      <span class="chip">snoozed until {{ row.snoozed_until }}</span>
+      {% endif %}
+    </td>
+    <td>{{ row.company_name or "" }}</td>
+    <td class="num">{{ row.score if row.score is not none else "—" }}</td>
+    <td>{{ row.eligibility or "—" }}</td>
+    <td>{{ row.listing_status }}</td>
+    <td>{{ row.disposition }}</td>
+    <td class="actions">
+      <button type="button" data-api-action data-reload
+              data-url="/api/jobs/{{ row.id }}/disposition"
+              data-body='{"profile_id": "{{ profile_id }}", "disposition": "SHORTLISTED", "expected_row_revision": {{ row.row_revision }}}'>Shortlist</button>
+      <button type="button" data-api-action data-reload
+              data-url="/api/jobs/{{ row.id }}/disposition"
+              data-body='{"profile_id": "{{ profile_id }}", "disposition": "SNOOZED", "expected_row_revision": {{ row.row_revision }}}'>Snooze 7d</button>
+      <button type="button" data-api-action data-reload
+              data-url="/api/jobs/{{ row.id }}/disposition"
+              data-body='{"profile_id": "{{ profile_id }}", "disposition": "DISMISSED", "expected_row_revision": {{ row.row_revision }}}'>Dismiss</button>
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No inbox items for this profile yet. Run a collection or adjust the profile.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

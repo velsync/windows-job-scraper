@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Profiles — Job Scraper{% endblock %}
+{% block content %}
+<h1>Profiles</h1>
+
+{% if profiles %}
+<table>
+  <thead><tr><th>Name</th><th>Created</th><th>Default</th></tr></thead>
+  <tbody>
+  {% for p in profiles %}
+  <tr><td>{{ p.name }}</td><td>{{ p.created_at }}</td><td>{{ "yes" if p.is_default else "" }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No profiles yet.</p>
+{% endif %}
+
+<h2>Create profile</h2>
+<form data-api-form data-url="/api/profiles" method="post" class="profile-form">
+  <label>Name
+    <input type="text" name="name" required maxlength="100">
+  </label>
+  <label>Home country (ISO, e.g. DE)
+    <input type="text" name="home_country" maxlength="2" placeholder="DE">
+  </label>
+  <label>Eligible countries (comma-separated)
+    <input type="text" name="eligible_countries" placeholder="DE, NL, FR">
+  </label>
+  <label>Keywords (comma-separated)
+    <input type="text" name="keywords" placeholder="python, fastapi">
+  </label>
+  <label>Must-have keywords (comma-separated)
+    <input type="text" name="must_keywords" placeholder="python">
+  </label>
+  <label>Minimum inbox score
+    <input type="number" name="min_score_inbox" step="1" value="0">
+  </label>
+  <button type="submit">Create profile</button>
+  <span class="status" data-form-status></span>
+</form>
+{% endblock %}
