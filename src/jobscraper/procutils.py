@@ -1,4 +1,4 @@
-"""Child-process environment helpers.
+"""Child-process environment and lifecycle helpers.
 
 When running from source (not a frozen build), child processes spawned by
 the launcher/service/supervisor must be able to import ``jobscraper``. The
@@ -12,11 +12,17 @@ that actually runs the child. For lifecycle/fencing purposes we instead
 spawn ``sys._base_executable`` and pass ``__PYVENV_LAUNCHER__`` so CPython
 retains the virtual-environment identity and site-packages. This is the same
 strategy used by CPython's Windows multiprocessing implementation.
+
+Windows ``Popen.terminate()`` is a forced TerminateProcess operation, not a
+graceful SIGTERM. Controlled service/launcher subprocesses therefore use a
+new process group and receive ``CTRL_BREAK_EVENT`` for graceful shutdown.
 """
 
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -60,3 +66,25 @@ def child_process_env(base: dict | None = None) -> dict:
     if child_python_executable() != sys.executable:
         env["__PYVENV_LAUNCHER__"] = sys.executable
     return env
+
+
+def graceful_process_group_kwargs() -> dict[str, int]:
+    """Popen kwargs required for a later graceful process-directed stop."""
+    if sys.platform == "win32":  # pragma: no cover - Windows native
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def request_graceful_stop(proc: subprocess.Popen) -> None:
+    """Request cooperative shutdown of an owned child process.
+
+    Windows has no POSIX SIGTERM semantics in subprocess: ``terminate()`` is
+    TerminateProcess. A child created in a new process group can instead be
+    sent CTRL_BREAK_EVENT, which Python exposes as SIGBREAK to the child.
+    """
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":  # pragma: no cover - Windows native
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        proc.terminate()
