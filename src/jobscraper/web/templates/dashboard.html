@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Windows Job Scraper</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/vendor/htmx.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Windows Job Scraper</h1>
+    <span class="meta">v{{ app_version }} · schema {{ schema_version }} · instance {{ service_instance_id }}</span>
+    <form hx-post="/api/session/logout" hx-headers='{"X-CSRF-Token": document.cookie.match(/(?:^|;\s*)wjs_csrf=([^;]+)/)?.[1] ?? ""}'
+          hx-on::after-request="window.location.replace('/')">
+      <button type="submit" class="link">Sign out</button>
+    </form>
+  </header>
+  <main>
+    <section class="card" id="status-card">
+      <h2>Service status</h2>
+      <p>Slice 0 foundation shell. Local service is running and authenticated.</p>
+      <ul class="meta-list">
+        <li>Application version: <code>{{ app_version }}</code></li>
+        <li>Schema version: <code>{{ schema_version }}</code></li>
+        <li>Service instance: <code>{{ service_instance_id }}</code></li>
+      </ul>
+    </section>
+    <section class="card">
+      <h2>Recent events</h2>
+      <div hx-get="/api/events" hx-trigger="every 5s" hx-swap="innerHTML">
+        <p class="hint">Loading events…</p>
+      </div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

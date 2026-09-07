@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name if app_name is defined else "Windows Job Scraper" }} — starting</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="bootstrap-shell">
+  <main class="card">
+    <h1>Windows Job Scraper</h1>
+    <p id="status">Waiting for launcher bootstrap…</p>
+    <p id="hint" class="hint">This page exchanges a one-time local bootstrap ticket.
+       Open the application normally; do not bookmark or share this page.</p>
+    <noscript><p class="error">JavaScript is required for the local bootstrap exchange.</p></noscript>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    window.wjs.bootstrapExchange("/api/bootstrap", "/app");
+  </script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name if app_name is defined else "Windows Job Scraper" }} — error</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="bootstrap-shell">
+  <main class="card">
+    <h1>Something went wrong</h1>
+    <p id="status" class="error">{{ message | default("An unexpected local error occurred.") }}</p>
+    <p class="hint">The local service is still running. Restart the application if this persists.</p>
+  </main>
+</body>
+</html>

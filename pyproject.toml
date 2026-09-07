@@ -17,3 +17,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+jobscraper = [
+    "web/templates/*.html",
+    "web/static/*",
+    "web/static/vendor/*",
+]
