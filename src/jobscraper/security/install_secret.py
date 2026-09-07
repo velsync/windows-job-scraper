@@ -21,6 +21,7 @@ from jobscraper.security.dpapi import (
     set_dev_auth_dir,
     unprotect_for_current_user,
 )
+from jobscraper.security.dpapi import W32 as _IS_WINDOWS
 from jobscraper.security.windows_acl import harden_auth_directory
 from jobscraper.timeutil import utc_now_s
 
@@ -32,7 +33,20 @@ def _secret_path(paths: AppPaths) -> Path:
     return paths.auth / SECRET_FILE
 
 
+def _prepare_protector(paths: AppPaths) -> None:
+    """Bind the development protector to this auth directory (non-Windows).
+
+    This must happen before *loading*, not only when storing: the service,
+    launcher and tests are separate processes, and each must resolve the same
+    development key file. On Windows the protector is DPAPI and needs no
+    directory binding.
+    """
+    if not _IS_WINDOWS:
+        set_dev_auth_dir(paths.auth)
+
+
 def _load(paths: AppPaths) -> bytes | None:
+    _prepare_protector(paths)
     file = _secret_path(paths)
     if not file.is_file():
         return None
@@ -45,8 +59,7 @@ def _load(paths: AppPaths) -> bytes | None:
 
 def _store(paths: AppPaths, secret: bytes) -> None:
     harden_auth_directory(paths.auth)
-    if protector_kind() != "DPAPI":
-        set_dev_auth_dir(paths.auth)
+    _prepare_protector(paths)
     blob = protect_for_current_user(secret, entropy=ENTROPY)
     file = _secret_path(paths)
     file.write_bytes(blob)

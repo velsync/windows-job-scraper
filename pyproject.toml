@@ -24,3 +24,6 @@ jobscraper = [
     "web/static/*",
     "web/static/vendor/*",
 ]
+
+[project.scripts]
+jobscraper = "jobscraper.launcher.main:main"
