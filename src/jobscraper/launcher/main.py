@@ -33,10 +33,7 @@ from jobscraper.launcher.lifecycle import (
     start_service_process,
     wait_for_valid_service,
 )
-from jobscraper.launcher.runtime_descriptor import (
-    DescriptorError,
-    remove_runtime_descriptor,
-)
+from jobscraper.launcher.runtime_descriptor import DescriptorError, remove_runtime_descriptor
 from jobscraper.launcher.single_instance import acquire_single_instance
 from jobscraper.paths import ensure_app_directories
 from jobscraper.security.install_secret import load_or_create_install_secret
@@ -84,9 +81,6 @@ def _bootstrap_flow(config: AppConfig, desc, *, print_url: bool) -> int:
     ticket = request_bootstrap_ticket(desc, _load_secret(config))
     url = open_dashboard(desc.port, ticket, host=desc.host)
     if print_url:
-        # Automation/acceptance aid; the ticket is in the fragment and goes to
-        # the launcher's own stdout, not to server request/event logs. stdout
-        # is block-buffered when piped, so flush explicitly for consumers.
         print(f"Dashboard: {url}", flush=True)
     _emit(
         config,
@@ -107,7 +101,10 @@ class _ShutdownIntent:
         self._old_handlers: dict = {}
 
     def install(self) -> None:
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        signals = [signal.SIGINT, signal.SIGTERM]
+        if sys.platform == "win32" and hasattr(signal, "SIGBREAK"):
+            signals.append(signal.SIGBREAK)
+        for sig in signals:
             try:
                 self._old_handlers[sig] = signal.signal(sig, self._handle)
             except (ValueError, OSError):  # pragma: no cover - non-main thread
@@ -126,10 +123,12 @@ class _ShutdownIntent:
 
 
 def _stop_service(config: AppConfig, proc: subprocess.Popen) -> None:
-    """Stop the service we own: graceful terminate, bounded wait, force kill."""
+    """Stop the service we own: cooperative request, bounded wait, force kill."""
     if proc.poll() is not None:
         return
-    proc.terminate()
+    from jobscraper.procutils import request_graceful_stop
+
+    request_graceful_stop(proc)
     try:
         proc.wait(timeout=SERVICE_STOP_TIMEOUT_S)
     except subprocess.TimeoutExpired:  # pragma: no cover
@@ -144,7 +143,6 @@ def launch(config: AppConfig, *, print_url: bool = False) -> int:
 
     ownership = acquire_single_instance(config.paths.runtime)
     if ownership.already_running:
-        # Second launch: attach to the existing service if it is valid.
         from jobscraper.launcher.lifecycle import attach_with_retries
 
         desc = attach_with_retries(config, secret)
@@ -170,7 +168,6 @@ def launch(config: AppConfig, *, print_url: bool = False) -> int:
         )
         return _bootstrap_flow(config, desc, print_url=print_url)
 
-    # First launch: own the lifecycle and supervise the service.
     try:
         return _run_as_owner(config, secret, print_url=print_url)
     finally:
@@ -184,9 +181,6 @@ def _run_as_owner(config: AppConfig, secret: bytes, *, print_url: bool) -> int:
     service_proc: subprocess.Popen | None = None
     try:
         while True:
-            # A stale descriptor from a previous run (crash/forced kill) is
-            # safe to clear only now that we own the lifecycle; its
-            # PID/identity checks would reject it anyway.
             try:
                 remove_runtime_descriptor(config.paths.runtime)
             except OSError:  # pragma: no cover
@@ -234,12 +228,9 @@ def _run_as_owner(config: AppConfig, secret: bytes, *, print_url: bool) -> int:
             )
             code = _bootstrap_flow(config, desc, print_url=print_url)
             if code != 0:
-                # Terminate the service we started; do not leave an orphan.
                 _stop_service(config, service_proc)
                 return code
 
-            # Supervise: on launcher shutdown stop the service; on service
-            # death restart bounded.
             while True:
                 if intent.requested:
                     _stop_service(config, service_proc)
@@ -265,7 +256,7 @@ def _run_as_owner(config: AppConfig, secret: bytes, *, print_url: bool) -> int:
                     attempt=restarts,
                 )
                 time.sleep(min(RESTART_BACKOFF_S * restarts, 5.0))
-                break  # spawn a fresh service
+                break
     finally:
         intent.restore()
 
