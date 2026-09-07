@@ -1,28 +1,11 @@
-"""Explicit, non-secret build/version metadata collection."""
+"""Development-time alias for the build metadata collector.
 
-from importlib import metadata
-import platform
+The authoritative implementation lives inside the package at
+``jobscraper.build_metadata`` so packaged (frozen) builds always carry it.
+This module keeps the plan's ``build/build_metadata.py`` path importable in
+a source checkout.
+"""
 
-from jobscraper.version import APP_VERSION
+from jobscraper.build_metadata import collect_build_metadata, _NOT_INSTALLED
 
-_NOT_INSTALLED = "NOT_INSTALLED"
-
-
-def _distribution_version(distribution: str) -> str:
-    try:
-        return metadata.version(distribution)
-    except metadata.PackageNotFoundError:
-        return _NOT_INSTALLED
-
-
-def collect_build_metadata() -> dict[str, str]:
-    """Return only the version facts explicitly required by the build contract."""
-    return {
-        "application_version": APP_VERSION,
-        "python_version": platform.python_version(),
-        "fastapi_version": _distribution_version("fastapi"),
-        "playwright_version": _distribution_version("playwright"),
-        "pyinstaller_version": _distribution_version("pyinstaller"),
-        "tzdata_version": _distribution_version("tzdata"),
-        "browser_revision": _NOT_INSTALLED,
-    }
+__all__ = ["collect_build_metadata", "_NOT_INSTALLED"]

@@ -10,16 +10,21 @@ is imported lazily so a missing runtime is a typed, reportable condition
 
 Slice 0 smoke scope is deliberately narrow and inert: ``about:blank`` and a
 ``data:`` document only. No job-source navigation, no network.
+
+Note: only ONE ``sync_playwright()`` context may be active per call path —
+nesting contexts raises "Sync API inside the asyncio loop". All helpers here
+therefore work within a single context and never call each other inside one.
 """
 
 from __future__ import annotations
 
 import importlib
-import shutil
-import subprocess
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+NOT_INSTALLED = "NOT_INSTALLED"
 
 
 class BrowserRuntimeError(Exception):
@@ -31,9 +36,37 @@ class BrowserRuntimeError(Exception):
         self.message = message
 
 
+def _import_playwright():
+    try:
+        return importlib.import_module("playwright.sync_api")
+    except Exception as exc:  # ImportError and driver failures
+        raise BrowserRuntimeError("PLAYWRIGHT_NOT_INSTALLED", str(exc)) from exc
+
+
+def _playwright_version() -> str:
+    try:
+        import importlib.metadata as im
+
+        return im.version("playwright")
+    except Exception:  # pragma: no cover - defensive
+        return "unknown"
+
+
+def _revision_from_executable(executable: str) -> str:
+    """Extract the browser revision directory (e.g. ``chromium-1200``) from
+    an expected executable path such as
+    ``.../ms-playwright/chromium-1200/chrome-linux64/chrome``."""
+    parts = Path(executable).parts
+    for index, part in enumerate(parts):
+        if part == "ms-playwright" and index + 1 < len(parts):
+            return parts[index + 1]
+    match = re.search(r"chromium[A-Za-z0-9_]*-?\d+", executable)
+    return match.group(0) if match else "unknown"
+
+
 @dataclass(frozen=True)
 class BrowserRuntimeStatus:
-    playwright_version: str  # "NOT_INSTALLED" when absent
+    playwright_version: str  # NOT_INSTALLED when absent
     chromium_revision: str  # expected revision for the pinned Playwright
     chromium_executable: str  # expected path (may not exist)
     chromium_installed: bool
@@ -49,38 +82,25 @@ class BrowserRuntimeStatus:
         }
 
 
-def _import_playwright():
-    try:
-        return importlib.import_module("playwright.sync_api")
-    except Exception as exc:  # ImportError and driver failures
-        raise BrowserRuntimeError("PLAYWRIGHT_NOT_INSTALLED", str(exc)) from exc
-
-
 def browser_runtime_status() -> BrowserRuntimeStatus:
     """Report the pinned Playwright/Chromium compatibility facts (WIN-02)."""
     try:
         sync_api = _import_playwright()
-    except BrowserRuntimeError as exc:
+    except BrowserRuntimeError:
         return BrowserRuntimeStatus(
-            playwright_version="NOT_INSTALLED",
+            playwright_version=NOT_INSTALLED,
             chromium_revision="UNKNOWN",
             chromium_executable="",
             chromium_installed=False,
         )
-    try:
-        import importlib.metadata as im
-
-        version = im.version("playwright")
-    except Exception:  # pragma: no cover - defensive
-        version = "unknown"
     with sync_api.sync_playwright() as p:
-        executable = p.chromium.executable_path
-        revision = Path(str(executable)).parent.name  # e.g. chromium-1200
-        installed = Path(str(executable)).exists()
+        executable = str(p.chromium.executable_path)
+        installed = Path(executable).exists()
+        revision = _revision_from_executable(executable)
     return BrowserRuntimeStatus(
-        playwright_version=version,
+        playwright_version=_playwright_version(),
         chromium_revision=revision,
-        chromium_executable=str(executable),
+        chromium_executable=executable,
         chromium_installed=installed,
     )
 
@@ -104,7 +124,11 @@ class SmokeResult:
             "page_title": self.page_title,
             "launch_ms": self.launch_ms,
             "browser_exited_cleanly": self.browser_exited_cleanly,
-            **({"error": {"kind": self.error_kind, "message": self.error_message}} if self.error_kind else {}),
+            **(
+                {"error": {"kind": self.error_kind, "message": self.error_message}}
+                if self.error_kind
+                else {}
+            ),
         }
 
 
@@ -112,6 +136,19 @@ INERT_DATA_DOCUMENT = (
     "data:text/html,<html><head><title>WJS-Inert-Smoke</title></head>"
     "<body><h1>Windows Job Scraper inert smoke</h1></body></html>"
 )
+
+
+def _classify_launch_error(exc: Exception) -> str:
+    """A missing browser runtime is an install-state condition, not a crash.
+
+    ``launch(headless=True)`` resolves to the headless-shell build, whose
+    path may differ from ``chromium.executable_path`` — so classification is
+    based on the launch error itself, not on a pre-check.
+    """
+    message = str(exc)
+    if "Executable doesn't exist" in message or "doesn't look like a browser" in message:
+        return "CHROMIUM_NOT_INSTALLED"
+    return "LAUNCH_FAILED"
 
 
 def run_inert_smoke() -> SmokeResult:
@@ -129,21 +166,20 @@ def run_inert_smoke() -> SmokeResult:
         return SmokeResult(ok=False, error_kind=exc.kind, error_message=exc.message)
 
     started = time.monotonic()
+    revision = "unknown"
     try:
         with sync_api.sync_playwright() as p:
             executable = str(p.chromium.executable_path)
-            if not Path(executable).exists():
-                status = browser_runtime_status()
+            revision = _revision_from_executable(executable)
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as exc:
                 return SmokeResult(
                     ok=False,
-                    chromium_revision=status.chromium_revision,
-                    error_kind="CHROMIUM_NOT_INSTALLED",
-                    error_message=(
-                        "pinned Chromium runtime is not installed at the expected path; "
-                        "run the packaged first-run installer or `playwright install chromium`"
-                    ),
+                    chromium_revision=revision,
+                    error_kind=_classify_launch_error(exc),
+                    error_message=str(exc)[:400],
                 )
-            browser = p.chromium.launch(headless=True)
             try:
                 context = browser.new_context()
                 page = context.new_page()
@@ -155,13 +191,12 @@ def run_inert_smoke() -> SmokeResult:
                 page.close()
                 context.close()
             finally:
-                browser_pid = getattr(browser, "_impl_obj", None)
                 browser.close()
             launch_ms = int((time.monotonic() - started) * 1000)
             return SmokeResult(
                 ok=True,
                 chromium_version=version,
-                chromium_revision=Path(executable).parent.name,
+                chromium_revision=revision,
                 page_title=title,
                 launch_ms=launch_ms,
                 browser_exited_cleanly=True,
@@ -171,6 +206,7 @@ def run_inert_smoke() -> SmokeResult:
     except Exception as exc:  # any Playwright/driver failure is typed
         return SmokeResult(
             ok=False,
+            chromium_revision=revision,
             error_kind="LAUNCH_FAILED",
             error_message=f"{type(exc).__name__}: {exc}"[:400],
         )
