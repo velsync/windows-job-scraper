@@ -63,20 +63,21 @@ def service_command(config: AppConfig, mode: str) -> list[str]:
 
 
 def start_service_process(config: AppConfig) -> subprocess.Popen:
-    """Spawn the service process (detached output, new process group on
-    POSIX so launcher signals do not cascade into it)."""
-    from jobscraper.procutils import child_process_env
+    """Spawn the owned service in its own process group.
 
-    kwargs: dict = {}
-    if sys.platform != "win32":
-        kwargs["start_new_session"] = True
+    The separate process group prevents launcher control signals from
+    cascading into the service automatically and, on Windows, enables a
+    process-directed CTRL_BREAK_EVENT for graceful Uvicorn shutdown.
+    """
+    from jobscraper.procutils import child_process_env, graceful_process_group_kwargs
+
     return subprocess.Popen(
         service_command(config, "service"),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
         env=child_process_env(),
-        **kwargs,
+        **graceful_process_group_kwargs(),
     )
 
 
