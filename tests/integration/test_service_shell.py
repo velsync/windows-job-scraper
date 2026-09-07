@@ -29,7 +29,6 @@ from jobscraper.diagnostics.events import append_event, event
 from jobscraper.paths import build_app_paths
 from jobscraper.service.app import create_service_app
 from jobscraper.web.bootstrap import make_launcher_proof
-from jobscraper.web.sessions import SessionRegistry
 
 PORT = 8431
 SECRET = b"\x01" * 32

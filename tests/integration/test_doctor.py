@@ -105,6 +105,33 @@ def test_doctor_does_not_mutate_fresh_root(tmp_path):
     assert any("stale" in m or "corrupt" in m for m in marker_check.details.get("markers", []))
 
 
+def test_doctor_corrupt_secret_fails_closed_without_rotation(tmp_path):
+    """WIN-09 (corrective): a corrupt stored secret is an actionable FAIL and
+    Doctor must never silently rotate it by re-creating it."""
+    from jobscraper.security.install_secret import (
+        InstallSecretError,
+        load_install_secret_strict,
+    )
+
+    root = tmp_path / "corrupt-secret"
+    _initialize_healthy_root(root)
+    paths = build_app_paths(root)
+    secret_file = paths.auth / "install-secret.bin"
+    corrupt = b"not-a-valid-dpapi-blob" * 4
+    secret_file.write_bytes(corrupt)
+
+    results = run_doctor(AppConfig(data_root=root))
+    check = next(r for r in results if r.name == "auth_storage")
+    assert check.status == "FAIL"
+    assert "secret" in check.summary.lower()
+    # Not rotated: the stored blob is byte-identical after Doctor ran.
+    assert secret_file.read_bytes() == corrupt
+    # The strict loader is read-only and explains the failure.
+    with pytest.raises(InstallSecretError):
+        load_install_secret_strict(paths)
+    assert secret_file.read_bytes() == corrupt
+
+
 def test_doctor_output_contains_no_secret_material(tmp_path):
     root = tmp_path / "secret-scan"
     _initialize_healthy_root(root)

@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
 from jobscraper.config import AppConfig, config_from_env
@@ -200,11 +199,12 @@ def _check_auth_storage(paths: AppPaths) -> CheckResult:
     }
     if not acl.get("ok"):
         return CheckResult("auth_storage", FAIL, f"auth directory ACL: {acl.get('reason')}", details)
-    # Decryptability only — the secret value is never revealed.
+    # Decryptability only — the secret value is never revealed. Read-only:
+    # never create/rotate (WIN-09: doctor must not mutate user data).
     try:
-        from jobscraper.security.install_secret import load_or_create_install_secret
+        from jobscraper.security.install_secret import load_install_secret_strict
 
-        secret = load_or_create_install_secret(paths)
+        secret = load_install_secret_strict(paths)
         decryptable = len(secret) == 32
     except Exception as exc:
         details["decrypt_error_type"] = type(exc).__name__

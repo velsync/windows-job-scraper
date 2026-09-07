@@ -162,6 +162,55 @@ class Harness:
         markers = ("chrome", "chromium", "JobScraper", "jobscraper")
         return [line for line in self.list_processes() if any(m in line for m in markers)]
 
+    @staticmethod
+    def child_pids(parent_pid: int) -> list[int]:
+        """Direct child PIDs of one exact parent (no name matching)."""
+        if os.name == "nt":
+            out = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    (
+                        "Get-CimInstance Win32_Process "
+                        f"-Filter 'ParentProcessId={parent_pid}' "
+                        "| Select-Object -ExpandProperty ProcessId"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            ).stdout
+            return [int(x) for x in out.split() if x.isdigit()]
+        out = subprocess.run(
+            ["ps", "--ppid", str(parent_pid), "-o", "pid="],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout
+        return [int(x) for x in out.split() if x.isdigit()]
+
+    def kill_tree(self, pid: int) -> None:
+        """Kill exactly one process (and, on Windows, its subtree).
+
+        Never name-matches: only the explicit PID tree is terminated, so the
+        operator's own browsers are untouched.
+        """
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=60,
+            )
+            return
+        # POSIX: children first (best effort), then the process itself.
+        for child in self.child_pids(pid):
+            try:
+                os.kill(child, signal.SIGKILL)
+            except OSError:
+                pass
+        os.kill(pid, signal.SIGKILL)
+
     # ------------------------------------------------------------- W0 checks
     def w01_packaged_launch(self, data_root: Path) -> str:
         launcher, url = self.launch_and_get_url(data_root)
@@ -260,7 +309,7 @@ class Harness:
         from jobscraper.launcher.runtime_descriptor import pid_alive
 
         if pid_alive(service_pid):  # pragma: no cover - race
-            os.kill(service_pid, signal.SIGKILL)
+            _hard_kill(service_pid)
             time.sleep(1)
         # Write a stale descriptor pointing at the dead PID.
         from jobscraper.launcher.runtime_descriptor import (
@@ -588,34 +637,58 @@ class Harness:
             self.record("W0-14", NOT_RUN, f"cleanup check could not execute: {exc}")
 
     def w15_browser_crash_recovery(self, data_root: Path) -> str:
+        """Terminate the service's own browser worker; service must survive,
+        the supervisor must restart it bounded, and Doctor must stay healthy.
+        Targets only the exact worker PID (child of the service process) —
+        never name-matched processes, so the operator's browsers are safe."""
         launcher, url = self.launch_and_get_url(data_root)
         try:
             desc = self.descriptor_of(data_root)
-            # Kill any worker/Chromium tree under the service; the service
-            # must survive (health stays ok).
-            killed = 0
-            for line in self.chrome_like_processes():
-                parts = [p.strip().strip('"') for p in line.split('","')]
-                try:
-                    pid = int(next(p for p in parts if p.isdigit()))
-                except (StopIteration, ValueError):
-                    continue
-                if pid != desc.pid and pid != os.getpid() and pid != launcher.pid:
-                    try:
-                        os.kill(pid, signal.SIGKILL if os.name != "nt" else signal.SIGTERM)
-                        killed += 1
-                    except OSError:
-                        continue
-            time.sleep(3)
+            # The service starts its browser worker at boot; find it as a
+            # direct child of the service PID.
+            deadline = time.time() + 30
+            children: list[int] = []
+            while time.time() < deadline:
+                children = self.child_pids(desc.pid)
+                if children:
+                    break
+                time.sleep(0.5)
+            if not children:
+                self.record(
+                    "W0-15",
+                    FAIL,
+                    "service did not start its browser worker (no child process)",
+                    service_pid=desc.pid,
+                )
+                return "FAIL"
+            old_worker = children[0]
+            self.kill_tree(old_worker)
+            # Bounded restart: the supervisor restarts the worker (backoff 1s+).
+            deadline = time.time() + 60
+            new_worker = None
+            while time.time() < deadline:
+                children = self.child_pids(desc.pid)
+                if children and children[0] != old_worker:
+                    new_worker = children[0]
+                    break
+                time.sleep(0.5)
             host_port = f"{desc.host}:{desc.port}"
             status, _, body = self.http("GET", f"http://{host_port}/health/live")
-            survived = status == 200
+            survived = status == 200 and json.loads(body).get("status") == "ok"
+            doctor = self.doctor_json(data_root)
+            doctor_healthy = doctor.get("failed") == 0
+            ok = bool(new_worker) and survived and doctor_healthy
             self.record(
                 "W0-15",
-                PASS if survived else FAIL,
-                "service survives browser-worker/Chromium termination",
-                killed_processes=killed,
+                PASS if ok else FAIL,
+                "service survives browser-worker termination; bounded restart; doctor healthy",
+                old_worker_pid=old_worker,
+                restarted_worker_pid=new_worker,
                 service_healthy_after=survived,
+                doctor_status=doctor.get("status"),
+                doctor_failed_checks=[
+                    c.get("name") for c in doctor.get("checks", []) if c.get("status") == "FAIL"
+                ],
             )
         finally:
             self.stop_launcher(launcher)

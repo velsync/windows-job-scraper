@@ -226,22 +226,6 @@ def remove_runtime_descriptor(runtime_dir: Path) -> None:
 # ------------------------------------------------------------------ validation
 
 
-def validate_descriptor_freshness(desc: RuntimeDescriptor, max_age_s: float = 600.0, *, now=None) -> None:
-    """Reject descriptors that are structurally too old (stale leftovers)."""
-    from jobscraper.timeutil import parse_rfc3339, utc_now
-
-    now_dt = now or utc_now()
-    try:
-        created = parse_rfc3339(desc.created_at_utc)
-    except ValueError as exc:
-        raise DescriptorError("descriptor timestamp unparseable") from exc
-    age = (now_dt - created).total_seconds()
-    if age < -300:
-        raise DescriptorError("descriptor timestamp in the future (clock anomaly)")
-    if age > max_age_s:
-        raise DescriptorError(f"descriptor stale (age {age:.0f}s)")
-
-
 def check_descriptor_identity(desc: RuntimeDescriptor, secret: bytes) -> None:
     """HMAC + PID liveness + start-identity checks (no network)."""
     if desc.schema_version != DESCRIPTOR_SCHEMA_VERSION:

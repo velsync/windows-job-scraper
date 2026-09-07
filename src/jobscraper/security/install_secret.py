@@ -17,13 +17,11 @@ from jobscraper.paths import AppPaths
 from jobscraper.security.dpapi import (
     DPAPIError,
     protect_for_current_user,
-    protector_kind,
     set_dev_auth_dir,
     unprotect_for_current_user,
 )
 from jobscraper.security.dpapi import W32 as _IS_WINDOWS
 from jobscraper.security.windows_acl import harden_auth_directory
-from jobscraper.timeutil import utc_now_s
 
 SECRET_FILE = "install-secret.bin"
 ENTROPY = b"windows-job-scraper/install-secret/v1"
@@ -66,8 +64,38 @@ def _store(paths: AppPaths, secret: bytes) -> None:
     os.chmod(file, 0o600)
 
 
+class InstallSecretError(RuntimeError):
+    """Raised when the stored install secret exists but cannot be loaded."""
+
+
+def load_install_secret_strict(paths: AppPaths) -> bytes:
+    """Load the install secret without ever creating or rotating it.
+
+    For read-only diagnostics (Doctor, WIN-09): unlike
+    `load_or_create_install_secret`, a missing file or a blob that fails to
+    decrypt is reported as an error instead of being silently replaced.
+    """
+    _prepare_protector(paths)
+    file = _secret_path(paths)
+    if not file.is_file():
+        raise InstallSecretError("install secret file is missing")
+    blob = file.read_bytes()
+    try:
+        secret = unprotect_for_current_user(blob, entropy=ENTROPY)
+    except DPAPIError as exc:
+        raise InstallSecretError(f"install secret not decryptable: {exc}") from exc
+    if secret is None or len(secret) != 32:
+        raise InstallSecretError("install secret has unexpected length")
+    return secret
+
+
 def load_or_create_install_secret(paths: AppPaths) -> bytes:
-    """Load the install secret, creating it on first use."""
+    """Load the install secret, creating it on first use.
+
+    NOTE: a corrupt/undecryptable existing secret is replaced (rotated). This
+    is correct for the owning service/launcher path but must NOT be used from
+    read-only diagnostics; use `load_install_secret_strict` there.
+    """
     import secrets
 
     paths.auth.mkdir(parents=True, exist_ok=True)

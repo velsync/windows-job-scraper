@@ -28,6 +28,10 @@ from pathlib import Path
 
 import pytest
 
+# Windows lacks signal.SIGKILL; os.kill with any non-CTRL value terminates
+# the process unconditionally there, so a SIGTERM constant is equivalent.
+_HARD_KILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
 from jobscraper.config import AppConfig
 from jobscraper.launcher.lifecycle import (
     request_bootstrap_ticket,
@@ -287,7 +291,7 @@ def test_launcher_end_to_end(tmp_path):
 
         # Forced service death: the supervising launcher must restart it
         # bounded (W0-15/W0-16 behavior).
-        os.kill(first_pid, signal.SIGKILL)
+        os.kill(first_pid, _HARD_KILL)
         deadline = time.time() + 30
         new_desc = None
         while time.time() < deadline:
@@ -322,7 +326,7 @@ def test_launcher_end_to_end(tmp_path):
             desc = load_runtime_descriptor(config.paths.runtime)
             if desc is not None:
                 try:
-                    os.kill(desc.pid, signal.SIGKILL)
+                    os.kill(desc.pid, _HARD_KILL)
                 except OSError:
                     pass
         except DescriptorError:

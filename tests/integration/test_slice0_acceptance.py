@@ -16,7 +16,6 @@ cannot show together:
 
 from __future__ import annotations
 
-import http.client
 import json
 import os
 import signal
@@ -32,7 +31,6 @@ import pytest
 from jobscraper.config import AppConfig
 from jobscraper.diagnostics.events import list_recent_events
 from jobscraper.launcher.runtime_descriptor import (
-    DescriptorError,
     load_runtime_descriptor,
 )
 from jobscraper.paths import build_app_paths, ensure_app_directories
