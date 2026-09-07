@@ -299,7 +299,9 @@ class TestPostRunEvidence:
                 for name, value in sensitive.items():
                     assert value.encode() not in blob, f"sensitive value {name} leaked into {path}"
                 assert secret not in blob, f"raw install secret leaked into {path}"
-        assert scanned >= 3, "expected database/events/descriptor files to scan"
+        # Windows DPAPI needs only the database and protected install-secret
+        # file here; non-Windows development also has a separate protector key.
+        assert scanned >= 2, "expected database and protected auth material to scan"
 
     def test_doctor_healthy_after_initialized_run(self, launched_app):
         config, secret, dashboard_url, launcher = launched_app
