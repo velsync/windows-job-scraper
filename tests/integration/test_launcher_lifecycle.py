@@ -19,9 +19,7 @@ import http.server
 import json
 import os
 import signal
-import socket
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -48,7 +46,12 @@ from jobscraper.launcher.runtime_descriptor import (
     remove_runtime_descriptor,
 )
 from jobscraper.paths import build_app_paths, ensure_app_directories
-from jobscraper.procutils import child_process_env, child_python_executable
+from jobscraper.procutils import (
+    child_process_env,
+    child_python_executable,
+    graceful_process_group_kwargs,
+    request_graceful_stop,
+)
 from jobscraper.security.install_secret import load_or_create_install_secret
 from jobscraper.timeutil import utc_now_s
 
@@ -58,7 +61,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 def _env():
     env = child_process_env()
     env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
-    # Keep the child away from any ambient configuration.
     env.pop("WJS_DATA_ROOT", None)
     return env
 
@@ -74,18 +76,12 @@ def service_process(tmp_path):
     ensure_app_directories(build_app_paths(root))
     secret = load_or_create_install_secret(build_app_paths(root))
     proc = subprocess.Popen(
-        [
-            _python(),
-            "-m",
-            "jobscraper",
-            "--service",
-            "--data-root",
-            str(root),
-        ],
+        [_python(), "-m", "jobscraper", "--service", "--data-root", str(root)],
         cwd=str(REPO_ROOT),
         env=_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        **graceful_process_group_kwargs(),
     )
     config = AppConfig(data_root=root)
     try:
@@ -93,7 +89,7 @@ def service_process(tmp_path):
         yield proc, config, secret, desc
     finally:
         if proc.poll() is None:
-            proc.terminate()
+            request_graceful_stop(proc)
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:  # pragma: no cover
@@ -103,20 +99,15 @@ def service_process(tmp_path):
 
 def test_service_binds_os_assigned_port_and_publishes_live_descriptor(service_process):
     proc, config, secret, desc = service_process
-    # Port is OS-assigned (not a fixed default) and the listener answers.
     assert desc.port != 0
     assert desc.port != 8000
     assert desc.host == "127.0.0.1"
-    # The health endpoint is live and reports the descriptor's instance.
     validate_running_service(desc, secret)
-    # The descriptor on disk matches the validated one.
     on_disk = load_runtime_descriptor(config.paths.runtime)
     assert on_disk == desc
 
 
 def test_descriptor_published_only_after_listener_live(service_process):
-    # If we can validate the descriptor, the listener is answering on that
-    # port — publication cannot precede liveness.
     proc, config, secret, desc = service_process
     validate_running_service(desc, secret)
 
@@ -224,8 +215,8 @@ def test_old_port_impersonation_rejected(tmp_path):
 
 def test_clean_shutdown_removes_descriptor(service_process):
     proc, config, secret, desc = service_process
-    proc.terminate()
-    proc.wait(timeout=15)
+    request_graceful_stop(proc)
+    assert proc.wait(timeout=15) == 0
     deadline = time.time() + 10
     while time.time() < deadline:
         if load_runtime_descriptor(config.paths.runtime) is None:
@@ -255,6 +246,7 @@ def test_launcher_end_to_end(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        **graceful_process_group_kwargs(),
     )
     config = AppConfig(data_root=root)
     secret = load_or_create_install_secret(config.paths)
@@ -293,7 +285,7 @@ def test_launcher_end_to_end(tmp_path):
             time.sleep(0.3)
         assert new_desc is not None and new_desc.pid != first_pid, "launcher did not restart the dead service"
 
-        launcher.send_signal(signal.SIGTERM)
+        request_graceful_stop(launcher)
         launcher_exit = launcher.wait(timeout=30)
         assert launcher_exit == 0
         deadline = time.time() + 10
