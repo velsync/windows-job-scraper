@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import time
 import urllib.error
@@ -31,7 +30,12 @@ from jobscraper.config import AppConfig
 from jobscraper.diagnostics.events import list_recent_events
 from jobscraper.launcher.runtime_descriptor import load_runtime_descriptor
 from jobscraper.paths import build_app_paths, ensure_app_directories
-from jobscraper.procutils import child_process_env, child_python_executable
+from jobscraper.procutils import (
+    child_process_env,
+    child_python_executable,
+    graceful_process_group_kwargs,
+    request_graceful_stop,
+)
 from jobscraper.security.install_secret import load_or_create_install_secret
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -63,6 +67,7 @@ def launched_app(tmp_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        **graceful_process_group_kwargs(),
     )
     config = AppConfig(data_root=root)
     secret = load_or_create_install_secret(config.paths)
@@ -82,7 +87,7 @@ def launched_app(tmp_path):
         yield config, secret, dashboard_url, launcher
     finally:
         if launcher.poll() is None:
-            launcher.send_signal(signal.SIGTERM)
+            request_graceful_stop(launcher)
             try:
                 launcher.wait(timeout=30)
             except subprocess.TimeoutExpired:  # pragma: no cover
@@ -223,7 +228,7 @@ class TestFullBootstrapChain:
         assert desc is not None
         service_pid = desc.pid
 
-        launcher.send_signal(signal.SIGTERM)
+        request_graceful_stop(launcher)
         assert launcher.wait(timeout=30) == 0
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -265,7 +270,7 @@ class TestPostRunEvidence:
         assert session_id
         csrf_token = json.loads(body)["csrf_token"]
 
-        launcher.send_signal(signal.SIGTERM)
+        request_graceful_stop(launcher)
         assert launcher.wait(timeout=30) == 0
 
         from jobscraper.db.connection import connect_db
@@ -298,7 +303,7 @@ class TestPostRunEvidence:
 
     def test_doctor_healthy_after_initialized_run(self, launched_app):
         config, secret, dashboard_url, launcher = launched_app
-        launcher.send_signal(signal.SIGTERM)
+        request_graceful_stop(launcher)
         assert launcher.wait(timeout=30) == 0
 
         from jobscraper.launcher.doctor import run_doctor
