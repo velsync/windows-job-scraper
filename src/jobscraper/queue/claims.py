@@ -46,6 +46,65 @@ class Claim:
     execution_class: str
 
 
+def enqueue_request_tx(
+    tx: sqlite3.Connection,
+    *,
+    run_id: str,
+    run_source_plan_id: str,
+    source_id: str,
+    binding_id: str,
+    request_type: str,
+    request_unique_key: str,
+    payload: dict,
+    strategy: str,
+    execution_class: str = "HTTP",
+    priority: int = 100,
+    depth: int = 0,
+    parent_request_id: str | None = None,
+    query_id: str | None = None,
+    max_attempts: int = 3,
+    coverage_generation_id: str | None = None,
+    now: str | None = None,
+) -> str | None:
+    """Enqueue inside an existing (fenced) transaction; returns None when the
+    logical unit of work already exists (request uniqueness)."""
+    now = now or utc_now_s()
+    request_id = "req-" + secrets.token_hex(12)
+    try:
+        tx.execute(
+            "INSERT INTO scrape_requests(id, run_id, run_source_plan_id, query_id, source_id,"
+            " binding_id, request_type, request_unique_key, payload_json, strategy,"
+            " execution_class, priority, depth, parent_request_id, status, max_attempts,"
+            " coverage_generation_id, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                request_id,
+                run_id,
+                run_source_plan_id,
+                query_id,
+                source_id,
+                binding_id,
+                request_type,
+                request_unique_key,
+                json.dumps(payload, sort_keys=True),
+                strategy,
+                execution_class,
+                priority,
+                depth,
+                parent_request_id,
+                "PENDING",
+                max_attempts,
+                coverage_generation_id,
+                now,
+                now,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        return None  # same logical request already enqueued
+    tx.execute("UPDATE scrape_runs SET requests_total = requests_total + 1 WHERE id = ?", (run_id,))
+    return request_id
+
+
 def enqueue_request(
     db: Database,
     *,
@@ -66,45 +125,27 @@ def enqueue_request(
     coverage_generation_id: str | None = None,
     now: str | None = None,
 ) -> str | None:
-    """Enqueue one logical request; returns request id or None when the
-    logical unit of work already exists (request uniqueness)."""
-    now = now or utc_now_s()
-    request_id = "req-" + secrets.token_hex(12)
-    try:
-        with immediate_transaction(db.conn) as tx:
-            tx.execute(
-                "INSERT INTO scrape_requests(id, run_id, run_source_plan_id, query_id, source_id,"
-                " binding_id, request_type, request_unique_key, payload_json, strategy,"
-                " execution_class, priority, depth, parent_request_id, status, max_attempts,"
-                " coverage_generation_id, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    request_id,
-                    run_id,
-                    run_source_plan_id,
-                    query_id,
-                    source_id,
-                    binding_id,
-                    request_type,
-                    request_unique_key,
-                    json.dumps(payload, sort_keys=True),
-                    strategy,
-                    execution_class,
-                    priority,
-                    depth,
-                    parent_request_id,
-                    "PENDING",
-                    max_attempts,
-                    coverage_generation_id,
-                    now,
-                    now,
-                ),
-            )
-    except sqlite3.IntegrityError:
-        return None  # same logical request already enqueued
+    """Enqueue one logical request in its own transaction."""
     with immediate_transaction(db.conn) as tx:
-        tx.execute("UPDATE scrape_runs SET requests_total = requests_total + 1 WHERE id = ?", (run_id,))
-    return request_id
+        return enqueue_request_tx(
+            tx,
+            run_id=run_id,
+            run_source_plan_id=run_source_plan_id,
+            source_id=source_id,
+            binding_id=binding_id,
+            request_type=request_type,
+            request_unique_key=request_unique_key,
+            payload=payload,
+            strategy=strategy,
+            execution_class=execution_class,
+            priority=priority,
+            depth=depth,
+            parent_request_id=parent_request_id,
+            query_id=query_id,
+            max_attempts=max_attempts,
+            coverage_generation_id=coverage_generation_id,
+            now=now,
+        )
 
 
 def request_by_id(db: Database, request_id: str) -> sqlite3.Row | None:
