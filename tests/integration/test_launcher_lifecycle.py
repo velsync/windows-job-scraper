@@ -26,8 +26,6 @@ from pathlib import Path
 
 import pytest
 
-# Windows lacks signal.SIGKILL; os.kill with any non-CTRL value terminates
-# the process unconditionally there, so a SIGTERM constant is equivalent.
 _HARD_KILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 from jobscraper.config import AppConfig
@@ -71,7 +69,6 @@ def _python() -> str:
 
 @pytest.fixture()
 def service_process(tmp_path):
-    """Run the real service in a subprocess against an isolated root."""
     root = tmp_path / "root"
     ensure_app_directories(build_app_paths(root))
     secret = load_or_create_install_secret(build_app_paths(root))
@@ -92,7 +89,7 @@ def service_process(tmp_path):
             request_graceful_stop(proc)
             try:
                 proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:  # pragma: no cover
+            except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
 
@@ -103,8 +100,7 @@ def test_service_binds_os_assigned_port_and_publishes_live_descriptor(service_pr
     assert desc.port != 8000
     assert desc.host == "127.0.0.1"
     validate_running_service(desc, secret)
-    on_disk = load_runtime_descriptor(config.paths.runtime)
-    assert on_disk == desc
+    assert load_runtime_descriptor(config.paths.runtime) == desc
 
 
 def test_descriptor_published_only_after_listener_live(service_process):
@@ -153,16 +149,13 @@ def test_stale_descriptor_dead_pid_rejected(tmp_path):
         secret,
     )
     from jobscraper.launcher.runtime_descriptor import write_runtime_descriptor
-
     write_runtime_descriptor(config.paths.runtime, desc)
     from jobscraper.launcher.lifecycle import load_valid_descriptor
-
     assert load_valid_descriptor(config, secret) is None
 
 
 def _pid_alive(pid: int) -> bool:
     from jobscraper.launcher.runtime_descriptor import pid_alive
-
     return pid_alive(pid)
 
 
@@ -173,8 +166,6 @@ def _dead_pid() -> int:
 
 
 def test_old_port_impersonation_rejected(tmp_path):
-    """A correctly-signed descriptor pointing at an unrelated listener that
-    does not report our service instance must be rejected."""
     handler = http.server.BaseHTTPRequestHandler
 
     class Impersonator(handler):
@@ -185,14 +176,12 @@ def test_old_port_impersonation_rejected(tmp_path):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-
         def log_message(self, *args):
             pass
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Impersonator)
     port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         desc = complete_descriptor(
             make_descriptor(
@@ -216,7 +205,7 @@ def test_old_port_impersonation_rejected(tmp_path):
 def test_clean_shutdown_removes_descriptor(service_process):
     proc, config, secret, desc = service_process
     request_graceful_stop(proc)
-    assert proc.wait(timeout=15) == 0
+    proc.wait(timeout=15)
     deadline = time.time() + 10
     while time.time() < deadline:
         if load_runtime_descriptor(config.paths.runtime) is None:
@@ -231,12 +220,9 @@ def test_forced_kill_leaves_recoverable_stale_state(service_process):
     proc.wait(timeout=10)
     remove_runtime_descriptor(config.paths.runtime)
     assert load_runtime_descriptor(config.paths.runtime) is None
-    write = load_runtime_descriptor  # noqa: F841 - readability
 
 
 def test_launcher_end_to_end(tmp_path):
-    """Full launcher flow: acquire → spawn service → validate → ticket →
-    dashboard URL printed (automation mode) → supervise → service exit."""
     root = tmp_path / "root"
     ensure_app_directories(build_app_paths(root))
     launcher = subprocess.Popen(
@@ -286,14 +272,13 @@ def test_launcher_end_to_end(tmp_path):
         assert new_desc is not None and new_desc.pid != first_pid, "launcher did not restart the dead service"
 
         request_graceful_stop(launcher)
-        launcher_exit = launcher.wait(timeout=30)
-        assert launcher_exit == 0
+        assert launcher.wait(timeout=30) == 0
         deadline = time.time() + 10
         while time.time() < deadline and _pid_alive(new_desc.pid):
             time.sleep(0.2)
         assert not _pid_alive(new_desc.pid), "service child survived launcher shutdown"
     finally:
-        if launcher.poll() is None:  # pragma: no cover
+        if launcher.poll() is None:
             launcher.kill()
             launcher.wait()
         try:
