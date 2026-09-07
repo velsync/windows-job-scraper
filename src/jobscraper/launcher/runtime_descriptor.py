@@ -154,13 +154,25 @@ def pid_alive(pid: int) -> bool:
     if sys.platform == "win32":  # pragma: no cover - Windows native
         import win32api
         import win32con
+        import win32event
 
+        # OpenProcess can still succeed for a terminated process object. A
+        # zero-time wait on a SYNCHRONIZE-capable process handle distinguishes
+        # running (WAIT_TIMEOUT) from terminated/signaled (WAIT_OBJECT_0).
         try:
-            handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            handle = win32api.OpenProcess(
+                win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.SYNCHRONIZE,
+                False,
+                pid,
+            )
         except Exception:
             return False
-        handle.Close()
-        return True
+        try:
+            return win32event.WaitForSingleObject(handle, 0) == win32con.WAIT_TIMEOUT
+        except Exception:
+            return False
+        finally:
+            handle.Close()
     try:
         Path(f"/proc/{pid}").stat()
         # A zombie process is not a live service.
