@@ -139,7 +139,7 @@ def inspect_auth_directory_acl(path: Path) -> dict[str, object]:
         except Exception as exc:
             return {**info, "ok": False, "reason": f"cannot read security descriptor: {exc}"}
 
-        protected_dacl = bool(control & 0x800)  # SE_DACL_PROTECTED
+        protected_dacl = bool(control & win32security.SE_DACL_PROTECTED)
         aces: list[dict[str, object]] = []
         user_has_access = False
         broad_write: list[str] = []
