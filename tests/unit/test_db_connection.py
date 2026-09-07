@@ -40,7 +40,7 @@ def test_fts5_available(tmp_path):
     assert fts5_available(conn) is True
     conn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
     conn.execute("INSERT INTO t VALUES ('hello world')")
-    assert conn.execute("SELECT count(*) FROM t MATCH 'hello'").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM t WHERE t MATCH 'hello'").fetchone()[0] == 1
     conn.close()
 
 
