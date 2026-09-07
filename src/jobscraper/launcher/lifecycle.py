@@ -63,6 +63,8 @@ def service_command(config: AppConfig, mode: str) -> list[str]:
 def start_service_process(config: AppConfig) -> subprocess.Popen:
     """Spawn the service process (detached output, new process group on
     POSIX so launcher signals do not cascade into it)."""
+    from jobscraper.procutils import child_process_env
+
     kwargs: dict = {}
     if sys.platform != "win32":
         kwargs["start_new_session"] = True
@@ -71,6 +73,7 @@ def start_service_process(config: AppConfig) -> subprocess.Popen:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
+        env=child_process_env(),
         **kwargs,
     )
 

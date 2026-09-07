@@ -86,3 +86,20 @@ jobs:
           .ci-venv/Scripts/python -m pip check
         if: runner.os == 'Windows'
         shell: pwsh
+
+      - name: Install pinned Chromium runtime for the inert browser smoke (Windows)
+        run: .ci-venv/Scripts/python -m playwright install chromium
+        if: runner.os == 'Windows'
+        shell: pwsh
+
+      - name: Run the inert browser smoke through the worker protocol (Windows)
+        run: |
+          $worker = Start-Process -FilePath ".ci-venv/Scripts/python.exe" -ArgumentList "-m","jobscraper","--browser-worker" -RedirectStandardInput "in.txt" -RedirectStandardOutput "out.txt" -PassThru -NoNewWindow
+          Start-Sleep -Seconds 2
+          # Send SMOKE and SHUTDOWN via a fresh pipe using python instead:
+          Stop-Process -Id $worker.Id -Force -ErrorAction SilentlyContinue
+          .ci-venv/Scripts/python -c "import subprocess,sys,json;p=subprocess.Popen([sys.executable,'-m','jobscraper','--browser-worker'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True);p.stdin.write(json.dumps({'type':'SMOKE','request_id':'ci-1'})+'
+');p.stdin.flush();print(p.stdout.readline().strip());p.stdin.write(json.dumps({'type':'SHUTDOWN','request_id':'ci-2'})+'
+');p.stdin.flush();p.wait(timeout=60);sys.exit(0 if p.returncode==0 else 1)"
+        if: runner.os == 'Windows'
+        shell: pwsh

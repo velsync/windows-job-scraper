@@ -30,6 +30,17 @@ from jobscraper.launcher.runtime_descriptor import (
 from jobscraper.timeutil import utc_now_s
 
 
+def _default_supervisor(db: Database):
+    """One supervised browser worker (default capacity per WIN-05), with
+    supervision events persisted through central redaction."""
+    from jobscraper.browser_worker.supervisor import BrowserWorkerSupervisor
+
+    def on_event(level: str, kind: str, message: str) -> None:
+        append_event(db.conn, event(level, kind, message, data={}))
+
+    return BrowserWorkerSupervisor(on_event=on_event)
+
+
 @dataclass
 class ServiceLifespan:
     config: AppConfig
@@ -37,6 +48,10 @@ class ServiceLifespan:
     secret: bytes
     supervisor: object | None = None  # browser-worker supervisor (S0.9)
     _current_descriptor: RuntimeDescriptor | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.supervisor is None:
+            self.supervisor = _default_supervisor(self.db)
 
     @property
     def runtime_dir(self) -> Path:
@@ -95,17 +110,26 @@ class ServiceLifespan:
         )
 
     async def start_background(self) -> None:
-        """Start supervised background resources (browser worker in S0.9)."""
+        """Start supervised background resources (browser worker in S0.9).
+
+        The supervisor API is synchronous (thread + subprocess based); it is
+        dispatched off the event loop so the service never blocks on process
+        control.
+        """
+        import asyncio
+
         if self.supervisor is not None:
-            await self.supervisor.start()
+            await asyncio.to_thread(self.supervisor.start)
 
     async def stop_background(self) -> None:
         """Stop supervised background resources; failures become events, not
         silent exceptions (never swallow-and-pass)."""
         if self.supervisor is None:
             return
+        import asyncio
+
         try:
-            await self.supervisor.stop()
+            await asyncio.to_thread(self.supervisor.stop)
         except Exception as exc:
             append_event(
                 self.db.conn,
