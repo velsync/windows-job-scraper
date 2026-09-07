@@ -126,16 +126,21 @@ def process_start_identity(pid: int) -> str:
         except Exception:
             return ""
         try:
-            create, _exit, _kernel, _user = win32process.GetProcessTimes(handle)
+            times = win32process.GetProcessTimes(handle)
+        except Exception:
+            return ""
         finally:
             handle.Close()
-        # pywin32 exposes FILETIME values as datetime-compatible PyTime
-        # objects. Serialize the creation instant itself rather than coercing
-        # it to float (which is not supported by current pywin32 PyTime).
+        # pywin32 returns a dict with CreationTime/ExitTime/KernelTime/UserTime.
+        # CreationTime is a datetime-compatible PyTime value.
+        create = times.get("CreationTime") if isinstance(times, dict) else None
+        if create is None:
+            return ""
         try:
             return "win:" + create.isoformat(timespec="microseconds")
         except (AttributeError, TypeError, ValueError):
-            return "win:" + str(create)
+            text = str(create)
+            return "win:" + text if text else ""
     try:
         stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except OSError:
