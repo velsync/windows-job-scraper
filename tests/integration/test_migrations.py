@@ -105,16 +105,18 @@ REQUIRED_TABLES = {
 }
 
 
-def test_all_required_slice0_tables_exist_and_no_product_tables(tmp_path):
-    db = Database(tmp_path / "m.db")
-    migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
+def test_slice_boundary_is_version_scoped(tmp_path):
+    """The Slice 0 product-table boundary is scoped to schema version 2:
+    a database held at the Slice 0 baseline has no product tables; the
+    Slice 1 domain model arrives only through migrations >= 3."""
+    db = Database(tmp_path / "v2.db")
+    migrate_schema(db.conn, 2)
     tables = {
         r[0]
         for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
     }
     missing = REQUIRED_TABLES - tables
     assert not missing, f"missing tables: {missing}"
-    # Slice 0 must not create product/crawler tables (plan section 7).
     forbidden = {
         "jobs",
         "sources",
@@ -123,8 +125,13 @@ def test_all_required_slice0_tables_exist_and_no_product_tables(tmp_path):
         "job_profile_state",
         "applications",
     }
-    leaked = forbidden & tables
-    assert not leaked, f"future-slice tables leaked into Slice 0: {leaked}"
+    assert not (forbidden & tables), "product tables before migration v3"
+    migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
+    tables = {
+        r[0]
+        for r in db.conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")
+    }
+    assert forbidden <= tables, "Slice 1 domain tables missing after v3-v9"
     db.close()
 
 

@@ -164,7 +164,7 @@ def test_migration_of_existing_db_creates_backup_first(tmp_path):
     assert report["from_version"] == 1
     assert report["to_version"] == LATEST_SCHEMA_VERSION
     assert report["backup"] is not None
-    assert report["applied"] == [LATEST_SCHEMA_VERSION]
+    assert report["applied"] == list(range(2, LATEST_SCHEMA_VERSION + 1))
     # The pre-migration backup verifies and contains the old schema.
     manifest = verify_backup_generation(paths.backups / report["backup"].split("\\")[-1].split("/")[-1])
     assert manifest.schema_version == 1
