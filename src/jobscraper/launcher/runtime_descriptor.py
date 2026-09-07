@@ -126,14 +126,21 @@ def process_start_identity(pid: int) -> str:
         except Exception:
             return ""
         try:
-            _create, _exit, _kernel, _user = win32process.GetProcessTimes(handle)
+            times = win32process.GetProcessTimes(handle)
+        except Exception:
+            return ""
         finally:
             handle.Close()
-        try:
-            create = float(_create)
-        except (TypeError, ValueError):
+        # pywin32 returns a dict with CreationTime/ExitTime/KernelTime/UserTime.
+        # CreationTime is a datetime-compatible PyTime value.
+        create = times.get("CreationTime") if isinstance(times, dict) else None
+        if create is None:
             return ""
-        return f"win:{create:.6f}"
+        try:
+            return "win:" + create.isoformat(timespec="microseconds")
+        except (AttributeError, TypeError, ValueError):
+            text = str(create)
+            return "win:" + text if text else ""
     try:
         stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except OSError:
@@ -154,13 +161,25 @@ def pid_alive(pid: int) -> bool:
     if sys.platform == "win32":  # pragma: no cover - Windows native
         import win32api
         import win32con
+        import win32event
 
+        # OpenProcess can still succeed for a terminated process object. A
+        # zero-time wait on a SYNCHRONIZE-capable process handle distinguishes
+        # running (WAIT_TIMEOUT) from terminated/signaled (WAIT_OBJECT_0).
         try:
-            handle = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            handle = win32api.OpenProcess(
+                win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.SYNCHRONIZE,
+                False,
+                pid,
+            )
         except Exception:
             return False
-        handle.Close()
-        return True
+        try:
+            return win32event.WaitForSingleObject(handle, 0) == win32con.WAIT_TIMEOUT
+        except Exception:
+            return False
+        finally:
+            handle.Close()
     try:
         Path(f"/proc/{pid}").stat()
         # A zombie process is not a live service.

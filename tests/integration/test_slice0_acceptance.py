@@ -18,9 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -30,17 +28,21 @@ import pytest
 
 from jobscraper.config import AppConfig
 from jobscraper.diagnostics.events import list_recent_events
-from jobscraper.launcher.runtime_descriptor import (
-    load_runtime_descriptor,
-)
+from jobscraper.launcher.runtime_descriptor import load_runtime_descriptor
 from jobscraper.paths import build_app_paths, ensure_app_directories
+from jobscraper.procutils import (
+    child_process_env,
+    child_python_executable,
+    graceful_process_group_kwargs,
+    request_graceful_stop,
+)
 from jobscraper.security.install_secret import load_or_create_install_secret
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 def _env():
-    env = os.environ.copy()
+    env = child_process_env()
     env["PYTHONPATH"] = str(REPO_ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("WJS_DATA_ROOT", None)
     return env
@@ -52,12 +54,20 @@ def launched_app(tmp_path):
     root = tmp_path / "acceptance-root"
     ensure_app_directories(build_app_paths(root))
     launcher = subprocess.Popen(
-        [sys.executable, "-m", "jobscraper", "--data-root", str(root), "--print-url"],
+        [
+            child_python_executable(),
+            "-m",
+            "jobscraper",
+            "--data-root",
+            str(root),
+            "--print-url",
+        ],
         cwd=str(REPO_ROOT),
         env=_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        **graceful_process_group_kwargs(),
     )
     config = AppConfig(data_root=root)
     secret = load_or_create_install_secret(config.paths)
@@ -77,7 +87,7 @@ def launched_app(tmp_path):
         yield config, secret, dashboard_url, launcher
     finally:
         if launcher.poll() is None:
-            launcher.send_signal(signal.SIGTERM)
+            request_graceful_stop(launcher)
             try:
                 launcher.wait(timeout=30)
             except subprocess.TimeoutExpired:  # pragma: no cover
@@ -90,10 +100,7 @@ def _request(method: str, url: str, *, headers: dict | None = None, body: bytes 
     request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            # Return the raw header object: duplicate Set-Cookie headers must
-            # survive (a dict would collapse them).
             return response.status, response.headers, response.read()
-        # urllib follows redirects; none are expected in this flow.
     except urllib.error.HTTPError as exc:
         return exc.code, exc.headers, exc.read()
 
@@ -102,7 +109,6 @@ class TestFullBootstrapChain:
     def test_end_to_end_flow(self, launched_app):
         config, secret, dashboard_url, launcher = launched_app
 
-        # 1. Ticket is in the fragment; nothing sensitive in query/path.
         assert "#bootstrap=" in dashboard_url
         base, fragment = dashboard_url.split("#", 1)
         ticket = fragment.split("bootstrap=", 1)[1]
@@ -112,20 +118,17 @@ class TestFullBootstrapChain:
         host, port_s = host_port.rsplit(":", 1)
         port = int(port_s)
         assert host == "127.0.0.1"
-        assert 0 < port < 65536  # OS-assigned, not a fixed default
+        assert 0 < port < 65536
 
-        # 2. Runtime descriptor is valid on disk while running.
         desc = load_runtime_descriptor(config.paths.runtime)
         assert desc is not None and desc.port == port
 
-        # 3. Liveness is public and minimal.
         status, headers, body = _request("GET", f"http://{host}:{port}/health/live")
         assert status == 200
         health = json.loads(body)
         assert set(health) == {"status", "service_instance_id"}
         assert health["service_instance_id"] == desc.service_instance_id
 
-        # 4. Public bootstrap shell: local assets only.
         status, headers, shell = _request("GET", f"http://{host}:{port}/")
         assert status == 200
         shell_text = shell.decode()
@@ -137,7 +140,6 @@ class TestFullBootstrapChain:
         assert csp.startswith("default-src 'self'")
         assert "Access-Control-Allow-Origin" not in headers
 
-        # 5. Hostile Host/Origin denied.
         status, _, _ = _request(
             "GET", f"http://{host}:{port}/health/live", headers={"Host": "evil.example"}
         )
@@ -150,13 +152,11 @@ class TestFullBootstrapChain:
         )
         assert status == 403
 
-        # 6. Private read denied without a session.
         status, _, _ = _request(
             "GET", f"http://{host}:{port}/app", headers={"Host": host_port}
         )
         assert status == 401
 
-        # 7. Bootstrap exchange: one-time ticket + exact Origin -> session.
         exchange_body = json.dumps({"ticket": ticket}).encode()
         status, headers, body = _request(
             "POST",
@@ -180,7 +180,6 @@ class TestFullBootstrapChain:
         assert "HttpOnly" in set_cookies and "samesite=strict" in set_cookies.lower()
         assert session_id != ticket and csrf_token != ticket
 
-        # 8. Ticket is single-use.
         status, _, _ = _request(
             "POST",
             f"http://{host}:{port}/api/bootstrap",
@@ -193,7 +192,6 @@ class TestFullBootstrapChain:
         )
         assert status == 403
 
-        # 9. Authenticated private read works; unauthenticated still denied.
         auth_headers = {
             "Host": host_port,
             "Origin": f"http://{host}:{port}",
@@ -206,7 +204,6 @@ class TestFullBootstrapChain:
         status, _, _ = _request("GET", f"http://{host}:{port}/api/events", headers={"Host": host_port})
         assert status == 401
 
-        # 10. Mutation without CSRF denied; with CSRF succeeds.
         status, _, _ = _request(
             "POST",
             f"http://{host}:{port}/api/session/logout",
@@ -222,7 +219,6 @@ class TestFullBootstrapChain:
         )
         assert status == 200
 
-        # 11. Session revoked -> private read denied.
         status, _, _ = _request("GET", f"http://{host}:{port}/app", headers=auth_headers)
         assert status == 401
 
@@ -232,8 +228,7 @@ class TestFullBootstrapChain:
         assert desc is not None
         service_pid = desc.pid
 
-        # Clean launcher shutdown stops the service and clears the descriptor.
-        launcher.send_signal(signal.SIGTERM)
+        request_graceful_stop(launcher)
         assert launcher.wait(timeout=30) == 0
         deadline = time.time() + 15
         while time.time() < deadline:
@@ -253,7 +248,6 @@ class TestFullBootstrapChain:
 class TestPostRunEvidence:
     def test_events_persisted_and_secret_scan_across_data_root(self, launched_app):
         config, secret, dashboard_url, launcher = launched_app
-        # Exercise one full bootstrap to have session/ticket material in play.
         ticket = dashboard_url.split("#bootstrap=", 1)[1]
         host_port = dashboard_url.split("//", 1)[1].split("#", 1)[0].rstrip("/")
 
@@ -276,11 +270,9 @@ class TestPostRunEvidence:
         assert session_id
         csrf_token = json.loads(body)["csrf_token"]
 
-        # Shutdown cleanly so DB/WAL are checkpointed.
-        launcher.send_signal(signal.SIGTERM)
-        launcher.wait(timeout=30)
+        request_graceful_stop(launcher)
+        assert launcher.wait(timeout=30) == 0
 
-        # Durable lifecycle events exist.
         from jobscraper.db.connection import connect_db
 
         conn = connect_db(config.paths.database_file)
@@ -292,8 +284,6 @@ class TestPostRunEvidence:
         finally:
             conn.close()
 
-        # SECRET SCAN: none of the sensitive values may appear in ANY file
-        # under the data root (DB bytes, WAL, events, runtime descriptor...).
         sensitive = {
             "secret_hex": secret.hex(),
             "secret_b64": __import__("base64").b64encode(secret).decode(),
@@ -307,19 +297,16 @@ class TestPostRunEvidence:
                 scanned += 1
                 blob = path.read_bytes()
                 for name, value in sensitive.items():
-                    assert value.encode() not in blob, (
-                        f"sensitive value {name} leaked into {path}"
-                    )
-                    if name in ("ticket", "session_id", "csrf_token", "secret_hex", "secret_b64"):
-                        continue
-                # Raw secret bytes (non-ASCII) must not appear either.
+                    assert value.encode() not in blob, f"sensitive value {name} leaked into {path}"
                 assert secret not in blob, f"raw install secret leaked into {path}"
-        assert scanned >= 3, "expected database/events/descriptor files to scan"
+        # Windows DPAPI needs only the database and protected install-secret
+        # file here; non-Windows development also has a separate protector key.
+        assert scanned >= 2, "expected database and protected auth material to scan"
 
     def test_doctor_healthy_after_initialized_run(self, launched_app):
         config, secret, dashboard_url, launcher = launched_app
-        launcher.send_signal(signal.SIGTERM)
-        launcher.wait(timeout=30)
+        request_graceful_stop(launcher)
+        assert launcher.wait(timeout=30) == 0
 
         from jobscraper.launcher.doctor import run_doctor
 

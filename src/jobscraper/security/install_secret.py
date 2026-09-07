@@ -17,10 +17,13 @@ from jobscraper.paths import AppPaths
 from jobscraper.security.dpapi import (
     DPAPIError,
     protect_for_current_user,
-    set_dev_auth_dir,
     unprotect_for_current_user,
 )
 from jobscraper.security.dpapi import W32 as _IS_WINDOWS
+
+if not _IS_WINDOWS:
+    from jobscraper.security.dpapi import set_dev_auth_dir
+
 from jobscraper.security.windows_acl import harden_auth_directory
 
 SECRET_FILE = "install-secret.bin"

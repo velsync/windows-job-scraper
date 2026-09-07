@@ -89,7 +89,20 @@ class TestWorkerProcess:
         assert data["ok"] is True
         payload = data["payload"]
         assert payload["app_version"]
-        assert payload["worker_pid"] == worker.proc.pid
+        worker_pid = payload["worker_pid"]
+        assert isinstance(worker_pid, int) and worker_pid > 0
+        # On Windows, venv python.exe is a redirector that launches the base
+        # interpreter as a child, so Popen.pid may be the redirector rather
+        # than the process executing this worker. In direct/frozen execution
+        # the identities must match exactly.
+        base_executable = getattr(sys, "_base_executable", sys.executable)
+        windows_venv_redirector = (
+            sys.platform == "win32"
+            and os.path.normcase(os.path.abspath(base_executable))
+            != os.path.normcase(os.path.abspath(sys.executable))
+        )
+        if not windows_venv_redirector:
+            assert worker_pid == worker.proc.pid
         assert payload["python_version"]
         # Playwright facts are present and typed (may be NOT_INSTALLED).
         assert "playwright_version" in payload

@@ -18,13 +18,8 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
-from jobscraper.browser_worker.protocol import (
-    ProtocolError,
-    WorkerResponse,
-    parse_request,
-)
+from jobscraper.browser_worker.protocol import WorkerResponse
 
 REQUEST_TIMEOUT_S = 120.0  # SMOKE can legitimately take tens of seconds
 READINESS_TIMEOUT_S = 20.0
@@ -63,7 +58,9 @@ class BrowserWorkerSupervisor:
     def worker_command(self) -> list[str]:
         if getattr(sys, "frozen", False):  # pragma: no cover - packaged build
             return [sys.executable, "--browser-worker"]
-        return [sys.executable, "-m", "jobscraper", "--browser-worker"]
+        from jobscraper.procutils import child_python_executable
+
+        return [child_python_executable(), "-m", "jobscraper", "--browser-worker"]
 
     def start(self) -> None:
         with self._lock:
