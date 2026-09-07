@@ -1,0 +1,4 @@
+# Dev/test/build dependencies. Locked exact versions: dev.lock.txt.
+pytest>=8.0
+httpx>=0.27
+pyinstaller>=6.6

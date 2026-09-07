@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobscraper"
+version = "0.3.1.3"
+description = "Windows Job Scraper - local-first, single-user job-search operating system (v0.3.1.3)"
+readme = "README.md"
+requires-python = ">=3.11"
+# Production target runtime is Python 3.12+ per docs/spec/v0.3.1.3.
+# >=3.11 is accepted so the cross-platform development/test environment can
+# execute the identical code; no 3.12-only syntax is used and the packaged
+# Windows release pins 3.12. See docs/plans and the implementation report.
+license = { text = "Proprietary" }
+authors = [{ name = "Windows Job Scraper" }]
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+    "tzdata>=2024.1",
+    # playwright is a production dependency for the separate browser worker
+    # process; on the packaged Windows build the pinned Chromium runtime is
+    # installed/verified by Doctor.
+    "playwright>=1.45",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+    "pyinstaller>=6.6",
+]
+
+[project.scripts]
+jobscraper = "jobscraper.launcher.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+jobscraper = [
+    "web/templates/*.html",
+    "web/static/*",
+    "db/migrations_sql/*.sql",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "windows_acceptance: test requires the real Windows target (WINDOWS_ACCEPTANCE_REQUIRED)",
+]
+filterwarnings = ["ignore::DeprecationWarning"]
