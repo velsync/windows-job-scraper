@@ -31,8 +31,8 @@ class DPAPIError(Exception):
 
 
 if W32:  # pragma: no cover - exercised on Windows only (CI + native harness)
-    import win32con
     import win32crypt
+    import win32cryptcon
 
     def protect_for_current_user(plaintext: bytes, *, entropy: bytes | None = None) -> bytes:
         """DPAPI CryptProtectData with user scope (pywin32)."""
@@ -43,7 +43,7 @@ if W32:  # pragma: no cover - exercised on Windows only (CI + native harness)
                 entropy,
                 None,
                 None,
-                win32con.CRYPTPROTECT_UI_FORBIDDEN,
+                win32cryptcon.CRYPTPROTECT_UI_FORBIDDEN,
             )
         except Exception as exc:  # pywintypes.error
             raise DPAPIError(f"CryptProtectData failed: {exc}") from exc
@@ -53,12 +53,15 @@ if W32:  # pragma: no cover - exercised on Windows only (CI + native harness)
         """DPAPI CryptUnprotectData with user scope (pywin32)."""
         try:
             out = win32crypt.CryptUnprotectData(
-                ciphertext, entropy, None, None, win32con.CRYPTPROTECT_UI_FORBIDDEN
+                ciphertext,
+                entropy,
+                None,
+                None,
+                win32cryptcon.CRYPTPROTECT_UI_FORBIDDEN,
             )
         except Exception as exc:  # pywintypes.error
             raise DPAPIError(f"CryptUnprotectData failed: {exc}") from exc
-        # pywin32 returns the plaintext, or a (description, plaintext) tuple
-        # depending on version; accept both shapes.
+        # pywin32 returns (description, plaintext).
         if isinstance(out, tuple):
             out = out[-1]
         return bytes(out)
