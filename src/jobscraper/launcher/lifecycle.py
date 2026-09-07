@@ -50,8 +50,10 @@ def service_command(config: AppConfig, mode: str) -> list[str]:
     """
     if getattr(sys, "frozen", False):  # pragma: no cover - packaged build
         return [sys.executable, f"--{mode}", "--data-root", str(config.data_root)]
+    from jobscraper.procutils import child_python_executable
+
     return [
-        sys.executable,
+        child_python_executable(),
         "-m",
         "jobscraper",
         f"--{mode}",
@@ -182,18 +184,18 @@ def request_bootstrap_ticket(
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             body = json.loads(response.read().decode("utf-8"))
     except (OSError, ValueError, urllib.error.URLError) as exc:
-        raise DescriptorError(f"launcher channel request failed: {exc}") from exc
-    ticket = body.get("ticket")
+        raise DescriptorError(f"launcher bootstrap request failed: {exc}") from exc
+    ticket = body.get("ticket") if isinstance(body, dict) else None
     if not isinstance(ticket, str) or not ticket:
-        raise DescriptorError("launcher channel returned no ticket")
-    return str(ticket)
+        raise DescriptorError("launcher bootstrap response contained no ticket")
+    return ticket
 
 
 def open_dashboard(port: int, ticket: str, *, host: str = "127.0.0.1") -> str:
-    """Open the dashboard in the default browser with the ticket in the URL
-    fragment (never query/path). Returns the URL used."""
-    url = f"http://{host}:{port}/#bootstrap={ticket}"
+    """Build and open the one-time bootstrap URL. The ticket is a fragment,
+    never a query/path component, so it is not sent in HTTP request lines."""
     import webbrowser
 
+    url = f"http://{host}:{int(port)}/#bootstrap={ticket}"
     webbrowser.open(url)
     return url
