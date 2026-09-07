@@ -98,8 +98,6 @@ jobs:
           Start-Sleep -Seconds 2
           # Send SMOKE and SHUTDOWN via a fresh pipe using python instead:
           Stop-Process -Id $worker.Id -Force -ErrorAction SilentlyContinue
-          .ci-venv/Scripts/python -c "import subprocess,sys,json;p=subprocess.Popen([sys.executable,'-m','jobscraper','--browser-worker'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True);p.stdin.write(json.dumps({'type':'SMOKE','request_id':'ci-1'})+'
-');p.stdin.flush();print(p.stdout.readline().strip());p.stdin.write(json.dumps({'type':'SHUTDOWN','request_id':'ci-2'})+'
-');p.stdin.flush();p.wait(timeout=60);sys.exit(0 if p.returncode==0 else 1)"
+          .ci-venv/Scripts/python -c "import subprocess,sys,json;p=subprocess.Popen([sys.executable,'-m','jobscraper','--browser-worker'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True);p.stdin.write(json.dumps({'type':'SMOKE','request_id':'ci-1'})+chr(10));p.stdin.flush();print(p.stdout.readline().strip());p.stdin.write(json.dumps({'type':'SHUTDOWN','request_id':'ci-2'})+chr(10));p.stdin.flush();p.wait(timeout=60);sys.exit(0 if p.returncode==0 else 1)"
         if: runner.os == 'Windows'
         shell: pwsh
