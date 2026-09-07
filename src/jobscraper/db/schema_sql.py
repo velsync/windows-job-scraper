@@ -16,6 +16,22 @@ Slice 1 appends the domain model (v3–v9) per RUN-17/RUN-18:
   v8 profile-relative state: disposition, inbox events, eligibility, scores
      (PROD-01/02, 01 §36/§41)
   v9 applications and documents (01 §43)
+  v10 S1.1 corrective (architectural review 2026-09-08):
+     - companies: normalized_name is a resolution signal, not identity
+       (01 §33.1 "weak evidence must not aggressively merge companies") —
+       the v7 UNIQUE(normalized_name) is replaced by a non-unique lookup
+       index;
+     - job_sources: native identity is strong per RUN-15 — a partial unique
+       index binds one (source_id, source_job_id, source_identity_generation)
+       to one canonical job for non-null native ids; genuine reuse keeps
+       incrementing the generation;
+     - permission pins resolve: source_adapter_binding_revisions and
+       run_source_plans gain composite FKs to
+       adapter_permission_profile_revisions(permission_profile_id, revision)
+       (02 §9.1, RUN-02 rule 8);
+     - field_evidence.observation_id gains an FK to job_observations (03 §30);
+     - job_sources.last_absence_coverage_id gains an FK to
+       enumeration_coverage (03 RUN-13).
 
 Each step is forward-only; a step may never be edited after being committed to
 a release (append a new step instead). The pinned-hash test in
@@ -798,6 +814,245 @@ CREATE INDEX idx_application_events
     return sql
 
 
+
+# --------------------- v10 S1.1 corrective: identity + referential integrity
+@_step(10, "s1_1_corrective_identity_and_referential_integrity")
+def _(sql: str = """
+-- Forward-only corrective for the S1.1 architectural review (2026-09-08).
+-- Released steps v3-v9 are byte-stable; corrections rebuild tables here.
+--
+-- This step is declared in REBUILD_STEPS, so the migration machinery runs it
+-- under SQLite's documented table-rebuild procedure (PRAGMA foreign_keys=OFF
+-- for the duration of the step) and refuses to COMMIT unless
+-- PRAGMA foreign_key_check is clean for the entire database inside the step
+-- transaction. Immediate-FK enforcement cannot host a DROP TABLE of a
+-- referenced parent (the implicit DELETE records a deferred violation that
+-- re-insertion into the rebuilt table does not clear), and defer_foreign_keys
+-- therefore cannot substitute for the documented procedure here.
+--
+-- The partial unique index on job_sources is created after the copy:
+-- pre-existing duplicates of one (source_id, source_job_id, generation)
+-- abort this migration (fail-closed) rather than silently picking a winner.
+
+-- companies: drop UNIQUE(normalized_name) (01 §33.1), keep lookup index.
+CREATE TABLE companies_v10 (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    domain TEXT,
+    careers_url TEXT,
+    ats_provider TEXT,
+    ats_board TEXT,
+    country TEXT,
+    notes_md TEXT,
+    watch INTEGER NOT NULL DEFAULT 0,
+    blocklist INTEGER NOT NULL DEFAULT 0,
+    first_seen_at TEXT NOT NULL,
+    last_posting_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+INSERT INTO companies_v10 (id, name, normalized_name, domain, careers_url,
+    ats_provider, ats_board, country, notes_md, watch, blocklist,
+    first_seen_at, last_posting_at, created_at, updated_at)
+    SELECT id, name, normalized_name, domain, careers_url, ats_provider,
+        ats_board, country, notes_md, watch, blocklist, first_seen_at,
+        last_posting_at, created_at, updated_at
+    FROM companies;
+DROP TABLE companies;
+ALTER TABLE companies_v10 RENAME TO companies;
+CREATE INDEX idx_companies_normalized_name ON companies(normalized_name);
+
+-- source_adapter_binding_revisions: permission pin must resolve (02 §9.1).
+CREATE TABLE source_adapter_binding_revisions_v10 (
+    id TEXT PRIMARY KEY,
+    binding_id TEXT NOT NULL REFERENCES source_adapter_bindings(id),
+    revision INTEGER NOT NULL,
+    adapter_id TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+    strategy TEXT NOT NULL
+        CHECK (strategy IN (
+            'PROVIDER_NATIVE', 'FEED_OR_PUBLIC_STRUCTURED_ENDPOINT',
+            'STRUCTURED_PAGE', 'HTTP_HTML', 'PLAYWRIGHT_PUBLIC',
+            'PLAYWRIGHT_AUTHENTICATED', 'MANUAL_UNSUPPORTED',
+            'GENERIC_DISCOVERY')),
+    priority INTEGER NOT NULL DEFAULT 0,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    auth_requirement TEXT NOT NULL DEFAULT 'NONE',
+    auth_scope_id TEXT,
+    execution_class TEXT NOT NULL
+        CHECK (execution_class IN ('HTTP', 'BROWSER', 'BROWSER_INTERACTIVE')),
+    permission_profile_id TEXT NOT NULL
+        REFERENCES adapter_permission_profiles(id),
+    permission_profile_revision INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    superseded_at TEXT,
+    UNIQUE (binding_id, revision),
+    FOREIGN KEY (adapter_id, adapter_version)
+        REFERENCES adapter_definitions(adapter_id, adapter_version),
+    FOREIGN KEY (permission_profile_id, permission_profile_revision)
+        REFERENCES adapter_permission_profile_revisions(
+            permission_profile_id, revision)
+);
+INSERT INTO source_adapter_binding_revisions_v10 (id, binding_id, revision,
+    adapter_id, adapter_version, strategy, priority, config_json,
+    auth_requirement, auth_scope_id, execution_class, permission_profile_id,
+    permission_profile_revision, created_at, superseded_at)
+    SELECT id, binding_id, revision, adapter_id, adapter_version, strategy,
+        priority, config_json, auth_requirement, auth_scope_id,
+        execution_class, permission_profile_id, permission_profile_revision,
+        created_at, superseded_at
+    FROM source_adapter_binding_revisions;
+DROP TABLE source_adapter_binding_revisions;
+ALTER TABLE source_adapter_binding_revisions_v10
+    RENAME TO source_adapter_binding_revisions;
+CREATE INDEX idx_binding_revisions_adapter
+    ON source_adapter_binding_revisions(adapter_id, adapter_version);
+
+-- run_source_plans: the plan's permission pin must resolve (RUN-02 rule 8).
+CREATE TABLE run_source_plans_v10 (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES scrape_runs(id),
+    source_id TEXT NOT NULL REFERENCES sources(id),
+    source_config_snapshot_ref TEXT,
+    query_id TEXT REFERENCES queries(id),
+    query_revision_id TEXT REFERENCES query_revisions(id),
+    source_plan_group_id TEXT NOT NULL,
+    fallback_rank INTEGER NOT NULL DEFAULT 0,
+    binding_id TEXT NOT NULL REFERENCES source_adapter_bindings(id),
+    binding_revision_id TEXT NOT NULL
+        REFERENCES source_adapter_binding_revisions(id),
+    adapter_id TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+    adapter_api_version TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    execution_class TEXT NOT NULL,
+    cursor_schema_version INTEGER NOT NULL DEFAULT 1,
+    recipe_version_id TEXT,
+    navigation_plan_version_id TEXT,
+    crawl_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    rate_policy_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    auth_scope_id TEXT,
+    permission_profile_id TEXT NOT NULL,
+    permission_profile_revision INTEGER NOT NULL,
+    profile_revision TEXT,
+    rules_revision TEXT,
+    run_config_hash TEXT,
+    group_outcome TEXT
+        CHECK (group_outcome IS NULL OR group_outcome IN (
+            'SATISFIED', 'SATISFIED_PARTIAL', 'FAILED', 'CANCELLED',
+            'POLICY_DENIED', 'SKIPPED_NOT_NEEDED')),
+    created_at TEXT NOT NULL,
+    UNIQUE (run_id, source_plan_group_id, fallback_rank),
+    FOREIGN KEY (permission_profile_id, permission_profile_revision)
+        REFERENCES adapter_permission_profile_revisions(
+            permission_profile_id, revision)
+);
+INSERT INTO run_source_plans_v10 (id, run_id, source_id,
+    source_config_snapshot_ref, query_id, query_revision_id,
+    source_plan_group_id, fallback_rank, binding_id, binding_revision_id,
+    adapter_id, adapter_version, adapter_api_version, strategy,
+    execution_class, cursor_schema_version, recipe_version_id,
+    navigation_plan_version_id, crawl_policy_snapshot_json,
+    rate_policy_snapshot_json, auth_scope_id, permission_profile_id,
+    permission_profile_revision, profile_revision, rules_revision,
+    run_config_hash, group_outcome, created_at)
+    SELECT id, run_id, source_id, source_config_snapshot_ref, query_id,
+        query_revision_id, source_plan_group_id, fallback_rank, binding_id,
+        binding_revision_id, adapter_id, adapter_version, adapter_api_version,
+        strategy, execution_class, cursor_schema_version, recipe_version_id,
+        navigation_plan_version_id, crawl_policy_snapshot_json,
+        rate_policy_snapshot_json, auth_scope_id, permission_profile_id,
+        permission_profile_revision, profile_revision, rules_revision,
+        run_config_hash, group_outcome, created_at
+    FROM run_source_plans;
+DROP TABLE run_source_plans;
+ALTER TABLE run_source_plans_v10 RENAME TO run_source_plans;
+CREATE INDEX idx_run_source_plans_run ON run_source_plans(run_id);
+CREATE INDEX idx_run_source_plans_binding ON run_source_plans(binding_id);
+
+-- field_evidence: bind evidence to its observation (03 §30).
+CREATE TABLE field_evidence_v10 (
+    id TEXT PRIMARY KEY,
+    observation_id TEXT NOT NULL REFERENCES job_observations(id),
+    field_name TEXT NOT NULL,
+    locator_kind TEXT,
+    locator_value TEXT,
+    evidence_start INTEGER,
+    evidence_end INTEGER,
+    value_hash TEXT,
+    excerpt TEXT,
+    created_at TEXT NOT NULL
+);
+INSERT INTO field_evidence_v10 (id, observation_id, field_name, locator_kind,
+    locator_value, evidence_start, evidence_end, value_hash, excerpt,
+    created_at)
+    SELECT id, observation_id, field_name, locator_kind, locator_value,
+        evidence_start, evidence_end, value_hash, excerpt, created_at
+    FROM field_evidence;
+DROP TABLE field_evidence;
+ALTER TABLE field_evidence_v10 RENAME TO field_evidence;
+CREATE INDEX idx_field_evidence_observation
+    ON field_evidence(observation_id, field_name);
+
+-- job_sources: absence attribution must resolve (RUN-13) and native
+-- identity is strong within one generation (RUN-15).
+CREATE TABLE job_sources_v10 (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    source_id TEXT NOT NULL REFERENCES sources(id),
+    binding_id TEXT NOT NULL REFERENCES source_adapter_bindings(id),
+    source_job_id TEXT,
+    source_identity_generation INTEGER NOT NULL DEFAULT 1,
+    discovery_url TEXT,
+    raw_source_url TEXT,
+    canonical_job_url TEXT,
+    application_url TEXT,
+    origin_url TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_verified_at TEXT,
+    last_changed_at TEXT,
+    presence_state TEXT NOT NULL DEFAULT 'ACTIVE'
+        CHECK (presence_state IN ('ACTIVE', 'UNCERTAIN', 'EXPIRED',
+                                  'CLOSED', 'WITHDRAWN', 'UNKNOWN')),
+    content_revision INTEGER NOT NULL DEFAULT 1,
+    last_authoritative_scope_key TEXT,
+    last_absence_coverage_id TEXT REFERENCES enumeration_coverage(id),
+    last_observation_id TEXT REFERENCES job_observations(id),
+    source_rank INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, source_id, source_job_id, source_identity_generation)
+);
+INSERT INTO job_sources_v10 (id, job_id, source_id, binding_id,
+    source_job_id, source_identity_generation, discovery_url, raw_source_url,
+    canonical_job_url, application_url, origin_url, first_seen_at,
+    last_seen_at, last_verified_at, last_changed_at, presence_state,
+    content_revision, last_authoritative_scope_key, last_absence_coverage_id,
+    last_observation_id, source_rank, created_at, updated_at)
+    SELECT id, job_id, source_id, binding_id, source_job_id,
+        source_identity_generation, discovery_url, raw_source_url,
+        canonical_job_url, application_url, origin_url, first_seen_at,
+        last_seen_at, last_verified_at, last_changed_at, presence_state,
+        content_revision, last_authoritative_scope_key, last_absence_coverage_id,
+        last_observation_id, source_rank, created_at, updated_at
+    FROM job_sources;
+DROP TABLE job_sources;
+ALTER TABLE job_sources_v10 RENAME TO job_sources;
+CREATE INDEX idx_job_sources_lookup
+    ON job_sources(job_id, source_id, source_job_id);
+CREATE INDEX idx_job_sources_source ON job_sources(source_id, source_job_id);
+CREATE INDEX idx_job_sources_presence
+    ON job_sources(presence_state, last_seen_at, last_verified_at);
+CREATE UNIQUE INDEX idx_job_sources_native_identity
+    ON job_sources(source_id, source_job_id, source_identity_generation)
+    WHERE source_job_id IS NOT NULL;
+"""
+) -> None:
+    return sql
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -805,6 +1060,11 @@ def _finalize() -> None:
 
 _finalize()
 
+# Steps whose SQL rebuilds existing tables (SQLite 12-step ALTER procedure).
+# The machinery runs these with foreign keys disabled for the duration of the
+# step and gates COMMIT on a clean PRAGMA foreign_key_check (03 §50).
+REBUILD_STEPS: frozenset[int] = frozenset({10})
+
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 9, "Slice 1 S1.1 schema is versions 1-9"
+assert LATEST_SCHEMA_VERSION == 10, "Slice 1 S1.1 schema is versions 1-10 (v10 corrective)"

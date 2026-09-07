@@ -31,7 +31,11 @@ from jobscraper.db.connection import (
     immediate_transaction,
     verify_sqlite_settings,
 )
-from jobscraper.db.schema_sql import LATEST_SCHEMA_VERSION, MIGRATION_STEPS
+from jobscraper.db.schema_sql import (
+    LATEST_SCHEMA_VERSION,
+    MIGRATION_STEPS,
+    REBUILD_STEPS,
+)
 from jobscraper.timeutil import utc_now_s
 
 
@@ -85,16 +89,16 @@ def migrate_schema(conn: sqlite3.Connection, target_version: int) -> list[int]:
             if has_table is None
             else ""
         )
-        script = (
-            "BEGIN IMMEDIATE;\n"
-            + bookkeeping
-            + sql
-            + f"\nINSERT INTO schema_migrations(version, name, applied_at) "
+        insert_version_row = (
+            f"\nINSERT INTO schema_migrations(version, name, applied_at) "
             f"VALUES ({int(version)}, '{name.replace(chr(39), chr(39)*2)}', '{utc_now_s()}');\n"
-            "COMMIT;\n"
         )
         try:
-            conn.executescript(script)
+            if version in REBUILD_STEPS:
+                _executes_rebuild_step(conn, bookkeeping + sql + insert_version_row, version)
+            else:
+                script = "BEGIN IMMEDIATE;\n" + bookkeeping + sql + insert_version_row + "COMMIT;\n"
+                conn.executescript(script)
         except sqlite3.Error:
             # Ensure no half-open transaction survives a failed script.
             try:
@@ -104,6 +108,49 @@ def migrate_schema(conn: sqlite3.Connection, target_version: int) -> list[int]:
             raise
         applied.append(version)
     return applied
+
+
+def _executes_rebuild_step(
+    conn: sqlite3.Connection, step_sql: str, version: int
+) -> None:
+    """Apply a table-rebuild step under SQLite's documented 12-step procedure.
+
+    Dropping a table that other tables' foreign keys reference cannot run
+    under immediate FK enforcement: the implicit DELETE records a violation
+    that re-inserting the rows into the rebuilt table does not clear, so even
+    a correct rebuild would fail COMMIT. SQLite's documented procedure is to
+    disable FK enforcement for the rebuild and verify with
+    ``PRAGMA foreign_key_check`` before committing.
+
+    Fail-closed discipline: the check runs INSIDE the step transaction, so a
+    violation aborts the step (nothing commits) and FK enforcement is always
+    restored for the connection afterwards.
+    """
+    fk_was_on = int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) == 1
+    try:
+        if fk_was_on:
+            # Must happen outside a transaction (no-op otherwise); the
+            # connection is in autocommit mode between steps.
+            conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            # No trailing COMMIT: the foreign-key gate below commits.
+            conn.executescript("BEGIN IMMEDIATE;\n" + step_sql)
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise MigrationError(
+                    f"rebuild migration step {version} left"
+                    f" foreign key violations: {violations[:5]}"
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+    finally:
+        if fk_was_on:
+            conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _application_consistency_checks(conn: sqlite3.Connection) -> list[str]:

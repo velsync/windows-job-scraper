@@ -18,4 +18,4 @@ def test_version_contract_is_initial_and_semantic() -> None:
     # agreement with the migration steps is asserted in test_migrations.
     from jobscraper.db.schema_sql import LATEST_SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION >= 9
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION >= 10
