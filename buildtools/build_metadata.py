@@ -53,19 +53,40 @@ def _chromium_revision() -> tuple[str, str]:
     """Expected pinned Chromium revision and installed browser path.
 
     The exact Playwright/Chromium pair is pinned by the production lock; the
-    installed browser revision/path is discovered from the Playwright package
-    without launching anything. On hosts without the browser installed the
-    path reports NOT_INSTALLED.
+    installed browser revision/path is probed from the local Playwright
+    browsers registry directory without launching any process. Hosts without
+    the browser installed report NOT_INSTALLED.
     """
-    try:
-        from playwright.sync_api import sync_playwright
+    return _playwright_expected_chromium(), _probe_installed_chromium()
 
-        with sync_playwright() as p:
-            path = p.chromium.executable_path
-            installed = "INSTALLED" if path else "NOT_INSTALLED"
-            return _playwright_expected_chromium(), f"{installed}:{path}"
-    except Exception:
-        return _playwright_expected_chromium(), "NOT_INSTALLED"
+
+def _probe_installed_chromium() -> str:
+    import glob
+    import os
+
+    env_root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    candidates: list[str] = []
+    if env_root:
+        candidates.append(env_root)
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(os.path.join(local, "ms-playwright"))
+    elif sys.platform == "darwin":
+        candidates.append(os.path.expanduser("~/Library/Caches/ms-playwright"))
+    else:
+        candidates.append(os.path.expanduser("~/.cache/ms-playwright"))
+    exe_names = {"win32": "chrome.exe", "darwin": "chrome"}
+    exe = exe_names.get(sys.platform, "chrome")
+    for root in candidates:
+        for pattern in (
+            os.path.join(root, "chromium-*", "chrome-*", exe),
+            os.path.join(root, "chromium-*", "**", exe),
+        ):
+            hits = glob.glob(pattern, recursive=True)
+            if hits:
+                return f"INSTALLED:{hits[0]}"
+    return "NOT_INSTALLED"
 
 
 def _playwright_expected_chromium() -> str:

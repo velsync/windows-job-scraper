@@ -1,0 +1,210 @@
+"""Forward-only schema migrations.
+
+Authority: docs/spec/v0.3.1.3/05_windows_packaging_and_operations.md section 57
+(migration); module 03 section 50.
+
+Migration gate sequence (owned by the service startup coordinator):
+
+    verify DB -> create backup -> run ordered migration -> integrity check +
+    foreign_key_check + application consistency checks -> verify PRAGMAs ->
+    record schema version.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+from jobscraper.db.connection import (
+    Database,
+    fts5_available,
+    immediate_transaction,
+    verify_sqlite_settings,
+)
+from jobscraper.db.schema_sql import LATEST_SCHEMA_VERSION, MIGRATION_STEPS
+from jobscraper.timeutil import utc_now_s
+
+
+class MigrationError(Exception):
+    """Raised when a migration cannot be applied safely."""
+
+
+def current_schema_version(conn: sqlite3.Connection) -> int:
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone()
+    if not has_table:
+        return 0
+    row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+    return int(row[0] or 0)
+
+
+def _migration_sql_map() -> dict[int, tuple[str, str]]:
+    return {version: (name, sql) for version, name, sql in MIGRATION_STEPS}
+
+
+def migrate_schema(conn: sqlite3.Connection, target_version: int) -> list[int]:
+    """Apply forward-only migrations up to ``target_version``.
+
+    Returns the list of applied versions. Refuses downgrades. Each step runs
+    inside one explicit ``BEGIN IMMEDIATE ... COMMIT`` block carried by the
+    script itself (sqlite3 ``executescript`` performs no implicit transaction
+    control in autocommit connections), so a crash mid-step leaves either the
+    fully applied step (tables + version row) or none of it.
+    """
+    applied: list[int] = []
+    steps = _migration_sql_map()
+    if target_version > LATEST_SCHEMA_VERSION:
+        raise MigrationError(f"unknown target version {target_version}")
+    current = current_schema_version(conn)
+    if target_version < current:
+        raise MigrationError(
+            f"downgrade refused: current={current} target={target_version} "
+            "(forward-only migrations)"
+        )
+    for version in range(current + 1, target_version + 1):
+        if version not in steps:
+            raise MigrationError(f"missing migration step {version}")
+        name, sql = steps[version]
+        has_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        ).fetchone()
+        bookkeeping = (
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);\n"
+            if has_table is None
+            else ""
+        )
+        script = (
+            "BEGIN IMMEDIATE;\n"
+            + bookkeeping
+            + sql
+            + f"\nINSERT INTO schema_migrations(version, name, applied_at) "
+            f"VALUES ({int(version)}, '{name.replace(chr(39), chr(39)*2)}', '{utc_now_s()}');\n"
+            "COMMIT;\n"
+        )
+        try:
+            conn.executescript(script)
+        except sqlite3.Error:
+            # Ensure no half-open transaction survives a failed script.
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+            raise
+        applied.append(version)
+    return applied
+
+
+def _application_consistency_checks(conn: sqlite3.Connection) -> list[str]:
+    """Application-level consistency checks beyond SQLite's own checks."""
+    problems: list[str] = []
+    checks = [
+        # (name, sql, must_be_zero)
+        ("orphan job_locations", "SELECT COUNT(*) FROM job_locations WHERE job_id NOT IN (SELECT id FROM jobs)", True),
+        ("orphan job_profile_state", "SELECT COUNT(*) FROM job_profile_state WHERE job_id NOT IN (SELECT id FROM jobs)", True),
+        ("orphan applications", "SELECT COUNT(*) FROM applications WHERE job_id NOT IN (SELECT id FROM jobs)", True),
+        ("job_sources without job", "SELECT COUNT(*) FROM job_sources WHERE job_id NOT IN (SELECT id FROM jobs)", True),
+        ("jobs listing in application status", "SELECT COUNT(*) FROM jobs WHERE listing_status IN ('APPLIED','PREPARING','INTERVIEWING')", True),
+        ("absence transitions without coverage", "SELECT COUNT(*) FROM job_sources WHERE last_absence_coverage_id IS NOT NULL AND last_absence_coverage_id NOT IN (SELECT id FROM enumeration_coverage)", True),
+    ]
+    for name, sql, must_be_zero in checks:
+        try:
+            count = int(conn.execute(sql).fetchone()[0])
+        except sqlite3.OperationalError:
+            continue  # table absent in this schema version
+        if must_be_zero and count:
+            problems.append(f"{name}: {count}")
+    return problems
+
+
+def run_database_checks(conn: sqlite3.Connection) -> dict[str, object]:
+    """Run integrity, foreign-key, FTS and application consistency checks."""
+    result: dict[str, object] = {"ok": True, "problems": []}
+    problems: list[str] = []
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    result["integrity_check"] = integrity
+    if integrity != "ok":
+        problems.append(f"integrity_check: {integrity}")
+        result["ok"] = False
+    fk_rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+    result["foreign_key_check"] = len(fk_rows)
+    if fk_rows:
+        problems.append(f"foreign_key_check violations: {len(fk_rows)}")
+        result["ok"] = False
+    app_problems = _application_consistency_checks(conn)
+    if app_problems:
+        problems.extend(app_problems)
+        result["ok"] = False
+    result["fts5"] = fts5_available(conn)
+    if not result["fts5"]:
+        problems.append("FTS5 unavailable")
+    try:
+        result["pragmas"] = verify_sqlite_settings(conn).as_dict()
+    except sqlite3.DatabaseError as exc:
+        problems.append(f"pragma verification failed: {exc}")
+        result["ok"] = False
+    result["problems"] = problems
+    return result
+
+
+def migrate_database_with_backup(
+    db: Database, *, create_backup, target_version: int = LATEST_SCHEMA_VERSION
+) -> dict[str, object]:
+    """Full migration gate with backup-before-mutation.
+
+    ``create_backup`` is a callable returning the backup directory Path (it is
+    provided by jobscraper.db.backup to avoid a circular import).
+    """
+    report: dict[str, object] = {
+        "from_version": current_schema_version(db.conn),
+        "to_version": target_version,
+        "backup": None,
+        "applied": [],
+        "checks": {},
+        "ok": False,
+    }
+    pre_checks = run_database_checks(db.conn)
+    report["pre_checks"] = pre_checks
+    if not pre_checks["ok"]:
+        raise MigrationError(f"pre-migration checks failed: {pre_checks['problems']}")
+
+    if current_schema_version(db.conn) < target_version:
+        backup_dir = create_backup(kind="PRE_MIGRATION")
+        report["backup"] = str(backup_dir)
+        applied = migrate_schema(db.conn, target_version)
+        report["applied"] = applied
+    else:
+        report["applied"] = []
+
+    post_checks = run_database_checks(db.conn)
+    report["checks"] = post_checks
+    report["ok"] = bool(post_checks["ok"])
+    if not post_checks["ok"]:
+        raise MigrationError(f"post-migration checks failed: {post_checks['problems']}")
+    with immediate_transaction(db.conn) as tx:
+        tx.execute(
+            "INSERT INTO app_meta(key, value, updated_at) VALUES ('schema_version', ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (str(target_version), utc_now_s()),
+        )
+    return report
+
+
+def open_database_at_latest(
+    path: Path, *, busy_timeout_ms: int = 5000, create_backup=None
+) -> Database:
+    """Open (creating if needed) a database at the latest schema version."""
+    db = Database(path, busy_timeout_ms=busy_timeout_ms)
+    try:
+        if create_backup is not None:
+            migrate_database_with_backup(db, create_backup=create_backup)
+        else:
+            migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
+            checks = run_database_checks(db.conn)
+            if not checks["ok"]:
+                raise MigrationError(f"checks failed: {checks['problems']}")
+    except BaseException:
+        db.close()
+        raise
+    return db
