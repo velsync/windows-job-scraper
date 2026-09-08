@@ -211,18 +211,21 @@ def _clean_markdown(raw: str) -> str:
 
 
 def _markdown_to_text(markdown: str) -> str:
-    """Markdown → plain text (labels only, no Markdown syntax residue)."""
+    """Markdown → plain text while preserving stable block boundaries."""
     text = markdown or ""
     text = _MD_FENCE.sub("", text)
-    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = _MD_LINK.sub(r"\1", text)
     text = _MD_HEADING.sub("", text)
     text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
     text = re.sub(r"__([^_]+)__", r"\1", text)
     text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
     text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = _MD_BULLET.sub("", text)
-    text = _MD_NUMBERED.sub("", text)
+    # HTML list items historically become separate text blocks.  Preserve that
+    # same representation when re-cleaning the canonical Markdown by adding a
+    # block break after each Markdown list item before the final collapse.
+    text = re.sub(r"^\s*[-*+]\s+(.+)$", r"\1\n", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+[.)]\s+(.+)$", r"\1\n", text, flags=re.MULTILINE)
     text = re.sub(r"^>\s?", "", text, flags=re.MULTILINE)
     text = re.sub(r"^\s*([-*_])\s*(\1\s*){2,}$", "", text, flags=re.MULTILINE)
     return _derived_text(text)
