@@ -9,14 +9,17 @@ host-owned surface.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
 
+from jobscraper.adapters.contract import validate_manifest
 from jobscraper.adapters.fingerprint import AtsFingerprint
 from jobscraper.adapters.router import RouteCandidate, RouteDecision, RouteOutcome
 from jobscraper.runtime.provisioning import (
     ProvisioningError,
+    ensure_builtin_adapter_definition,
     provision_source_and_binding,
     record_fingerprint,
     record_route_decision,
@@ -50,6 +53,34 @@ def populated_db(db):
         (now,),
     )
     conn.commit()
+    return db
+
+
+@pytest.fixture()
+def greenhouse_db(db):
+    """populated_db plus the built-in Greenhouse adapter identity."""
+    from jobscraper.runtime.provisioning import ensure_builtin_adapter_definition
+
+    conn = db.conn
+    conn.execute(
+        "INSERT INTO adapter_definitions (adapter_id, adapter_version,"
+        " adapter_api_version, manifest_json, created_at)"
+        " VALUES ('json_api_feed', '1.0.0', '1', '{}',"
+        " '2026-09-08T00:00:00.000000Z')"
+    )
+    conn.execute(
+        "INSERT INTO adapter_permission_profiles (id, display_name, created_at)"
+        " VALUES ('perm-default', 'default', '2026-09-08T00:00:00.000000Z')"
+    )
+    conn.execute(
+        "INSERT INTO adapter_permission_profile_revisions"
+        " (id, permission_profile_id, revision, policy_json, created_at)"
+        " VALUES ('permrev-1', 'perm-default', 1, '{}', '2026-09-08T00:00:00.000000Z')"
+    )
+    conn.commit()
+    ensure_builtin_adapter_definition(
+        conn, "greenhouse", now="2026-09-08T00:00:00.000000Z"
+    )
     return db
 
 
@@ -383,3 +414,281 @@ class TestProvisionSourceAndBinding:
         )
         assert result.fingerprint_id is not None
         assert result.route_decision_id is not None
+
+
+# ---------------------------------------------------------------------------
+# S2.5 — adapter config pinning (02 §8/§9, 03 §50, RUN-17)
+# ---------------------------------------------------------------------------
+
+def _provision_greenhouse(conn, *, config=None, now="2026-09-08T00:00:01.000000Z"):
+    return provision_source_and_binding(
+        conn,
+        display_name="Acme Careers",
+        source_family="ATS",
+        entry_url="https://boards.greenhouse.io/acme",
+        canonical_host="boards.greenhouse.io",
+        adapter_id="greenhouse",
+        adapter_version="1.0.0",
+        strategy="PROVIDER_NATIVE",
+        execution_class="HTTP",
+        config=config,
+        now=now,
+    )
+
+
+class TestBindingRevisionConfig:
+    """The adapter config a run will use is pinned into the immutable revision.
+
+    A provider adapter cannot run without one (which board? what bounds?), and
+    the config must be part of the revision identity — not mutable state read
+    at run time — so an executed run always replays against exactly the config
+    it was authorized with (ARC-04.3, 03 §50).
+    """
+
+    def test_config_is_stored_on_the_revision(self, greenhouse_db):
+        conn = greenhouse_db.conn
+        result = _provision_greenhouse(conn, config={"board": "acme"})
+        rev = conn.execute(
+            "SELECT config_json FROM source_adapter_binding_revisions WHERE id = ?",
+            (result.binding_revision_id,),
+        ).fetchone()
+        assert json.loads(rev["config_json"]) == {"board": "acme"}
+
+    def test_config_absent_defaults_to_empty_object(self, greenhouse_db):
+        """Back-compat: existing callers pass no config and get ``{}``."""
+        conn = greenhouse_db.conn
+        result = _provision_greenhouse(conn)
+        rev = conn.execute(
+            "SELECT config_json FROM source_adapter_binding_revisions WHERE id = ?",
+            (result.binding_revision_id,),
+        ).fetchone()
+        assert json.loads(rev["config_json"]) == {}
+
+    def test_same_config_reuses_the_same_revision(self, greenhouse_db):
+        conn = greenhouse_db.conn
+        config = {"board": "acme", "detail_fetch": True}
+        r1 = _provision_greenhouse(conn, config=config)
+        r2 = _provision_greenhouse(
+            conn, config=dict(config), now="2026-09-08T00:00:02.000000Z"
+        )
+        assert r1.binding_revision_id == r2.binding_revision_id
+        assert r1.source_id == r2.source_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM source_adapter_binding_revisions"
+        ).fetchone()[0] == 1
+
+    def test_config_key_order_does_not_change_revision_identity(self, greenhouse_db):
+        """Serialization is deterministic, so equality is not spelling luck."""
+        conn = greenhouse_db.conn
+        r1 = _provision_greenhouse(conn, config={"board": "acme", "detail_fetch": True})
+        r2 = _provision_greenhouse(
+            conn,
+            config={"detail_fetch": True, "board": "acme"},
+            now="2026-09-08T00:00:02.000000Z",
+        )
+        assert r1.binding_revision_id == r2.binding_revision_id
+
+    def test_changed_config_creates_a_new_revision_and_never_mutates_the_old(
+        self, greenhouse_db
+    ):
+        """Immutability: re-pointing a board is a new authorization, not an edit."""
+        conn = greenhouse_db.conn
+        r1 = _provision_greenhouse(conn, config={"board": "acme"})
+        r2 = _provision_greenhouse(
+            conn, config={"board": "globex"}, now="2026-09-08T00:00:02.000000Z"
+        )
+        assert r1.binding_id == r2.binding_id
+        assert r1.binding_revision_id != r2.binding_revision_id
+        old = conn.execute(
+            "SELECT revision, config_json FROM source_adapter_binding_revisions"
+            " WHERE id = ?",
+            (r1.binding_revision_id,),
+        ).fetchone()
+        new = conn.execute(
+            "SELECT revision, config_json FROM source_adapter_binding_revisions"
+            " WHERE id = ?",
+            (r2.binding_revision_id,),
+        ).fetchone()
+        assert json.loads(old["config_json"]) == {"board": "acme"}
+        assert json.loads(new["config_json"]) == {"board": "globex"}
+        assert new["revision"] == old["revision"] + 1
+
+    def test_the_revision_is_pinned_as_the_bindings_current_one(self, greenhouse_db):
+        """A provisioned revision must be runnable, not just recorded.
+
+        The host's run planner selects plans through
+        ``source_adapter_bindings.current_revision_id``; provisioning is the
+        surface that authorized this adapter+config, so it is also the surface
+        that points the binding at it.
+        """
+        conn = greenhouse_db.conn
+        result = _provision_greenhouse(conn, config={"board": "acme"})
+        binding = conn.execute(
+            "SELECT current_revision_id FROM source_adapter_bindings WHERE id = ?",
+            (result.binding_id,),
+        ).fetchone()
+        assert binding["current_revision_id"] == result.binding_revision_id
+
+    def test_reprovisioning_moves_the_pin_and_keeps_the_old_revision(self, greenhouse_db):
+        conn = greenhouse_db.conn
+        first = _provision_greenhouse(conn, config={"board": "acme"})
+        second = _provision_greenhouse(
+            conn, config={"board": "globex"}, now="2026-09-08T00:00:02.000000Z"
+        )
+        binding = conn.execute(
+            "SELECT current_revision_id FROM source_adapter_bindings WHERE id = ?",
+            (second.binding_id,),
+        ).fetchone()
+        assert binding["current_revision_id"] == second.binding_revision_id
+        # the superseded authorization stays inspectable and unchanged
+        old = conn.execute(
+            "SELECT config_json, superseded_at FROM source_adapter_binding_revisions"
+            " WHERE id = ?",
+            (first.binding_revision_id,),
+        ).fetchone()
+        assert json.loads(old["config_json"]) == {"board": "acme"}
+        assert old["superseded_at"] is None
+
+    def test_pinning_is_idempotent(self, greenhouse_db):
+        conn = greenhouse_db.conn
+        config = {"board": "acme"}
+        first = _provision_greenhouse(conn, config=config)
+        again = _provision_greenhouse(
+            conn, config=dict(config), now="2026-09-08T00:00:03.000000Z"
+        )
+        assert again.binding_revision_id == first.binding_revision_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM source_adapter_bindings"
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT current_revision_id FROM source_adapter_bindings"
+        ).fetchone()["current_revision_id"] == first.binding_revision_id
+
+    def test_config_reaching_the_driver_is_the_pinned_one(self, greenhouse_db):
+        """The driver reads config from the revision — one source of truth."""
+        from jobscraper.pipeline.driver import _plan_config
+
+        conn = greenhouse_db.conn
+        result = _provision_greenhouse(conn, config={"board": "acme", "max_detail_requests": 7})
+        plan_row = conn.execute(
+            "SELECT ? AS binding_revision_id", (result.binding_revision_id,)
+        ).fetchone()
+        assert _plan_config(conn, plan_row) == {
+            "board": "acme",
+            "max_detail_requests": 7,
+        }
+
+
+# ---------------------------------------------------------------------------
+# S2.5 — built-in adapter definitions come from the registry manifest
+# ---------------------------------------------------------------------------
+
+class TestEnsureBuiltinAdapterDefinition:
+    """A built-in adapter's durable identity row is derived from its manifest.
+
+    The registry is the only place an adapter identity is declared in code, so
+    provisioning must read the manifest rather than accept a hand-written
+    identity: a durable row that disagrees with the code it authorizes would
+    make provenance unverifiable (02 §8, ARC-04.3).
+    """
+
+    def test_ensure_registers_greenhouse_from_the_manifest(self, db):
+        from jobscraper.adapters.greenhouse import MANIFEST
+
+        conn = db.conn
+        definition = ensure_builtin_adapter_definition(
+            conn, "greenhouse", now="2026-09-08T00:00:01.000000Z"
+        )
+        assert definition.created is True
+        assert definition.adapter_id == "greenhouse"
+        assert definition.adapter_version == MANIFEST.version
+        row = conn.execute(
+            "SELECT * FROM adapter_definitions WHERE adapter_id = 'greenhouse'"
+        ).fetchone()
+        assert row["adapter_api_version"] == MANIFEST.adapter_api_version
+        assert row["is_builtin"] == 1
+        assert row["created_at"] == "2026-09-08T00:00:01.000000Z"
+        stored = json.loads(row["manifest_json"])
+        assert stored["id"] == "greenhouse"
+        assert stored["version"] == MANIFEST.version
+        assert list(stored["capabilities"]) == list(MANIFEST.capabilities)
+        # the durable row must round-trip through the same validation the
+        # registry applies, so a corrupt row cannot be read back as an adapter
+        assert validate_manifest(stored).id == "greenhouse"
+
+    def test_ensure_is_idempotent(self, db):
+        conn = db.conn
+        first = ensure_builtin_adapter_definition(
+            conn, "greenhouse", now="2026-09-08T00:00:01.000000Z"
+        )
+        second = ensure_builtin_adapter_definition(
+            conn, "greenhouse", now="2026-09-08T00:00:05.000000Z"
+        )
+        assert first.created is True
+        assert second.created is False
+        assert second.adapter_version == first.adapter_version
+        assert conn.execute("SELECT COUNT(*) FROM adapter_definitions").fetchone()[0] == 1
+        row = conn.execute(
+            "SELECT created_at FROM adapter_definitions WHERE adapter_id = 'greenhouse'"
+        ).fetchone()
+        assert row["created_at"] == "2026-09-08T00:00:01.000000Z"
+
+    def test_ensure_never_overwrites_an_existing_identity_row(self, db):
+        """Append-only identity: a pre-existing row wins, it is not rewritten."""
+        conn = db.conn
+        conn.execute(
+            "INSERT INTO adapter_definitions (adapter_id, adapter_version,"
+            " adapter_api_version, manifest_json, is_builtin, created_at)"
+            " VALUES ('greenhouse', '1.0.0', '1', '{\"hand\":\"written\"}', 1,"
+            " '2026-01-01T00:00:00.000000Z')"
+        )
+        conn.commit()
+        definition = ensure_builtin_adapter_definition(
+            conn, "greenhouse", now="2026-09-08T00:00:01.000000Z"
+        )
+        assert definition.created is False
+        row = conn.execute(
+            "SELECT manifest_json, created_at FROM adapter_definitions"
+            " WHERE adapter_id = 'greenhouse'"
+        ).fetchone()
+        assert json.loads(row["manifest_json"]) == {"hand": "written"}
+        assert row["created_at"] == "2026-01-01T00:00:00.000000Z"
+
+    def test_ensure_refuses_an_adapter_the_registry_does_not_define(self, db):
+        conn = db.conn
+        with pytest.raises(ProvisioningError):
+            ensure_builtin_adapter_definition(conn, "lever")
+        assert conn.execute("SELECT COUNT(*) FROM adapter_definitions").fetchone()[0] == 0
+
+    def test_ensure_pins_the_requested_version_when_given(self, db):
+        conn = db.conn
+        definition = ensure_builtin_adapter_definition(
+            conn, "greenhouse", adapter_version="1.0.0", now="2026-09-08T00:00:01.000000Z"
+        )
+        assert definition.adapter_version == "1.0.0"
+        with pytest.raises(ProvisioningError):
+            # a version the manifest does not declare is not this adapter's identity
+            ensure_builtin_adapter_definition(conn, "greenhouse", adapter_version="9.9.9")
+
+    def test_ensure_then_provision_produces_a_runnable_binding(self, db):
+        """The two host surfaces compose: define the adapter, then bind it."""
+        conn = db.conn
+        ensure_builtin_adapter_definition(
+            conn, "greenhouse", now="2026-09-08T00:00:01.000000Z"
+        )
+        conn.execute(
+            "INSERT INTO adapter_permission_profiles (id, display_name, created_at)"
+            " VALUES ('perm-default', 'default', '2026-09-08T00:00:01.000000Z')"
+        )
+        conn.execute(
+            "INSERT INTO adapter_permission_profile_revisions"
+            " (id, permission_profile_id, revision, policy_json, created_at)"
+            " VALUES ('permrev-1', 'perm-default', 1, '{}', '2026-09-08T00:00:01.000000Z')"
+        )
+        conn.commit()
+        result = _provision_greenhouse(conn, config={"board": "acme"})
+        assert result.binding_revision_id
+        assert conn.execute(
+            "SELECT adapter_id FROM source_adapter_binding_revisions WHERE id = ?",
+            (result.binding_revision_id,),
+        ).fetchone()["adapter_id"] == "greenhouse"

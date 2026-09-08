@@ -1,0 +1,67 @@
+{
+  "id": 4002,
+  "internal_job_id": 900002,
+  "title": "Platform Engineer",
+  "updated_at": "2026-09-01T12:00:00Z",
+  "requisition_id": "REQ-4002",
+  "location": {
+    "name": "Berlin, Germany / Paris, France"
+  },
+  "absolute_url": "https://boards.greenhouse.io/acme/jobs/4002?utm_source=board_mailer",
+  "departments": [
+    {
+      "id": 12,
+      "name": "Infrastructure"
+    }
+  ],
+  "offices": [
+    {
+      "id": 21,
+      "name": "Berlin",
+      "location": "Berlin, Germany"
+    },
+    {
+      "id": 22,
+      "name": "Paris",
+      "location": "Paris, France"
+    }
+  ],
+  "job_listing_admin_locations": [
+    {
+      "city": "Berlin",
+      "state": "Berlin",
+      "country": "Germany",
+      "location_type": "Employee - Hybrid",
+      "display_active": true
+    },
+    {
+      "city": "Paris",
+      "state": "Ile-de-France",
+      "country": "France",
+      "location_type": "Employee - Hybrid",
+      "display_active": true
+    }
+  ],
+  "applicant_location_requirements": [
+    {
+      "location_type": "Employee - Remote",
+      "country": "Germany",
+      "state": null,
+      "city": null
+    },
+    {
+      "location_type": "Employee - Remote",
+      "country": "France",
+      "state": null,
+      "city": null
+    }
+  ],
+  "job_post_information": {
+    "employement_type": "Full time",
+    "date_published": "2026-08-30T06:00:00Z",
+    "job_family": "Infrastructure",
+    "degree_required": false,
+    "remote": true
+  },
+  "content": "<div class=\"job__description--opening\"><h2>Platform Engineer</h2><p>Work from <em>Berlin</em> or <em>Paris</em> on the runtime that keeps acquisition honest.</p><h3>Responsibilities</h3><ul><li>Lease and fencing semantics</li><li>Packaging for Windows</li></ul><p>Referral tracking: <a href=\"https://acme.example/careers?utm_source=newsletter&amp;utm_medium=email\">careers page</a>.</p></div>"
+}

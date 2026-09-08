@@ -158,7 +158,7 @@ def refresh_canonical_presentation(
             title = ?, normalized_title = ?, description_md = ?,
             description_text = ?, description_lang = ?, description_hash = ?,
             salary_original_text = ?, salary_min = ?, salary_max = ?,
-            salary_currency = ?, salary_period = ?,
+            salary_currency = ?, salary_period = ?, posted_at = ?,
             origin_provider = ?, origin_board = ?, origin_job_id = ?,
             remote_mode = ?, remote_worldwide = ?,
             employment_type = ?, experience_level = ?,
@@ -179,6 +179,13 @@ def refresh_canonical_presentation(
             winner_norm.salary_max if winner_norm and winner_norm.salary_max is not None else job["salary_max"],
             (winner_norm.salary_currency if winner_norm else None) or job["salary_currency"],
             (winner_norm.salary_period if winner_norm else None) or job["salary_period"],
+            # A publication time is a stable fact, so it is *filled*, never
+            # rewritten: a listing that states no posted time (the common
+            # provider-native shape — S2.5) leaves the row NULL until an
+            # observation of the winning presence states one, and a value
+            # already established is never replaced by a later disagreement
+            # (that would flap a fact no change class records).
+            job["posted_at"] or (winner_norm.posted_at if winner_norm else None),
             # origin identity rolls up from the winning presence's resolved
             # evidence (02 §32); it is never written by a collector directly
             winner["origin_provider"],

@@ -119,6 +119,42 @@ class AdapterTask:
     query_id: str | None = None
 
 
+#: Durable acquisition request type → adapter task kind (02 ACQ-02).
+#:
+#: The mapping is explicit data owned by the adapter contract, so a host can
+#: never dispatch a durable request type through an unstated task kind.  The
+#: pipeline request types (`NORMALIZE`, `RECONCILE`, `ENRICH`, `ELIGIBILITY`,
+#: `SCORE`, `EXPORT`) are host-native durable tasks and are deliberately
+#: absent: they are not dispatched through the source-adapter protocol.
+ACQ02_REQUEST_TASK_MAP: Mapping[str, AdapterTaskKind] = {
+    "SOURCE_HEALTH_CHECK": AdapterTaskKind.HEALTH,
+    "SOURCE_DISCOVERY": AdapterTaskKind.DISCOVER,
+    "LIST_FETCH": AdapterTaskKind.ENUMERATE,
+    "SOURCE_CRAWL": AdapterTaskKind.CRAWL,
+    "DETAIL_FETCH": AdapterTaskKind.DETAIL,
+    "ADAPTER_SMOKE": AdapterTaskKind.SMOKE,
+}
+
+#: Host-native request types: durable work that never reaches an adapter.
+HOST_NATIVE_REQUEST_TYPE_NAMES: frozenset[str] = frozenset(
+    {"NORMALIZE", "RECONCILE", "ENRICH", "ELIGIBILITY", "SCORE", "EXPORT"}
+)
+
+
+def task_kind_for_request_type(request_type: str) -> AdapterTaskKind | None:
+    """The ACQ-02 task kind for one durable request type.
+
+    ``None`` for a host-native pipeline task (it is not adapter work);
+    ``ValueError`` for a request type nobody owns — an unknown type is a
+    contract break, never a silently defaulted task.
+    """
+    if request_type in ACQ02_REQUEST_TASK_MAP:
+        return ACQ02_REQUEST_TASK_MAP[request_type]
+    if request_type in HOST_NATIVE_REQUEST_TYPE_NAMES:
+        return None
+    raise ValueError(f"request type has no ACQ-02 task mapping: {request_type!r}")
+
+
 #: Page classes a *normal* parser may be handed at all (02 ACQ-02 gate).
 #: EMPTY is included because a recognized empty enumeration is a successful
 #: outcome, not an invalid page; everything else is host-policy territory.
@@ -349,7 +385,9 @@ def json_dumps(value: Any) -> str:
 
 
 __all__ = [
+    "ACQ02_REQUEST_TASK_MAP",
     "CONTRACT_VERSION",
+    "HOST_NATIVE_REQUEST_TYPE_NAMES",
     "NORMAL_PARSE_CLASSES",
     "PARSE_CONTRACT_VERSION",
     "AdapterManifest",
@@ -369,6 +407,7 @@ __all__ = [
     "StopPolicy",
     "ValidatedResult",
     "ValidatedResultEnvelope",
+    "task_kind_for_request_type",
     "validate_manifest",
     "value_hash",
 ]

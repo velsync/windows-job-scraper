@@ -1,0 +1,43 @@
+{
+  "id": 4001,
+  "internal_job_id": 900001,
+  "title": "Backend Engineer",
+  "updated_at": "2026-08-20T09:15:00-04:00",
+  "first_published_at": "2026-08-18T06:00:00Z",
+  "requisition_id": "REQ-4001",
+  "location": {
+    "name": "Berlin, Germany"
+  },
+  "absolute_url": "https://boards.greenhouse.io/acme/jobs/4001",
+  "departments": [
+    {
+      "id": 11,
+      "name": "Engineering"
+    }
+  ],
+  "offices": [
+    {
+      "id": 21,
+      "name": "Berlin",
+      "location": "Berlin, Germany"
+    }
+  ],
+  "job_listing_admin_locations": [
+    {
+      "city": "Berlin",
+      "state": "Berlin",
+      "country": "Germany",
+      "location_type": "Employee - Onsite",
+      "display_active": true
+    }
+  ],
+  "applicant_location_requirements": [],
+  "job_post_information": {
+    "employement_type": "Full time",
+    "date_published": "2026-08-18T06:00:00Z",
+    "job_family": "Engineering",
+    "degree_required": false,
+    "remote": false
+  },
+  "content": "<div class=\"job__description--opening\"><h2>Backend Engineer</h2><p>Acme Fixtures builds <strong>local-first</strong> tooling. You will design and ship durable Python services backed by SQLite.</p><ul><li>Own the ingestion pipeline</li><li>Write tests first</li><li>Keep provenance immutable</li></ul><p>Salary band: EUR 78.000 - 92.000 per year.</p><p>Apply through the board: <a href=\"https://boards.greenhouse.io/acme/jobs/4001\">job page</a>.</p></div>"
+}

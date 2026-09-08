@@ -274,6 +274,70 @@ def test_reobservation_same_native_identity_one_canonical_job(db):
     assert changes == 0
 
 
+def test_an_unknown_posted_at_is_filled_and_a_known_one_never_rewritten(db):
+    """``jobs.posted_at`` is a stable fact: filled once, never flapped.
+
+    The provider-native shape (S2.5) makes this reachable in production: a
+    board listing states no publication time, and the detail payload that
+    follows does.  The canonical row must take the winner's value while it has
+    none, and must never rewrite an established posted time with a later
+    disagreement — no change class exists for that, so it must not happen.
+    """
+    run_id, plan_id, rid, att = _run_and_request(db)
+    _ingest(db, _obs(posted_at=None), rid, att, run_id=run_id)
+    job = db.conn.execute("SELECT id, posted_at FROM jobs").fetchone()
+    assert job["posted_at"] is None
+
+    enqueue_request(
+        db.conn,
+        run_id=run_id,
+        run_source_plan_id=plan_id,
+        source_id="src-feed",
+        binding_id="bnd-feed",
+        request_type="DETAIL_FETCH",
+        target_identity="https://jobs.example.test/jobs/fx-100",
+        logical_key="detail=fx-100",
+    )
+    claim2 = claim_next_request(db.conn, "worker-1", now=LATER)
+    _ingest(
+        db,
+        _obs(posted_at="2026-08-18T06:00:00.000000Z"),
+        claim2.request_id,
+        claim2.attempt_id,
+        now=LATER,
+        run_id=run_id,
+    )
+    filled = db.conn.execute(
+        "SELECT posted_at FROM jobs WHERE id = ?", (job["id"],)
+    ).fetchone()
+    assert filled["posted_at"] == "2026-08-18T06:00:00.000000Z"
+
+    enqueue_request(
+        db.conn,
+        run_id=run_id,
+        run_source_plan_id=plan_id,
+        source_id="src-feed",
+        binding_id="bnd-feed",
+        request_type="DETAIL_FETCH",
+        target_identity="https://jobs.example.test/jobs/fx-100",
+        logical_key="detail=fx-100-again",
+    )
+    claim3 = claim_next_request(db.conn, "worker-1", now=MUCH_LATER)
+    _ingest(
+        db,
+        _obs(posted_at="2020-01-01T00:00:00.000000Z"),
+        claim3.request_id,
+        claim3.attempt_id,
+        now=MUCH_LATER,
+        run_id=run_id,
+    )
+    kept = db.conn.execute(
+        "SELECT posted_at FROM jobs WHERE id = ?", (job["id"],)
+    ).fetchone()
+    assert kept["posted_at"] == "2026-08-18T06:00:00.000000Z"
+    assert db.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+
+
 def test_change_classes_recorded(db):
     run_id, plan_id, rid, att = _run_and_request(db)
     _ingest(db, _obs(), rid, att, run_id=run_id)
@@ -550,6 +614,60 @@ def test_non_authoritative_coverage_never_generates_absence(db):
         "SELECT presence_state FROM job_sources WHERE source_job_id = 'fx-2'"
     ).fetchone()
     assert fx2["presence_state"] == "ACTIVE"
+
+
+def test_a_resumed_pass_continues_an_unfinished_generation(db):
+    """Restart recovery must not crash on the durable generation key.
+
+    ``enumeration_coverage`` is unique per (plan, scope, generation), so a
+    second pass over the same run either continues the unfinished generation
+    or opens a distinctly named one — never a UNIQUE violation, and never a
+    rewrite of a finalized generation (S2.5, RUN-07/§18).
+    """
+    from jobscraper.pipeline.coverage import open_or_resume_coverage
+
+    run_id, plan_id, _rid, _att = _run_and_request(db)
+    kwargs = dict(
+        run_source_plan_id=plan_id,
+        source_id="src-feed",
+        binding_id="bnd-feed",
+        scope_key="full-source",
+        generation_key=f"run-{run_id}",
+        coverage_authority="AUTHORITATIVE_FULL_SOURCE",
+    )
+    first, resumed = open_or_resume_coverage(db.conn, now=NOW, **kwargs)
+    assert resumed is False
+
+    # an unfinished generation is continued, not duplicated
+    again, resumed = open_or_resume_coverage(db.conn, now=LATER, **kwargs)
+    assert again == first
+    assert resumed is True
+    assert db.conn.execute("SELECT COUNT(*) FROM enumeration_coverage").fetchone()[0] == 1
+
+    finalize_coverage(
+        db.conn, first, completion_state="PARTIAL", stop_reason="driver stop",
+        terminal_enumeration_proven=False, now=LATER,
+    )
+
+    # a finalized generation is immutable: the next pass opens its own,
+    # deterministically named
+    third, resumed = open_or_resume_coverage(db.conn, now=MUCH_LATER, **kwargs)
+    assert resumed is False
+    assert third != first
+    rows = db.conn.execute(
+        "SELECT generation_key, finalized_at FROM enumeration_coverage"
+        " ORDER BY created_at, id"
+    ).fetchall()
+    assert [row["generation_key"] for row in rows] == [
+        f"run-{run_id}", f"run-{run_id}#pass-2",
+    ]
+    assert rows[0]["finalized_at"] is not None
+    assert rows[1]["finalized_at"] is None
+
+    # and resuming that one continues it rather than naming a third
+    fourth, resumed = open_or_resume_coverage(db.conn, now=MUCH_LATER, **kwargs)
+    assert (fourth, resumed) == (third, True)
+    assert db.conn.execute("SELECT COUNT(*) FROM enumeration_coverage").fetchone()[0] == 2
 
 
 def test_finalization_barrier_refuses_complete_while_requests_running(db):

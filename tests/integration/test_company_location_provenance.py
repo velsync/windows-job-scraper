@@ -579,3 +579,67 @@ def test_projection_is_left_alone_when_the_winner_has_no_retained_payload(db):
     db.conn.commit()
     presence = db.conn.execute("SELECT * FROM job_sources").fetchone()
     assert _latest_observation_projection(db.conn, presence) is None
+
+# ---------------------------------------------------------------------------
+# S2.5 — a name-less sighting must not fabricate (or crash on) a company
+# ---------------------------------------------------------------------------
+
+
+def test_strong_identifiers_without_a_name_never_create_a_company(db):
+    """The shape a provider-native board produces before a name is known.
+
+    A Greenhouse sighting resolves an ATS board identity (§32) but the board
+    API itself does not state the employer's name.  Creating a company would
+    mean inventing one; crashing would mean one honest observation takes the
+    whole fenced commit down.  Neither happens: the decision is recorded, no
+    row is created, and the identifiers stay available for the sighting that
+    does carry a name.
+    """
+    from jobscraper.pipeline.companies import CompanySignals, resolve_company
+
+    nameless = CompanySignals(ats_provider="GREENHOUSE", ats_board="acme")
+    resolution = resolve_company(
+        db.conn,
+        signals=nameless,
+        observed_at=NOW,
+        now=NOW,
+    )
+    assert resolution.company_id is None
+    assert resolution.decision == "NO_SIGNAL"
+    assert resolution.reason_code == "IDENTIFIERS_WITHOUT_NAME"
+    assert db.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 0
+    event = db.conn.execute(
+        "SELECT * FROM company_resolution_events ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    assert event["decision"] == "NO_SIGNAL"
+    assert json.loads(event["signals_json"])["ats_board"] == "acme"
+
+    # the next sighting that does carry the employer name creates the company
+    named = CompanySignals(
+        name="Acme Fixtures", ats_provider="GREENHOUSE", ats_board="acme"
+    )
+    created = resolve_company(db.conn, signals=named, observed_at=LATER, now=LATER)
+    assert created.decision == "CREATED"
+    assert created.company_id is not None
+    company = db.conn.execute(
+        "SELECT * FROM companies WHERE id = ?", (created.company_id,)
+    ).fetchone()
+    assert company["name"] == "Acme Fixtures"
+    assert company["ats_provider"] == "GREENHOUSE"
+    assert company["ats_board"] == "acme"
+    identifiers = db.conn.execute(
+        "SELECT kind, value FROM company_identifiers WHERE company_id = ?",
+        (created.company_id,),
+    ).fetchall()
+    assert [(row["kind"], row["value"]) for row in identifiers] == [
+        ("ATS_BOARD", "GREENHOUSE/acme")
+    ]
+
+    # and a later name-less sighting from the same board attaches to it
+    attached = resolve_company(
+        db.conn, signals=nameless, observed_at=LATER, now=LATER
+    )
+    assert attached.decision == "ATTACHED"
+    assert attached.company_id == created.company_id
+    assert attached.matched_on == "ATS_BOARD"
+    assert db.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1

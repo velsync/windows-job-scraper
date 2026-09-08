@@ -342,11 +342,20 @@ def resolve_company(
         _record_event(conn, resolution, observation_id=observation_id, now=now)
         return resolution
 
-    if not signals.normalized_name and not keys:
+    if not signals.normalized_name:
+        # ``companies.name`` is the one thing this pipeline must never
+        # fabricate (01 §33.1).  Strong identifiers *without* an employer name
+        # — the shape a provider-native board sighting has before the operator
+        # records the company name, or a payload that simply omits it — cannot
+        # create a row, so nothing is created and the sighting stays
+        # explainable through its recorded decision.  The identifiers are not
+        # lost: they arrive again with the next observation, and the first
+        # sighting that does carry a name creates the company and attaches
+        # them (``_register_identifiers`` runs on both paths).
         resolution = CompanyResolution(
             company_id=None,
             decision="NO_SIGNAL",
-            reason_code="NO_COMPANY_EVIDENCE",
+            reason_code="NO_COMPANY_EVIDENCE" if not keys else "IDENTIFIERS_WITHOUT_NAME",
             signals=signals.as_dict(),
         )
         _record_event(conn, resolution, observation_id=observation_id, now=now)
@@ -355,15 +364,13 @@ def resolve_company(
     # A name collision *without* any shared strong identifier is the refused
     # merge: recorded explicitly, because it is the case an operator most often
     # wants to review (two employers that happen to normalize alike).
-    name_collision = False
-    if signals.normalized_name:
-        name_collision = (
-            conn.execute(
-                "SELECT 1 FROM companies WHERE normalized_name = ? LIMIT 1",
-                (signals.normalized_name,),
-            ).fetchone()
-            is not None
-        )
+    name_collision = (
+        conn.execute(
+            "SELECT 1 FROM companies WHERE normalized_name = ? LIMIT 1",
+            (signals.normalized_name,),
+        ).fetchone()
+        is not None
+    )
     company_id = new_id("co")
     conn.execute(
         """

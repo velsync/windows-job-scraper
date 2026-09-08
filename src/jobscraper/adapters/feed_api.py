@@ -11,6 +11,7 @@ fail is ``PARSE_MARKER_MISSING``, never ``SUCCESS_EMPTY``.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping
@@ -66,6 +67,12 @@ class FeedApiConfig:
             raise ValueError("fields mapping is required")
 
 
+#: Accepted ``config_json`` members (an unknown key is refused, never ignored).
+_CONFIG_FIELD_NAMES = frozenset(
+    config_field.name for config_field in dataclasses.fields(FeedApiConfig)
+)
+
+
 def _dig(payload: Any, dotted_path: str) -> tuple[bool, Any]:
     node = payload
     for part in dotted_path.split("."):
@@ -81,8 +88,31 @@ class FeedApiAdapter:
 
     manifest = MANIFEST
 
+    #: 03 §40 coverage barrier: this binding contract proves listing presence
+    #: from the enumeration alone (it emits no detail child work), so detail
+    #: completion is not part of the absence-authority barrier.
+    listing_identity_sufficient = True
+
     def __init__(self, config: FeedApiConfig):
         self.config = config
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, Any]) -> "FeedApiAdapter":
+        """Registry construction from a binding-revision ``config_json``.
+
+        Unknown keys are refused rather than ignored, so a config this adapter
+        does not understand cannot run with silently different semantics.
+        """
+        if not isinstance(config, Mapping):
+            raise ValueError("json_api_feed binding config must be a mapping")
+        unknown = sorted(
+            str(key)
+            for key in config
+            if key not in _CONFIG_FIELD_NAMES
+        )
+        if unknown:
+            raise ValueError(f"unknown json_api_feed binding config keys: {unknown}")
+        return cls(FeedApiConfig(**dict(config)))
 
     # ------------------------------------------------------------------ plan
 

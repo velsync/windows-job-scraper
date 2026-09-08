@@ -36,18 +36,19 @@ from jobscraper.acquisition.envelope import (
 from jobscraper.acquisition.failures import FailureKind
 from jobscraper.acquisition.httpexec import execute_request
 from jobscraper.acquisition.origin import resolve_origin
-from jobscraper.acquisition.pagevalidity import classify_page
+from jobscraper.acquisition.pagevalidity import PageClass, classify_page
 from jobscraper.adapters.contract import (
     NORMAL_PARSE_CLASSES,
     AdapterTask,
     AdapterTaskKind,
     CrawlCursor,
     ParseContext,
+    ParseOutcomeKind,
     PlanningContext,
     ValidatedResultEnvelope,
+    task_kind_for_request_type,
 )
-from jobscraper.adapters.feed_api import FeedApiAdapter, FeedApiConfig
-from jobscraper.adapters.registry import get_adapter
+from jobscraper.adapters.registry import build_adapter
 from jobscraper.ids import new_id
 from jobscraper.net.destination import (
     DestinationPolicy,
@@ -56,7 +57,7 @@ from jobscraper.net.destination import (
 from jobscraper.net.urlnorm import normalize_url
 from jobscraper.pipeline.coverage import (
     finalize_coverage,
-    open_coverage,
+    open_or_resume_coverage,
     record_seen_identity,
 )
 from jobscraper.pipeline.evidence import bounded_json
@@ -73,9 +74,30 @@ from jobscraper.runtime.requests import (
     ACQUISITION_REQUEST_TYPES,
     enqueue_request,
 )
-from jobscraper.runtime.runs import aggregate_run, mark_run_started, set_group_outcome
+from jobscraper.runtime.runs import (
+    TERMINAL_GROUP_OUTCOMES,
+    aggregate_run,
+    mark_run_started,
+    set_group_outcome,
+)
 
+#: Host-side budget on enumeration pages per plan per run (RUN-09: bounded).
 MAX_PAGES_PER_RUN = 50
+#: Host-side budget on typed detail child requests per plan per run (ACQ-04).
+#: The adapter's own stop policy is the tighter, per-source bound; this is the
+#: host's refusal to be talked into unbounded breadth by content or config.
+MAX_DETAIL_REQUESTS_PER_RUN = 200
+
+#: Request types that constitute enumeration pages for coverage purposes
+#: (03 §40: coverage links the contributing *enumeration* requests/pages).
+_ENUMERATION_REQUEST_TYPES = frozenset({"LIST_FETCH", "SOURCE_CRAWL"})
+#: Typed child work (ACQ-02 DETAIL_FETCH): budgeted separately, and part of
+#: the absence barrier only when listing identity is NOT sufficient.
+_DETAIL_REQUEST_TYPES = frozenset({"DETAIL_FETCH"})
+#: Classifier states that, for a DETAIL task, are typed closure/missing
+#: evidence rather than failures (ACQ-02): the job is gone at the provider.
+_CLOSURE_CLASSES = frozenset({PageClass.NOT_FOUND, PageClass.JOB_CLOSED})
+_OPEN_REQUEST_STATUSES = ("PENDING", "RUNNING", "RETRY_WAIT")
 
 
 def source_policy(source_row: sqlite3.Row) -> DestinationPolicy:
@@ -226,6 +248,155 @@ def _update_run_counters(conn: sqlite3.Connection, run_id: str) -> None:
     conn.commit()
 
 
+def _claim_target_reference(claim) -> str | None:
+    """The durable target reference a claimed request carries.
+
+    ``scrape_requests`` folds the target into ``request_unique_key`` and keeps
+    the request payload, so evidence rows name what the host durably recorded
+    (typed detail children carry their reference in the payload) instead of
+    reconstructing an identity from content.  ``None`` is honest: an
+    enumeration continuation records its state in the cursor, not here.
+    """
+    payload = dict(claim.payload or {})
+    value = payload.get("target_reference") or payload.get("url")
+    return value if isinstance(value, str) and value else None
+
+
+def _open_acquisition_requests(conn: sqlite3.Connection, run_source_plan_id: str) -> int:
+    """How much of this plan's own accepted acquisition work is still open.
+
+    ACQ-04/RUN-01: a plan may not be terminalized while child work it accepted
+    is still claimable or in flight — and it may not be re-driven once all of
+    that work is durably closed.
+    """
+    placeholders = ",".join("?" for _ in ACQUISITION_REQUEST_TYPES)
+    statuses = ",".join("?" for _ in _OPEN_REQUEST_STATUSES)
+    return conn.execute(
+        "SELECT COUNT(*) FROM scrape_requests"
+        f" WHERE run_source_plan_id = ? AND request_type IN ({placeholders})"
+        f" AND status IN ({statuses})",
+        (run_source_plan_id, *sorted(ACQUISITION_REQUEST_TYPES), *_OPEN_REQUEST_STATUSES),
+    ).fetchone()[0]
+
+
+def _dispatch_child_tasks(
+    conn: sqlite3.Connection,
+    *,
+    outcome_obj,
+    task_kind: AdapterTaskKind,
+    claim,
+    plan_row: sqlite3.Row,
+    run_id: str,
+    ts: str,
+) -> None:
+    """Turn an adapter's proposed child tasks into durable typed requests.
+
+    ACQ-02/ACQ-04: the adapter *proposes*; the host decides what exists.  In
+    Slice 2 the only dispatchable child kind is DETAIL, and only from an
+    enumeration pass — crawl breadth is ROAD-04 work, so anything else is
+    recorded as durable review evidence instead of being silently dropped.
+    """
+    for discovered in outcome_obj.discovered_tasks:
+        if task_kind is not AdapterTaskKind.ENUMERATE or discovered.kind != "DETAIL":
+            _record_evidence(
+                conn,
+                request_id=claim.request_id,
+                attempt_id=claim.attempt_id,
+                fetch_attempt_id=None,
+                kind="REVIEW",
+                ref=f"child-task://{discovered.kind}",
+                detail={
+                    "reason": "CHILD_TASK_NOT_DISPATCHED",
+                    "kind": discovered.kind,
+                    "depth": discovered.depth,
+                    "logical_key": discovered.logical_key,
+                    "target_reference": discovered.target_reference,
+                    "from_task_kind": task_kind.value,
+                },
+                content_hash=None,
+                now=ts,
+            )
+            continue
+        enqueue_request(
+            conn,
+            run_id=run_id,
+            run_source_plan_id=plan_row["id"],
+            source_id=plan_row["source_id"],
+            binding_id=plan_row["binding_id"],
+            request_type="DETAIL_FETCH",
+            target_identity=discovered.target_reference,
+            logical_key=discovered.logical_key,
+            payload={
+                "kind": discovered.kind,
+                "target_reference": discovered.target_reference,
+                "logical_key": discovered.logical_key,
+                "depth": discovered.depth,
+            },
+            priority=discovered.priority,
+            depth=discovered.depth,
+            parent_request_id=claim.request_id,
+            execution_class=plan_row["execution_class"],
+            strategy=plan_row["strategy"],
+            now=ts,
+            commit=False,
+        )
+
+
+def _outcome_from_durable_state(conn: sqlite3.Connection, plan_id: str) -> str:
+    """The honest group outcome when this pass has nothing left to claim.
+
+    Restart recovery can land after an earlier pass closed every request but
+    before it recorded the outcome (``finalize_coverage`` and
+    ``set_group_outcome`` are separate commits).  Deriving the outcome from
+    durable evidence keeps a collection that succeeded from being rewritten as
+    a failure just because the resuming pass had no work left to do.
+    """
+    placeholders = ",".join("?" for _ in ACQUISITION_REQUEST_TYPES)
+    closed = conn.execute(
+        "SELECT COUNT(*) FROM scrape_requests"
+        f" WHERE run_source_plan_id = ? AND request_type IN ({placeholders})"
+        " AND status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')",
+        (plan_id, *sorted(ACQUISITION_REQUEST_TYPES)),
+    ).fetchone()[0]
+    if not closed:
+        return "FAILED"
+    complete = conn.execute(
+        "SELECT COUNT(*) FROM enumeration_coverage WHERE run_source_plan_id = ?"
+        " AND completion_state = 'COMPLETE' AND finalized_at IS NOT NULL",
+        (plan_id,),
+    ).fetchone()[0]
+    return "SATISFIED" if complete else "SATISFIED_PARTIAL"
+
+
+def _commit_fenced(conn, run_id, claim, *, ts, mutate) -> str:
+    """One fenced commit for one claim; report ownership loss honestly.
+
+    Returns ``COMMITTED`` / ``CANCELLED`` / ``STALE``.  The fence owns the
+    claim-and-commit contract (RUN-07, 03 §18): a refused late commit rolls
+    back everything this attempt wrote, and the driver must not count it as a
+    completed page.
+    """
+    from jobscraper.runtime.clock import db_utc_now
+
+    try:
+        with fenced_commit(conn, claim.request_id, claim.attempt_id, now=ts, mutate=mutate):
+            pass
+        return "COMMITTED"
+    except StaleOwnership:
+        if run_is_cancelled(conn, run_id):
+            # §18: the fence refused a late acquisition commit; this page's
+            # outputs were rolled back, the worker cooperatively abandons the
+            # request, and the plan ends CANCELLED.
+            abandon_request_for_cancellation(conn, claim.request_id, now=db_utc_now(conn))
+            return "CANCELLED"
+        # Ownership lost without cancellation (expired lease): an expired lease
+        # is already lost ownership (RUN-07), so the expired request is
+        # reclaimed for retry and the driver stops claiming this plan rather
+        # than reviving the dead lease.
+        reclaim_expired(conn)
+        return "STALE"
+
+
 def _execute_plan(
     conn: sqlite3.Connection,
     run_id: str,
@@ -234,20 +405,58 @@ def _execute_plan(
     worker_id: str,
     now: str,
 ) -> None:
+    """Drive one immutable RunSourcePlan to an honest terminal state.
+
+    S2.5 generalization (ARC-04.3, ACQ-02/ACQ-04, 03 RUN-01/RUN-09, §40):
+
+    * the adapter is whatever the pinned binding revision names, built only
+      through the registry — the host special-cases no adapter identity;
+    * request type -> task kind is durable data, so enumeration pages and the
+      typed detail children they produce are planned by the same adapter;
+    * a plan is never terminalized while its own accepted child work is open,
+      and re-driving a finished plan is an idempotent no-op;
+    * host budgets bound enumeration pages and detail requests separately, and
+      hitting one yields BUDGET_EXHAUSTED — never absence authority.
+    """
     from jobscraper.runtime.clock import db_utc_now
+
+    plan_id = plan_row["id"]
+    open_work = _open_acquisition_requests(conn, plan_id)
+    if plan_row["group_outcome"] in TERMINAL_GROUP_OUTCOMES and open_work == 0:
+        return
+    if open_work == 0 and plan_row["group_outcome"] is None:
+        # Everything this plan accepted is already closed and no outcome was
+        # recorded: close the plan from durable evidence.  Opening a coverage
+        # generation here would claim to have covered something this pass never
+        # fetched.
+        set_group_outcome(
+            conn, plan_id, _outcome_from_durable_state(conn, plan_id),
+            now=db_utc_now(conn),
+        )
+        return
 
     source = conn.execute(
         "SELECT * FROM sources WHERE id = ?", (plan_row["source_id"],)
     ).fetchone()
     policy = source_policy(source)
     config = _plan_config(conn, plan_row)
-    if plan_row["adapter_id"] != "json_api_feed":
-        raise ValueError(f"no builtin adapter for {plan_row['adapter_id']!r}")
-    adapter = FeedApiAdapter(FeedApiConfig(**config))
+    try:
+        adapter = build_adapter(plan_row["adapter_id"], config)
+    except KeyError as exc:
+        raise ValueError(f"no builtin adapter for {plan_row['adapter_id']!r}") from exc
 
-    coverage_id = open_coverage(
+    # 03 §40: detail completion joins the coverage barrier only when the
+    # binding contract does not already declare listing identity sufficient.
+    listing_identity_sufficient = bool(
+        getattr(adapter, "listing_identity_sufficient", False)
+    )
+
+    # A resumed pass continues an unfinished generation of this run, or opens a
+    # distinct one when the earlier pass already finalized its own (generations
+    # are immutable; 03 §40).
+    coverage_id, _resumed = open_or_resume_coverage(
         conn,
-        run_source_plan_id=plan_row["id"],
+        run_source_plan_id=plan_id,
         source_id=plan_row["source_id"],
         binding_id=plan_row["binding_id"],
         scope_key="full-source",
@@ -257,47 +466,120 @@ def _execute_plan(
     )
 
     terminal = False
+    degraded = False
+    cancelled = False
     pages = 0
-    outcome = None
-    while pages < MAX_PAGES_PER_RUN:
+    details = 0
+    while True:
         if run_is_cancelled(conn, run_id):
             # §18: no new acquisition driving once cancellation is durable
-            outcome = "CANCELLED"
+            cancelled = True
+            break
+        allowed = set(ACQUISITION_REQUEST_TYPES)
+        if pages >= MAX_PAGES_PER_RUN:
+            allowed -= set(_ENUMERATION_REQUEST_TYPES)
+        if details >= MAX_DETAIL_REQUESTS_PER_RUN:
+            allowed -= set(_DETAIL_REQUEST_TYPES)
+        if not allowed:
+            # RUN-09: the host stops itself rather than asking the provider for
+            # more.  Nothing is terminalized from a stopped enumeration.
             break
         claim = claim_next_request(
-            conn, worker_id, now=db_utc_now(conn), types=ACQUISITION_REQUEST_TYPES,
-            run_source_plan_id=plan_row["id"],
+            conn, worker_id, now=db_utc_now(conn), types=frozenset(allowed),
+            run_source_plan_id=plan_id,
         )
         if claim is None:
             break
         ts = db_utc_now(conn)
-        conn.execute(
-            "INSERT INTO coverage_contributing_request (coverage_id, request_id)"
-            " VALUES (?, ?) ON CONFLICT DO NOTHING",
-            (coverage_id, claim.request_id),
-        )
-        conn.commit()
+        task_kind = task_kind_for_request_type(claim.request_type)
+        target_reference = _claim_target_reference(claim)
+        is_enumeration = claim.request_type in _ENUMERATION_REQUEST_TYPES
+        if is_enumeration or not listing_identity_sufficient:
+            # 03 §40: coverage links the requests/pages that contributed to
+            # this generation's enumeration proof.
+            conn.execute(
+                "INSERT INTO coverage_contributing_request (coverage_id, request_id)"
+                " VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (coverage_id, claim.request_id),
+            )
+            conn.commit()
 
-        cursor = _load_cursor(conn, plan_row)
-        task = AdapterTask(kind=AdapterTaskKind.ENUMERATE, payload={})
+        cursor = (
+            _load_cursor(conn, plan_row)
+            if task_kind is AdapterTaskKind.ENUMERATE
+            else None
+        )
+        task = AdapterTask(kind=task_kind, payload=dict(claim.payload or {}))
         # 02 ACQ-09: planning receives the host-resolved pins, never mutable
         # host state.  Snapshots that do not exist durably yet stay None —
         # the driver does not fabricate references (Slice 3 frontier/budgets).
         planning_ctx = PlanningContext(
             run_id=run_id,
-            run_source_plan_id=plan_row["id"],
+            run_source_plan_id=plan_id,
             source_snapshot_ref=f"source://{plan_row['source_id']}",
             binding_revision_id=plan_row["binding_revision_id"],
             permission_profile_revision=plan_row["permission_profile_revision"],
             cursor_schema_version=plan_row["cursor_schema_version"],
         )
-        request_plan = adapter.plan(task, cursor, ctx=planning_ctx)
+        plan_refusal: str | None = None
+        try:
+            request_plan = adapter.plan(task, cursor, ctx=planning_ctx)
+        except (ValueError, TypeError) as exc:
+            request_plan = None
+            plan_refusal = f"{type(exc).__name__}: {exc}"
+
+        signal: dict = {}
+        if request_plan is None:
+            # A refused plan is a typed failure record, not a fetch and not a
+            # parse: no request is issued, no observation is invented, and the
+            # generation cannot claim terminal enumeration.
+            def mutate(
+                cursor_conn,
+                *,
+                _refusal=plan_refusal,
+                _kind=task_kind,
+                _target_reference=target_reference,
+            ):
+                cursor_conn.execute(
+                    "UPDATE scrape_requests SET page_class = ?, last_failure_kind = ?"
+                    " WHERE id = ?",
+                    ("UNKNOWN", FailureKind.INVALID_JOB_RECORD.value, claim.request_id),
+                )
+                _record_evidence(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    fetch_attempt_id=None,
+                    kind="FAILURE",
+                    ref="ADAPTER_PLAN_REFUSED",
+                    detail={
+                        "reason": "ADAPTER_PLAN_REFUSED",
+                        "task_kind": _kind.value,
+                        "target_reference": _target_reference,
+                        "detail": (_refusal or "")[:500],
+                    },
+                    content_hash=None,
+                    now=ts,
+                )
+                signal["value"] = "REFUSED"
+
+            if _commit_fenced(conn, run_id, claim, ts=ts, mutate=mutate) != "COMMITTED":
+                if run_is_cancelled(conn, run_id):
+                    cancelled = True
+                break
+            if is_enumeration:
+                pages += 1
+            else:
+                details += 1
+            degraded = True
+            continue
+
         envelope = ExecutionPlanEnvelope(
             plan_id=new_id("plan"),
             request_id=claim.request_id,
             attempt_id=claim.attempt_id,
             run_id=run_id,
-            run_source_plan_id=plan_row["id"],
+            run_source_plan_id=plan_id,
             source_id=plan_row["source_id"],
             binding_id=plan_row["binding_id"],
             binding_revision_id=plan_row["binding_revision_id"],
@@ -316,14 +598,14 @@ def _execute_plan(
                 expected_content_types=tuple(request_plan.expected_content_types),
                 timeout_s=request_plan.timeout_s,
                 max_bytes=request_plan.max_bytes,
-                purpose="LIST_FETCH",
+                purpose=claim.request_type,
             ),
         )
 
         result = execute_request(envelope, policy)  # NO transaction held
-        classification = classify_page(result, expect="LIST")
-
-        signal: dict = {}
+        classification = classify_page(
+            result, expect="JOB" if task_kind is AdapterTaskKind.DETAIL else "LIST"
+        )
 
         def mutate(cursor_conn):
             fetch_attempt_id = _persist_fetch_attempt(cursor_conn, envelope, result, ts)
@@ -368,10 +650,10 @@ def _execute_plan(
                 content_hash=result.normalized_content_hash,
                 now=ts,
             )
-            # EMPTY is a recognized non-job outcome (§21): the adapter parse
-            # yields SUCCESS_EMPTY, which terminates the enumeration
-            # authoritatively (ACQ-02).
             if classification.state in NORMAL_PARSE_CLASSES:
+                # EMPTY is a recognized non-job outcome (§21): the adapter parse
+                # yields SUCCESS_EMPTY, which terminates the enumeration
+                # authoritatively (ACQ-02).
                 validated = ValidatedResultEnvelope(
                     envelope=result,
                     page_class=classification.state,
@@ -382,7 +664,7 @@ def _execute_plan(
                 parse_ctx = ParseContext(
                     request_id=claim.request_id,
                     attempt_id=claim.attempt_id,
-                    run_source_plan_id=plan_row["id"],
+                    run_source_plan_id=plan_id,
                     parser_version=plan_row["adapter_version"],
                     normalization_version=NORMALIZATION_VERSION,
                     idempotency_namespace=claim.request_id,
@@ -391,6 +673,20 @@ def _execute_plan(
                 parse_attempt_id = _persist_parse_attempt(
                     cursor_conn, envelope, outcome_obj, validated, ts
                 )
+                if outcome_obj.failure is not None:
+                    # A typed adapter failure (02 ACQ-02 FailureRecord) is
+                    # durable on the request as well as on the parse attempt:
+                    # an operator scanning scrape_requests must see *why* a
+                    # completed request produced nothing, without a join.
+                    cursor_conn.execute(
+                        "UPDATE scrape_requests SET last_failure_kind = ?,"
+                        " last_failure_json = ? WHERE id = ?",
+                        (
+                            outcome_obj.failure.kind.value,
+                            bounded_json(outcome_obj.failure.as_dict()),
+                            claim.request_id,
+                        ),
+                    )
                 for observation in outcome_obj.observations:
                     # 02 §32 origin resolution — host-owned and network-inert:
                     # it consumes the recorded redirect chain plus the
@@ -432,15 +728,28 @@ def _execute_plan(
                             evidence_ref=observation.raw_url, commit=False,
                         )
                 if outcome_obj.kind.value == "SUCCESS_EMPTY":
-                    signal["value"] = "EMPTY"
+                    signal["value"] = "EMPTY" if is_enumeration else "JOBS"
                     return
-                next_cursor = adapter.next_cursor(task, outcome_obj, cursor, ctx=parse_ctx)
+                _dispatch_child_tasks(
+                    cursor_conn,
+                    outcome_obj=outcome_obj,
+                    task_kind=task_kind,
+                    claim=claim,
+                    plan_row=plan_row,
+                    run_id=run_id,
+                    ts=ts,
+                )
+                next_cursor = (
+                    adapter.next_cursor(task, outcome_obj, cursor, ctx=parse_ctx)
+                    if task_kind is AdapterTaskKind.ENUMERATE
+                    else None
+                )
                 if next_cursor is not None:
                     _save_cursor(cursor_conn, plan_row, next_cursor, ts)
                     enqueue_request(
                         cursor_conn,
                         run_id=run_id,
-                        run_source_plan_id=plan_row["id"],
+                        run_source_plan_id=plan_id,
                         source_id=plan_row["source_id"],
                         binding_id=plan_row["binding_id"],
                         request_type="LIST_FETCH",
@@ -448,62 +757,109 @@ def _execute_plan(
                         logical_key=next_cursor.state_json,
                         commit=False,
                     )
-                else:
-                    signal["value"] = "EMPTY"
+                    signal["value"] = "CONTINUE"
                     return
-                signal["value"] = "JOBS"
+                if (
+                    outcome_obj.kind is ParseOutcomeKind.PARTIAL
+                    or outcome_obj.continuation_required
+                ):
+                    # Degraded but recognized: the adapter says more exists and
+                    # the host could not plan it now.  Never absence authority.
+                    signal["value"] = "PARTIAL"
+                    return
+                if outcome_obj.kind is ParseOutcomeKind.FAILURE:
+                    # A failed parse proves nothing about membership: no
+                    # terminal enumeration may be derived from it (RUN-13).
+                    signal["value"] = "FAILURE"
+                    return
+                # Complete page with no further cursor proposed: for an
+                # enumeration task that is terminal membership proof.
+                signal["value"] = "TERMINAL" if is_enumeration else "JOBS"
+                return
+            if task_kind is AdapterTaskKind.DETAIL and classification.state in _CLOSURE_CLASSES:
+                # ACQ-02: a typed closure/missing outcome is durable evidence
+                # that this identity is gone at the provider.  It is *not* a
+                # failure, *not* an observation, and *not* absence authority
+                # for any other identity.
+                _record_evidence(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    fetch_attempt_id=fetch_attempt_id,
+                    kind="REVIEW",
+                    ref=f"closure://{classification.state.value}",
+                    detail={
+                        "reason": "DETAIL_CLOSURE_OR_MISSING",
+                        "classification": classification.state.value,
+                        "target_reference": target_reference,
+                        "absence_authority": False,
+                        "final_url": result.final_url,
+                        "status_code": result.status_code,
+                    },
+                    content_hash=result.normalized_content_hash,
+                    now=ts,
+                )
+                signal["value"] = "CLOSURE"
                 return
             signal["value"] = "INVALID"
 
-        try:
-            with fenced_commit(
-                conn, claim.request_id, claim.attempt_id, now=ts, mutate=mutate
-            ):
-                pass
-        except StaleOwnership:
+        if _commit_fenced(conn, run_id, claim, ts=ts, mutate=mutate) != "COMMITTED":
             if run_is_cancelled(conn, run_id):
-                # §18: the fence refused a late acquisition commit; this
-                # page's outputs were rolled back, the worker cooperatively
-                # abandons the request, and the plan ends CANCELLED.
-                abandon_request_for_cancellation(
-                    conn, claim.request_id, now=db_utc_now(conn)
-                )
-                outcome = "CANCELLED"
-                break
-            # Ownership lost without cancellation (expired lease): an
-            # expired lease is already lost ownership (RUN-07), so the
-            # expired request is reclaimed for retry and the driver stops
-            # claiming this plan rather than reviving the dead lease.
-            reclaim_expired(conn)
+                cancelled = True
             break
 
-        pages += 1
-        if signal.get("value") == "EMPTY":
+        if is_enumeration:
+            pages += 1
+        else:
+            details += 1
+        value = signal.get("value")
+        if value in ("INVALID", "FAILURE", "PARTIAL", "REFUSED"):
+            degraded = True
+        if is_enumeration and value in ("EMPTY", "TERMINAL"):
+            # 03 §40: only a recognized terminal enumeration — an accepted
+            # empty result or a complete listing with no further cursor —
+            # proves membership.  Budgets, refusals and parse failures never
+            # do.
             terminal = True
-            outcome = "SATISFIED"
-            break
-        if signal.get("value") == "INVALID":
-            outcome = "SATISFIED_PARTIAL"
-            break
 
-    if outcome is None:
-        outcome = "SATISFIED_PARTIAL" if pages else "FAILED"
-
-    stop_reason = (
-        "terminal cursor"
-        if terminal
-        else "cancelled"
-        if outcome == "CANCELLED"
-        else "driver stop"
+    open_child_work = _open_acquisition_requests(conn, plan_id)
+    budget_exhausted = (
+        pages >= MAX_PAGES_PER_RUN or details >= MAX_DETAIL_REQUESTS_PER_RUN
     )
+    if cancelled:
+        outcome = "CANCELLED"
+    elif terminal and not degraded and open_child_work == 0 and (pages or details):
+        # SATISFIED requires the whole accepted work set closed: a proven
+        # enumeration with a detail child still claimable is not satisfied.
+        outcome = "SATISFIED"
+    elif pages or details:
+        outcome = "SATISFIED_PARTIAL"
+    else:
+        outcome = "FAILED"
+
+    if terminal and not degraded and open_child_work == 0:
+        completion_state = "COMPLETE"
+        stop_reason = "terminal cursor"
+    elif cancelled:
+        completion_state = "PARTIAL"
+        stop_reason = "cancelled"
+    elif budget_exhausted and open_child_work:
+        completion_state = "BUDGET_EXHAUSTED"
+        stop_reason = "host acquisition budget exhausted with open child work"
+    elif open_child_work:
+        completion_state = "PARTIAL"
+        stop_reason = "open child work remains"
+    else:
+        completion_state = "PARTIAL"
+        stop_reason = "driver stop"
     try:
         finalize_coverage(
             conn,
             coverage_id,
-            completion_state="COMPLETE" if terminal else "PARTIAL",
+            completion_state=completion_state,
             stop_reason=stop_reason,
             terminal_enumeration_proven=terminal,
-            pages_completed=pages,
+            pages_completed=pages + details,
             now=db_utc_now(conn),
         )
     except Exception:
@@ -514,10 +870,10 @@ def _execute_plan(
             completion_state="PARTIAL",
             stop_reason="driver stop",
             terminal_enumeration_proven=False,
-            pages_completed=pages,
+            pages_completed=pages + details,
             now=db_utc_now(conn),
         )
-    set_group_outcome(conn, plan_row["id"], outcome, now=db_utc_now(conn))
+    set_group_outcome(conn, plan_id, outcome, now=db_utc_now(conn))
 
 
 def posting_host_matches_source(source_row, observation) -> bool:

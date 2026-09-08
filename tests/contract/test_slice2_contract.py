@@ -33,8 +33,9 @@ SRC = REPO_ROOT / "src" / "jobscraper"
 
 # The exact built-in adapter set as of the current Slice-2 package.  Each
 # Slice-2 adapter package appends to this set consciously; nothing else may
-# register an adapter.
-EXPECTED_BUILTIN_ADAPTERS = {"json_api_feed"}
+# register an adapter.  S2.5 graduates the first provider-native adapter
+# (02 §12.3); S2.6/S2.7 append Lever and Ashby only after `continue`.
+EXPECTED_BUILTIN_ADAPTERS = {"json_api_feed", "greenhouse"}
 
 # Slice 2 supports the HTTP execution class only (02 §14; ROAD-07 defers
 # browser acquisition).  The router must report a browser-class candidate as
@@ -113,6 +114,12 @@ def _adapter_files():
 # --------------------------------------------------- pure-adapter discipline
 
 #: adapters may only reach these host contract surfaces (02 ACQ-02/ACQ-09)
+#:
+#: ``jobscraper.timeutil`` was added by S2.5: a provider adapter must emit
+#: durable UTC RFC 3339 timestamps (03 §50) and must not reimplement that
+#: format.  timeutil is pure formatting/parsing — no I/O, no database, no
+#: destination policy, no grant authority — so it widens no boundary that this
+#: suite guards.
 _ALLOWED_ADAPTER_IMPORTS = {
     "jobscraper.acquisition.failures",
     "jobscraper.acquisition.pagevalidity",
@@ -121,6 +128,7 @@ _ALLOWED_ADAPTER_IMPORTS = {
     "jobscraper.acquisition.origin",
     "jobscraper.acquisition.atsendpoints",
     "jobscraper.net.urlnorm",
+    "jobscraper.timeutil",
 }
 
 
@@ -175,6 +183,74 @@ def test_builtin_adapter_registry_is_exact_and_manifest_validated():
         assert set(manifest.supported_execution_classes) <= SLICE2_SUPPORTED_EXECUTION_CLASSES
         with pytest.raises(KeyError):
             get_adapter(f"not-registered-{adapter_id}")
+
+
+def test_acq02_request_task_mapping_is_complete_and_exact():
+    """02 ACQ-02: the durable request-type↔task mapping is explicit data.
+
+    Every acquisition request type the runtime can enqueue maps to exactly one
+    adapter task kind, and every host-native pipeline type maps to none — so
+    the vocabulary cannot drift between ``runtime.requests`` and the adapter
+    contract.
+    """
+    from jobscraper.adapters.contract import (
+        ACQ02_REQUEST_TASK_MAP,
+        HOST_NATIVE_REQUEST_TYPE_NAMES,
+        AdapterTaskKind,
+        task_kind_for_request_type,
+    )
+    from jobscraper.runtime.requests import (
+        ACQUISITION_REQUEST_TYPES,
+        HOST_NATIVE_REQUEST_TYPES,
+        REQUEST_TYPES,
+    )
+
+    assert set(ACQ02_REQUEST_TASK_MAP) == set(ACQUISITION_REQUEST_TYPES)
+    assert HOST_NATIVE_REQUEST_TYPE_NAMES == set(HOST_NATIVE_REQUEST_TYPES)
+    assert set(ACQ02_REQUEST_TASK_MAP) | HOST_NATIVE_REQUEST_TYPE_NAMES == set(REQUEST_TYPES)
+    assert set(ACQ02_REQUEST_TASK_MAP.values()) <= set(AdapterTaskKind)
+    assert ACQ02_REQUEST_TASK_MAP["LIST_FETCH"] is AdapterTaskKind.ENUMERATE
+    assert ACQ02_REQUEST_TASK_MAP["DETAIL_FETCH"] is AdapterTaskKind.DETAIL
+    for request_type in HOST_NATIVE_REQUEST_TYPES:
+        assert task_kind_for_request_type(request_type) is None
+    with pytest.raises(ValueError):
+        task_kind_for_request_type("NOT_A_REQUEST_TYPE")
+
+
+def test_driver_selects_adapters_only_through_the_registry():
+    """ARC-04.3/ACQ-08: no adapter identity is hardcoded in the host driver.
+
+    The driver builds whatever the pinned binding revision names through the
+    registry; it may not import an adapter class directly (that would make the
+    registry bypassable and re-introduce the S2.4 single-adapter special case).
+    """
+    driver = (SRC / "pipeline" / "driver.py").read_text(encoding="utf-8")
+    assert "build_adapter(" in driver
+    for marker in ("FeedApiAdapter", "GreenhouseAdapter", "adapters.feed_api",
+                   "adapters.greenhouse"):
+        assert marker not in driver, marker
+    assert '!= "json_api_feed"' not in driver
+
+
+def test_provider_endpoint_shapes_come_from_the_versioned_table():
+    """02 §12.1/§32: one owner of "known ATS endpoint patterns".
+
+    A provider adapter must derive its URL shapes from
+    ``acquisition.atsendpoints`` instead of hardcoding provider hosts, so the
+    fingerprint classifier, the origin resolver and the adapter can never
+    disagree about what a Greenhouse URL is.
+    """
+    from jobscraper.acquisition.atsendpoints import ATS_ENDPOINT_SPECS
+
+    provider_hosts = {host for spec in ATS_ENDPOINT_SPECS for host in spec.hosts()}
+    for path in _adapter_files():
+        if path.name in {"atsendpoints.py", "registry.py", "__init__.py"}:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for host in provider_hosts:
+            assert f'"{host}"' not in text and f"'{host}'" not in text, (path.name, host)
+    greenhouse = (SRC / "adapters" / "greenhouse.py").read_text(encoding="utf-8")
+    assert "spec_for_provider" in greenhouse
 
 
 def test_registry_has_no_dynamic_import_path():

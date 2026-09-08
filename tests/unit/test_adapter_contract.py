@@ -96,16 +96,31 @@ def test_manifest_validation_accepts_valid_and_rejects_invalid():
 
 
 def test_registry_has_only_builtin_manifest_validated_adapters():
-    from jobscraper.adapters.feed_api import FeedApiConfig
+    """S1.5 registry pin, re-scoped by S2.5.
 
-    for adapter_id, factory in BUILTIN_ADAPTERS.items():
-        adapter = factory(FeedApiConfig(**CONFIG))
-        assert adapter.manifest.id == adapter_id
+    Slice 1 shipped exactly one built-in adapter and constructed it directly;
+    ROAD-03 owns acquisition breadth, so the *exact adapter set* is pinned by
+    ``tests/contract/test_slice2_contract.py`` and construction now goes
+    through the registry builder (one path for every built-in adapter, config
+    from the pinned binding revision).  What Slice 1 still pins: its own
+    adapter is registered, manifest-valid and constructible from the same
+    declarative config, and an unregistered identity is still refused.
+    """
+    from jobscraper.adapters.registry import build_adapter
+
+    adapter = build_adapter("json_api_feed", CONFIG)
+    assert isinstance(adapter, FeedApiAdapter)
+    assert adapter.manifest.id == "json_api_feed"
+    for adapter_id, adapter_cls in BUILTIN_ADAPTERS.items():
+        assert adapter_cls.manifest.id == adapter_id
     assert get_adapter("json_api_feed") is not None
     with pytest.raises(KeyError):
         get_adapter("does-not-exist")
-    # no dynamic import: registry keys are fixed
-    assert set(BUILTIN_ADAPTERS) == {"json_api_feed"}
+    with pytest.raises(KeyError):
+        build_adapter("does-not-exist", CONFIG)
+    # a config this adapter does not understand is refused, not half-applied
+    with pytest.raises(ValueError):
+        build_adapter("json_api_feed", {**CONFIG, "rotate_proxy_on_block": True})
 
 
 # ------------------------------------------------------------------ planning

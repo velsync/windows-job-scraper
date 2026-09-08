@@ -1,0 +1,4 @@
+{
+  "error": "Rate limit exceeded",
+  "retry_after_s": 30
+}

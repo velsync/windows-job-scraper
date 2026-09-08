@@ -1,0 +1,40 @@
+{
+  "id": 4003,
+  "internal_job_id": 900003,
+  "title": "Senior Data Engineer",
+  "updated_at": "2026-09-02T08:30:00+02:00",
+  "requisition_id": "REQ-4003",
+  "location": {
+    "name": "Remote"
+  },
+  "absolute_url": "javascript:alert(document.cookie)",
+  "departments": [
+    {
+      "id": 13,
+      "name": "Data"
+    }
+  ],
+  "offices": [
+    {
+      "id": 23,
+      "name": "Remote"
+    }
+  ],
+  "job_listing_admin_locations": [],
+  "applicant_location_requirements": [
+    {
+      "location_type": "Remote - Worldwide",
+      "country": null,
+      "state": null,
+      "city": null
+    }
+  ],
+  "job_post_information": {
+    "employement_type": "Full time",
+    "date_published": "2026-09-01T06:00:00Z",
+    "job_family": "Data",
+    "degree_required": false,
+    "remote": true
+  },
+  "content": "<div class=\"job__description--opening\"><h2>Senior Data Engineer</h2><p>Fully remote worldwide. You will own normalization and deduplication evidence.</p><script>document.write('inline script residue')</script><p><a href=\"javascript:alert(1)\">Click for salary</a> and a safe link <a href=\"https://acme.example/data?utm_campaign=hire\">team page</a>.</p><p>Also see <a href=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">encoded payload</a>.</p></div>"
+}

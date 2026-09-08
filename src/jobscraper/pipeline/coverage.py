@@ -72,6 +72,70 @@ def open_coverage(
     return presence_id
 
 
+def open_or_resume_coverage(
+    conn: sqlite3.Connection,
+    *,
+    run_source_plan_id: str,
+    source_id: str,
+    binding_id: str,
+    scope_key: str,
+    generation_key: str,
+    coverage_authority: str,
+    now: str,
+) -> tuple[str, bool]:
+    """Open this pass's coverage generation, or resume an unfinished one.
+
+    Returns ``(coverage_id, resumed)``.
+
+    Restart recovery re-drives a plan whose earlier pass may have died
+    mid-generation, or may have finalized one and still left accepted child
+    work open (ACQ-04).  Generations are immutable once finalized and the
+    durable uniqueness key is ``(plan, scope, generation)``, so:
+
+    * an **unfinalized** generation of this plan and scope is *continued* —
+      one enumeration attempt in flight per plan, finalized exactly once, even
+      when the resumed pass is itself a later pass with its own key;
+    * a **finalized** generation is left untouched and the resuming pass opens
+      a distinct, deterministically named generation (``…#pass-N``) that
+      records only what that pass actually covered.
+
+    Without this, re-driving an interrupted run raised a UNIQUE constraint
+    error inside the driver: a recovery path that crashes is not a recovery
+    path (RUN-07, 03 §18).
+    """
+    existing = conn.execute(
+        "SELECT id, generation_key, finalized_at FROM enumeration_coverage"
+        " WHERE run_source_plan_id = ? AND scope_key = ? ORDER BY created_at, id",
+        (run_source_plan_id, scope_key),
+    ).fetchall()
+    for row in existing:
+        # at most one generation of a plan+scope can be in flight: continuing it
+        # is what makes an interrupted enumeration recoverable instead of
+        # leaving a permanently unfinalized row behind
+        if row["finalized_at"] is None:
+            return row["id"], True
+
+    taken = {row["generation_key"] for row in existing}
+    key = generation_key
+    attempt = len(existing) + 1
+    while key in taken:
+        key = f"{generation_key}#pass-{attempt}"
+        attempt += 1
+    return (
+        open_coverage(
+            conn,
+            run_source_plan_id=run_source_plan_id,
+            source_id=source_id,
+            binding_id=binding_id,
+            scope_key=scope_key,
+            generation_key=key,
+            coverage_authority=coverage_authority,
+            now=now,
+        ),
+        False,
+    )
+
+
 def record_seen_identity(
     conn: sqlite3.Connection,
     coverage_id: str,
@@ -229,5 +293,6 @@ __all__ = [
     "CoverageFinalizationError",
     "finalize_coverage",
     "open_coverage",
+    "open_or_resume_coverage",
     "record_seen_identity",
 ]

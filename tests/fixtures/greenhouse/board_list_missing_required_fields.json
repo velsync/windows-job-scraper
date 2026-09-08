@@ -1,0 +1,29 @@
+{
+  "jobs": [
+    {
+      "title": "Role without a source-native id",
+      "updated_at": "2026-08-15T09:00:00Z",
+      "location": {
+        "name": "Berlin, Germany"
+      }
+    },
+    {
+      "id": "../../etc/passwd",
+      "title": "",
+      "updated_at": "not-a-timestamp",
+      "location": {
+        "name": "Berlin, Germany"
+      },
+      "absolute_url": "javascript:alert(1)"
+    },
+    {
+      "id": 6103,
+      "title": null,
+      "updated_at": "2026-08-16T09:00:00Z",
+      "absolute_url": "https://boards.greenhouse.io/missingfields/jobs/6103"
+    }
+  ],
+  "meta": {
+    "total": 3
+  }
+}

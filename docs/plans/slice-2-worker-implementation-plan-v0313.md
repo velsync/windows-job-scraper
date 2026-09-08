@@ -394,6 +394,125 @@ As implemented (S2.2, deviations recorded deliberately):
   `SOURCE_DISCOVERY→DISCOVER`, `SOURCE_CRAWL→CRAWL`, `ADAPTER_SMOKE→SMOKE`);
   the run cannot terminalize while its own accepted child work is still open.
 
+As implemented (S2.5, deviations recorded deliberately):
+
+* `adapters/greenhouse.py` is registered as the second built-in adapter
+  (`greenhouse` 1.0.0, `HTTP` only, auth `NONE`, `listing_identity_sufficient
+  = True`) and is constructed **only** through `adapters/registry.py`'s new
+  `build_adapter(adapter_id, config)`; `pipeline/driver.py` no longer names any
+  adapter class (pinned by `test_driver_selects_adapters_only_through_the_registry`).
+  Endpoint shapes come from `acquisition/atsendpoints.py` — the adapter
+  hardcodes no provider host (pinned by
+  `test_provider_endpoint_shapes_come_from_the_versioned_table`), so the
+  fingerprint classifier, the origin resolver and the adapter cannot disagree
+  about what a Greenhouse URL is.
+* `GreenhouseConfig` is fail-closed and validated at construction: `board`
+  (`[a-z0-9][a-z0-9_-]{0,63}`, control characters refused, reserved route words
+  refused — it is interpolated into a URL path), `api_base_url` (bare http(s)
+  origin: scheme + host [+ port], no path/query/fragment/credentials),
+  `include_content`, `detail_fetch`, `max_detail_requests` (≤ the adapter stop
+  policy), `company_name`, `careers_url`, and host caps `timeout_s ≤ 30` /
+  `max_bytes ≤ 2 MiB` that binding config may lower but never raise.  Unknown
+  config keys are refused, not ignored.
+* Detail targets are built from the pinned board token plus a **validated
+  source-native numeric id** (`^\d{1,20}$`, no stripping, no coercion).  Only
+  `target_reference` is read from the task payload: a board, host or URL
+  appearing in content is ignored by construction, and a traversal-shaped id
+  (`../../etc/passwd`) survives only as bounded review evidence — never as a
+  fetch target or an identity.
+* **Deviation (deliberate, stricter than the package text):** `posted_at` is
+  derived only from the provider's own *publication* stamps
+  (`first_published_at` → `job_post_information.date_published`).  The package
+  text listed "`updated_at`/posted time"; mapping a last-modified stamp to a
+  posting date asserts something the provider never said, and because a
+  presence keeps the first value it was given, that guess would then shadow the
+  real publication time arriving on the detail pass.  When the provider states
+  no publication time the field is absent (02 §22) and `discovered_at` /
+  `first_seen_at` still record when the host saw the posting.
+* `jobscraper.timeutil` was added to the adapter import allowlist: a provider
+  adapter must emit durable UTC RFC 3339 timestamps (03 §50) and must not
+  reimplement that format.  `timeutil` is pure formatting/parsing — no I/O, no
+  database, no destination policy, no grant authority — so it widens no
+  boundary the contract suite guards.  `urllib`, `socket`, `sqlite3` and
+  `subprocess` remain forbidden in adapters.
+* Driver generalization (architecture-preserving): registry-built adapters with
+  config from the pinned binding revision; the ACQ-02 request-type↔task mapping
+  is durable data in `adapters/contract.py`
+  (`ACQ02_REQUEST_TASK_MAP` + `HOST_NATIVE_REQUEST_TYPE_NAMES` +
+  `task_kind_for_request_type`, pinned complete-and-exact against
+  `runtime.requests`); separate host budgets (`MAX_PAGES_PER_RUN = 50`
+  unchanged, new `MAX_DETAIL_REQUESTS_PER_RUN = 200`) whose exhaustion yields
+  `BUDGET_EXHAUSTED` coverage, never absence authority; and child-work-aware
+  terminalization — a plan is `SATISFIED` only when enumeration is proven
+  terminal, nothing degraded it, and every request it accepted is closed.
+* `DETAIL_FETCH` joins the coverage barrier (contributing requests) only when
+  the binding contract does **not** declare listing identity sufficient; the
+  Greenhouse board API returns full membership in one response, so its detail
+  children enrich content without holding absence authority hostage.
+* Only `DETAIL` child tasks from an `ENUMERATE` pass are dispatched (crawl
+  breadth is ROAD-04).  Anything else an adapter proposes is recorded as
+  durable `REVIEW` evidence (`CHILD_TASK_NOT_DISPATCHED`) rather than silently
+  dropped.  `acquisition_evidence.kind` stays inside the released v11 CHECK
+  set — closure/missing evidence and refused plans use `REVIEW`/`FAILURE` — so
+  **S2.5 adds no migration** (schema stays v14).
+* Host-pipeline completions S2.5 required (each minimal, no architecture
+  change, each with its own focused test):
+  - `pipeline/companies.py`: strong identifiers *without* an employer name no
+    longer attempt a name-less insert (a NOT NULL crash that took the whole
+    fenced commit down).  The decision is recorded as
+    `NO_SIGNAL`/`IDENTIFIERS_WITHOUT_NAME`; the identifiers are re-asserted by
+    the first sighting that does carry a name.  `companies.name` is never
+    fabricated from a board slug.
+  - `pipeline/canonical.py`: `jobs.posted_at` is *filled* from the winning
+    presence while unknown and never rewritten afterwards (no change class
+    exists for a posted-time rewrite, so it must not happen).
+  - `pipeline/coverage.py`: new `open_or_resume_coverage` continues an
+    unfinished generation of the same plan+scope, or opens a deterministically
+    named one (`…#pass-N`) when the earlier pass finalized its own.  Re-driving
+    an interrupted run previously raised a UNIQUE constraint error inside the
+    driver — a recovery path that crashes is not a recovery path.
+  - `pipeline/driver.py`: the adapter's typed `FailureRecord` is now durable on
+    `scrape_requests.last_failure_kind`/`last_failure_json` (not only on the
+    parse attempt), and a `FAILURE`/`PARTIAL` parse no longer masquerades as a
+    terminal empty enumeration (an accepted-S1 latent bug: a failed parse used
+    to be read as "board is empty", which is exactly the direction that grants
+    absence authority).  A plan that finds nothing left to claim closes from
+    durable evidence instead of reporting `FAILED` for work another pass
+    already completed.
+* `runtime/provisioning.py` gained `config=` (canonical-JSON, part of revision
+  identity: re-pointing a board is a **new** immutable revision, never an edit)
+  and pins the revision it authorized as `source_adapter_bindings.current_
+  revision_id` — without that pointer the host's own run planner
+  (`POST /api/runs`) cannot select a provisioned binding at all.  New
+  `ensure_builtin_adapter_definition` derives the durable `adapter_definitions`
+  row from the registered manifest (append-only: an existing identity row is
+  reused byte-for-byte, never rewritten), so the durable record and the code it
+  authorizes cannot disagree.
+* Fixtures (`tests/fixtures/greenhouse/`, 15 files + README) are sanitized,
+  deterministic and offline; the E2E serves them over loopback through a
+  fixture HTTP server, so the run exercises the real host executor, destination
+  policy and validity gate.  Covered shapes: valid list, list with inline
+  content, empty board, truncated board (`meta.total` > returned), changed
+  template, malformed body, required-fields-missing (incl. traversal id and
+  `javascript:` URL), removed job (404), detail id mismatch, multi-location,
+  hostile detail links (`javascript:`/`data:`/`<script>`), 429 and 403
+  challenge.
+* E2E (`tests/integration/test_greenhouse_e2e.py`, 20 tests) proves the whole
+  spine twice over: through the driver directly and through the service surface
+  (`POST /api/runs` → Inbox → job detail), including origin resolution
+  (`GREENHOUSE`/`acme`/job id with evidence and rejected candidates),
+  `EMPLOYER_STRUCTURED_ATS` quality, company + identifier rows, multi-location
+  and remote-eligibility projection, cleaned content (script residue and
+  tracking parameters removed), FTS5 search, safe apply links, idempotent
+  re-drive, restart recovery with no duplicate observations, and the typed
+  429/challenge/404/mismatch behaviours.
+* Unchanged on purpose: a rate-limited or challenged request still commits as
+  `SUCCEEDED` with its typed `page_class` and degrades the run to `PARTIAL`
+  (accepted Slice-1 request semantics; retry/backoff policy is not redefined
+  here), and `remote_worldwide` stays conservative when a bare `"Remote"`
+  location accompanies an explicit worldwide applicant requirement (Slice-1
+  eligibility semantics preserved).
+
 ### S2.6 / S2.7 — Lever, Ashby (after `continue`)
 
 Same shape as S2.5: `adapters/lever.py` (`/v0/postings/{company}` list +

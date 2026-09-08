@@ -1,0 +1,14 @@
+{
+  "id": 9999,
+  "internal_job_id": 909999,
+  "title": "Some Other Role",
+  "updated_at": "2026-09-03T10:00:00Z",
+  "requisition_id": "REQ-9999",
+  "location": {
+    "name": "Nowhere"
+  },
+  "absolute_url": "https://boards.greenhouse.io/acme/jobs/9999",
+  "departments": [],
+  "offices": [],
+  "content": "<div class=\"job__description--opening\"><p>This response does not describe the job that was requested.</p></div>"
+}

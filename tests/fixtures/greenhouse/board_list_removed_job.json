@@ -1,0 +1,32 @@
+{
+  "jobs": [
+    {
+      "id": 7002,
+      "internal_job_id": 907002,
+      "title": "Ghost Role",
+      "updated_at": "2026-07-01T09:00:00Z",
+      "requisition_id": "REQ-7002",
+      "location": {
+        "name": "Berlin, Germany"
+      },
+      "absolute_url": "https://boards.greenhouse.io/removedjob/jobs/7002",
+      "departments": [
+        {
+          "id": 14,
+          "name": "Operations"
+        }
+      ],
+      "offices": [
+        {
+          "id": 21,
+          "name": "Berlin",
+          "location": "Berlin, Germany"
+        }
+      ],
+      "metadata": null
+    }
+  ],
+  "meta": {
+    "total": 1
+  }
+}
