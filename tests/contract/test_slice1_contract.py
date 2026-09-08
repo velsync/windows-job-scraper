@@ -3,8 +3,13 @@
 Repository-level invariants that keep Slice 1 inside the accepted
 architecture:
 
-* slice boundary — no Slice-2+ scope (FTS5/search expansion, scheduler,
-  contacts, exports, recipes/Adapter Lab, merge UI, second adapter);
+* slice boundary — no Slice-2+ scope *owned by Slice 1* (scheduler, contacts,
+  exports, recipes/Adapter Lab, merge UI).  Two of the original whole-tree
+  boundary pins ("no FTS5 anywhere", "exactly one built-in adapter") are
+  Slice-1 *shipped-state* assertions that ROAD-03 legitimately supersedes;
+  they are re-scoped to what Slice 1 itself owns, and the whole-tree rules
+  moved to ``test_slice2_contract.py`` (S2.0) rather than being dropped.  No
+  Slice-1 architectural invariant was relaxed here;
 * provenance-first — adapters never touch the database and nothing
   outside the pipeline writes canonical jobs;
 * browser/service boundary — Playwright/Chromium only inside the browser
@@ -96,21 +101,30 @@ def _parse(path: Path) -> ast.Module:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
-def test_no_fts5_or_search_expansion():
-    # The only permitted "fts5" references are the Slice-0 capability
-    # surfaces (doctor probe + integrity reporting).  The only permitted
-    # virtual table is the temp-table capability probe itself.
+def test_no_unowned_virtual_table_or_fts_capability_probe():
+    """S1.11 boundary pin, re-scoped by Slice 2 (S2.0).
+
+    Slice 1 shipped no FTS5/search surface, so the original assertion was
+    "the string ``fts5`` appears nowhere outside the capability surfaces".
+    ROAD-03 *owns* FTS5, so that whole-tree prohibition is now the Slice-2
+    contract (``test_slice2_contract.py::test_fts5_is_capability_gated_and_
+    owned_by_the_search_package``).
+
+    What Slice 1 still pins, unchanged: the FTS5 *capability probe* belongs to
+    the Slice-0 surfaces only, and no Slice-1 package may create a SQLite
+    virtual table.
+    """
     capability_surfaces = {
-        SRC / "db" / "connection.py",
-        SRC / "db" / "migrations.py",
-        SRC / "launcher" / "doctor.py",
+        (SRC / "db" / "connection.py").as_posix(),
+        (SRC / "db" / "migrations.py").as_posix(),
+        (SRC / "launcher" / "doctor.py").as_posix(),
     }
-    probe = SRC / "db" / "connection.py"
+    probe = (SRC / "db" / "connection.py").as_posix()
     for path in SRC.rglob("*.py"):
-        text = path.read_text(encoding="utf-8")
-        if path not in capability_surfaces:
-            assert "fts5" not in text.lower(), path
-        if path != probe:
+        rel = path.as_posix()
+        if "__fts5_probe" in (text := path.read_text(encoding="utf-8")):
+            assert rel in capability_surfaces, path
+        if rel != probe and not rel.startswith((SRC / "search").as_posix()):
             assert "CREATE VIRTUAL TABLE" not in text, path
 
 
@@ -132,10 +146,25 @@ def test_no_contacts_exports_adapter_lab_or_merge_ui():
             assert not re.search(rf"\b{table}\b", text), (path, table)
 
 
-def test_single_builtin_adapter():
+def test_feed_adapter_remains_the_slice1_baseline_adapter():
+    """S1.11 boundary pin, re-scoped by Slice 2 (S2.0).
+
+    Slice 1 pinned *exactly one* built-in adapter because ROAD-02 ships the
+    smallest reliable feed path.  ROAD-03 owns structured acquisition
+    breadth, so the exact adapter set is now the Slice-2 contract
+    (``test_slice2_contract.py::test_builtin_adapter_registry_is_exact_and_
+    manifest_validated``).
+
+    What Slice 1 still pins: its own adapter is registered, manifest-valid,
+    HTTP-only, and unchanged in identity.
+    """
     from jobscraper.adapters.registry import BUILTIN_ADAPTERS
 
-    assert set(BUILTIN_ADAPTERS) == {"json_api_feed"}
+    cls = BUILTIN_ADAPTERS["json_api_feed"]
+    assert cls.manifest.id == "json_api_feed"
+    assert cls.manifest.adapter_api_version == "1"
+    assert set(cls.manifest.supported_execution_classes) == {"HTTP"}
+    assert set(cls.manifest.supported_auth_modes) == {"NONE"}
 
 
 def test_adapters_never_touch_the_database():
@@ -236,11 +265,16 @@ def test_migration_discipline_forward_only_sequential_pinned():
     versions = [v for v, _name, _sql in MIGRATION_STEPS]
     assert versions == list(range(1, LATEST_SCHEMA_VERSION + 1))
     assert REBUILD_STEPS <= set(versions)
-    # every released step is pinned in the S1.1 test file
+    # every Slice-1 released step is pinned in the S1.1 test file.  Steps
+    # appended by later slices are pinned by their own slice's schema test
+    # (Slice 2: tests/integration/test_schema_slice2.py), which is what keeps
+    # "forward-only, never edited" enforceable across slices.
     pins = (REPO_ROOT / "tests/integration/test_schema_slice1.py").read_text(
         encoding="utf-8"
     )
     for version, _name, sql in MIGRATION_STEPS:
+        if version > 10:
+            continue
         digest = hashlib.sha256(sql.encode()).hexdigest()
         assert f'{version}: "{digest}"' in pins, f"migration step {version} not pinned"
 
