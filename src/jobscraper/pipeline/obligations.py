@@ -60,6 +60,10 @@ def reconcile_job(conn: sqlite3.Connection, job_id: str, *, now: str) -> str:
         "UPDATE jobs SET listing_status = ?, updated_at = ? WHERE id = ?",
         (derived, now, job_id),
     )
+    if derived == "CLOSED":
+        from jobscraper.applications.core import record_listing_closed_if_applicable
+
+        record_listing_closed_if_applicable(conn, job_id, now=now, commit=False)
     if (
         derived == "ACTIVE"
         and prior_status in ("CLOSED", "EXPIRED", "WITHDRAWN")
