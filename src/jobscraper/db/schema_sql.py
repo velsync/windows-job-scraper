@@ -16,6 +16,9 @@ Slice 1 appends the domain model (v3–v9) per RUN-17/RUN-18:
   v8 profile-relative state: disposition, inbox events, eligibility, scores
      (PROD-01/02, 01 §36/§41)
   v9 applications and documents (01 §43)
+  v11 S2.1 richer acquisition evidence + origin resolution (02 §11.3/§32,
+     ACQ-09, 03 §30 — append-only, no released step touched)
+
   v10 S1.1 corrective (architectural review 2026-09-08):
      - companies: normalized_name is a resolution signal, not identity
        (01 §33.1 "weak evidence must not aggressively merge companies") —
@@ -1053,6 +1056,84 @@ CREATE UNIQUE INDEX idx_job_sources_native_identity
     return sql
 
 
+# ---------------------- v11 richer acquisition evidence + origin resolution
+# Slice 2 S2.1 (02 §11.3 completeness, ACQ-09 versioned contracts, 02 §32
+# origin resolver, 03 §30 evidence chain).  Append-only: additive columns on
+# the existing evidence/observation/presence tables plus the new immutable
+# acquisition_evidence spine.  No released step is edited.
+@_step(11, "s2_1_richer_envelope_evidence_and_origin")
+def _(sql: str = """
+ALTER TABLE fetch_attempts ADD COLUMN contract_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE fetch_attempts ADD COLUMN execution_plan_id TEXT;
+ALTER TABLE fetch_attempts ADD COLUMN headers_redacted_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE fetch_attempts ADD COLUMN validators_sent_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE fetch_attempts ADD COLUMN robots_decision TEXT;
+ALTER TABLE fetch_attempts ADD COLUMN transport TEXT;
+ALTER TABLE fetch_attempts ADD COLUMN browser_used INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE fetch_attempts ADD COLUMN resource_blocking_applied INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE fetch_attempts ADD COLUMN security_policy_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE fetch_attempts ADD COLUMN structured_payload_ref TEXT;
+
+ALTER TABLE parse_attempts ADD COLUMN contract_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE parse_attempts ADD COLUMN validated_page_class TEXT;
+ALTER TABLE parse_attempts ADD COLUMN validation_evidence_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE parse_attempts ADD COLUMN result_envelope_ref TEXT;
+ALTER TABLE parse_attempts ADD COLUMN cursor_proposal_json TEXT;
+ALTER TABLE parse_attempts ADD COLUMN coverage_proposal_json TEXT;
+ALTER TABLE parse_attempts ADD COLUMN continuation_required INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE parse_attempts ADD COLUMN closure_evidence_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE parse_attempts ADD COLUMN evidence_refs_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE parse_attempts ADD COLUMN review_evidence_json TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE job_observations ADD COLUMN fetch_attempt_id TEXT
+    REFERENCES fetch_attempts(id);
+ALTER TABLE job_observations ADD COLUMN parse_attempt_id TEXT
+    REFERENCES parse_attempts(id);
+ALTER TABLE job_observations ADD COLUMN contract_version INTEGER NOT NULL DEFAULT 1;
+
+ALTER TABLE field_evidence ADD COLUMN source_url TEXT;
+ALTER TABLE field_evidence ADD COLUMN excerpt_hash TEXT;
+
+-- Origin resolution (02 §32) is durable *per source presence*: which
+-- employer/board/job id this observation's evidence points at, with the
+-- confidence and evidence that made it so.  Resolution never destroys the
+-- original source links above it (discovery_url / raw_source_url).
+ALTER TABLE job_sources ADD COLUMN origin_provider TEXT;
+ALTER TABLE job_sources ADD COLUMN origin_board TEXT;
+ALTER TABLE job_sources ADD COLUMN origin_job_id TEXT;
+ALTER TABLE job_sources ADD COLUMN origin_resolution_confidence REAL;
+ALTER TABLE job_sources ADD COLUMN origin_resolution_evidence_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE job_sources ADD COLUMN origin_resolved_at TEXT;
+CREATE INDEX idx_job_sources_origin
+    ON job_sources(origin_provider, origin_board, origin_job_id);
+
+CREATE TABLE acquisition_evidence (
+    id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES scrape_requests(id),
+    attempt_id TEXT,
+    fetch_attempt_id TEXT REFERENCES fetch_attempts(id),
+    parse_attempt_id TEXT REFERENCES parse_attempts(id),
+    observation_id TEXT REFERENCES job_observations(id),
+    kind TEXT NOT NULL
+        CHECK (kind IN ('RESULT_ENVELOPE', 'PAGE_VALIDITY', 'SECURITY_POLICY',
+                        'ORIGIN_RESOLUTION', 'CONTENT_CLEANING', 'FAILURE',
+                        'REVIEW')),
+    ref TEXT,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    content_hash TEXT,
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_acquisition_evidence_request
+    ON acquisition_evidence(request_id, kind);
+CREATE INDEX idx_acquisition_evidence_observation
+    ON acquisition_evidence(observation_id, kind);
+"""
+) -> None:
+    return sql
+
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1067,4 +1148,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 10, "Slice 1 S1.1 schema is versions 1-10 (v10 corrective)"
+assert LATEST_SCHEMA_VERSION == 11, (
+    "Slice 1 ships versions 1-10 (v10 corrective); Slice 2 appends v11"
+)

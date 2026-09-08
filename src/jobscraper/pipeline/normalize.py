@@ -12,6 +12,11 @@ import html as html_lib
 import re
 from dataclasses import dataclass
 
+#: Version of the deterministic normalization performed here.  Recorded on
+#: every parse attempt and evaluation row (ARC-10, RUN-21).  Slice 2 S2.3 adds
+#: the content-cleaning version on top of it.
+NORMALIZATION_VERSION = "normalize-v1"
+
 _BLOCK_TAGS = re.compile(
     r"</?(p|div|section|article|header|footer|ul|ol|li|h[1-6]|br|tr|table)[^>]*>",
     re.IGNORECASE,
@@ -226,6 +231,7 @@ def normalize_observation(observation) -> NormalizedContent:
 
 
 __all__ = [
+    "NORMALIZATION_VERSION",
     "NormalizedContent",
     "detect_language",
     "normalize_company",

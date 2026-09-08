@@ -48,7 +48,9 @@ SLICE1_RELEASED_STEP_SHA256 = {
 }
 
 #: Slice-2 released steps (v11+).  Each Slice-2 package appends its own pin.
-RELEASED_STEP_SHA256: dict[int, str] = {}
+RELEASED_STEP_SHA256: dict[int, str] = {
+    11: "dc3a29389a35b1e24396ac9d662cd6c6dfd460341d95125a3171a504f65e8ddb",
+}
 
 
 def _digest(sql: str) -> str:

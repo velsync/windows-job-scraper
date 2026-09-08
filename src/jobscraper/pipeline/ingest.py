@@ -25,6 +25,8 @@ import hashlib
 import json
 import sqlite3
 
+from jobscraper.acquisition.origin import OriginResolution, OriginStatus
+from jobscraper.adapters.contract import CONTRACT_VERSION
 from jobscraper.ids import new_id
 from jobscraper.pipeline.canonical import (
     record_change,
@@ -84,6 +86,9 @@ def ingest_observation(
     observed_at: str,
     now: str,
     query_id: str | None = None,
+    fetch_attempt_id: str | None = None,
+    parse_attempt_id: str | None = None,
+    origin: OriginResolution | None = None,
 ) -> dict:
     """Ingest one observation proposal inside the caller's fence.
 
@@ -109,8 +114,10 @@ def ingest_observation(
             source_job_id, raw_url, canonical_url_candidate,
             application_url_candidate, page_cursor_json, source_rank_or_order,
             raw_payload_ref, parse_evidence_ref, observed_at,
-            observation_unique_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            observation_unique_key, fetch_attempt_id, parse_attempt_id,
+            contract_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?)
         ON CONFLICT (request_id, observation_unique_key) DO NOTHING
         """,
         (
@@ -135,6 +142,9 @@ def ingest_observation(
             None,  # parse_evidence_ref set below with the content hash
             observed_at,
             key,
+            fetch_attempt_id,
+            parse_attempt_id,
+            CONTRACT_VERSION,
         ),
     )
     if inserted.rowcount == 0:
@@ -159,8 +169,9 @@ def ingest_observation(
             """
             INSERT INTO field_evidence (
                 id, observation_id, field_name, locator_kind, locator_value,
-                value_hash, excerpt, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                value_hash, excerpt, created_at, evidence_start, evidence_end,
+                source_url, excerpt_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 new_id("fe"),
@@ -171,6 +182,12 @@ def ingest_observation(
                 evidence.value_hash,
                 evidence.excerpt[:500],
                 now,
+                evidence.evidence_start,
+                evidence.evidence_end,
+                evidence.source_url,
+                hashlib.sha256(evidence.excerpt.encode()).hexdigest()
+                if evidence.excerpt
+                else None,
             ),
         )
 
@@ -213,6 +230,28 @@ def ingest_observation(
         ),
     )
 
+    if origin is not None:
+        # 02 §32: the resolution is durable evidence attached to the
+        # observation it was derived from; it never rewrites that
+        # observation's own recorded URLs.
+        conn.execute(
+            "INSERT INTO acquisition_evidence (id, request_id, attempt_id,"
+            " observation_id, kind, ref, detail_json, content_hash,"
+            " observed_at, created_at) VALUES (?, ?, ?, ?, 'ORIGIN_RESOLUTION',"
+            " ?, ?, ?, ?, ?)",
+            (
+                new_id("ev"),
+                request_id,
+                attempt_id,
+                observation_id,
+                origin.origin_url,
+                json.dumps(origin.as_dict(), sort_keys=True, default=str)[:60000],
+                None,
+                observed_at,
+                now,
+            ),
+        )
+
     presence_id, presence_updated = _upsert_presence(
         conn,
         job_id=job_id,
@@ -228,6 +267,7 @@ def ingest_observation(
         # URL match attaches a NEW presence row, never rewrites another
         # source's presence
         existing=existing_presence if resolution.decision == "MATCHED" else None,
+        origin=origin,
     )
 
     if presence_updated:
@@ -358,6 +398,7 @@ def _upsert_presence(
     observed_at: str,
     now: str,
     existing: sqlite3.Row | None,
+    origin: OriginResolution | None = None,
 ) -> str:
     if existing is None:
         presence_id = new_id("js")
@@ -369,8 +410,12 @@ def _upsert_presence(
                 source_identity_generation, discovery_url, raw_source_url,
                 canonical_job_url, application_url, origin_url, first_seen_at,
                 last_seen_at, last_verified_at, presence_state, content_revision,
-                last_observation_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', 1, ?, ?, ?)
+                last_observation_id, origin_provider, origin_board, origin_job_id,
+                origin_resolution_confidence, origin_resolution_evidence_json,
+                origin_resolved_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'ACTIVE', 1,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 presence_id,
@@ -388,6 +433,7 @@ def _upsert_presence(
                 observed_at,
                 observed_at,
                 observation_id,
+                *_origin_fields(origin, resolved_at=observed_at),
                 now,
                 now,
             ),
@@ -415,6 +461,12 @@ def _upsert_presence(
         """
         UPDATE job_sources SET
             binding_id = ?, last_seen_at = ?, last_verified_at = ?,
+            origin_provider = COALESCE(?, origin_provider),
+            origin_board = COALESCE(?, origin_board),
+            origin_job_id = COALESCE(?, origin_job_id),
+            origin_resolution_confidence = COALESCE(?, origin_resolution_confidence),
+            origin_resolution_evidence_json = COALESCE(?, origin_resolution_evidence_json),
+            origin_resolved_at = COALESCE(?, origin_resolved_at),
             canonical_job_url = COALESCE(?, canonical_job_url),
             application_url = COALESCE(?, application_url),
             content_revision = CASE WHEN ? THEN content_revision + 1
@@ -428,6 +480,7 @@ def _upsert_presence(
             binding_id,
             observed_at,
             observed_at,
+            *_origin_fields(origin, resolved_at=observed_at),
             observation.canonical_url_candidate,
             observation.application_url_candidate,
             content_changed,
@@ -437,6 +490,29 @@ def _upsert_presence(
         ),
     )
     return existing["id"], True
+
+
+def _origin_fields(origin: OriginResolution | None, *, resolved_at: str) -> tuple:
+    """Presence-level origin columns (02 §32).
+
+    An unresolved resolution writes NULLs: nothing is guessed, and an existing
+    resolved origin is never erased by a later unresolved sighting (COALESCE in
+    the UPDATE).  The resolved URL itself stays inside the evidence rows —
+    ``job_sources.origin_url`` remains reserved for canonical URL selection
+    (03 §39), so the resolver never overloads it.
+    """
+    if origin is None or origin.status is not OriginStatus.RESOLVED:
+        # {} is honest here: an unresolved sighting has no resolution to
+        # record, and the column is NOT NULL by contract.
+        return (None, None, None, None, "{}", None)
+    return (
+        origin.origin_provider,
+        origin.origin_board,
+        origin.origin_job_id,
+        origin.confidence,
+        json.dumps(origin.as_dict(), sort_keys=True, default=str),
+        origin.resolved_at or resolved_at,
+    )
 
 
 __all__ = ["ingest_observation", "observation_key"]

@@ -158,6 +158,61 @@ plane:
   spine (`03` §30). Canonical `jobs.origin_*` (03 §52) is rolled up from the
   selected provenance in S2.2, never written by a collector.
 
+As implemented (S2.1, deviations recorded deliberately):
+
+* `PlanningContext` and `ParseContext` live in `adapters/contract.py` — the
+  single versioned adapter-contract module (`CONTRACT_VERSION =
+  PARSE_CONTRACT_VERSION = 2`) — rather than a new `acquisition/contract.py`,
+  so the adapter protocol has exactly one owner.  The driver constructs both
+  contexts; adapters receive them read-only.
+* `ValidatedResultEnvelope` is the real type and `ValidatedResult` remains an
+  alias, so accepted Slice-1 call sites and fixtures stay valid.  The ACQ-02
+  gate is `__post_init__`: *constructing* the validated envelope with any page
+  class outside `NORMAL_PARSE_CLASSES = {VALID_LIST, VALID_JOB, EMPTY}` raises,
+  which makes "parser handed unvalidated content" unrepresentable instead of
+  merely discouraged.
+* `ResultEnvelope.finalize()` (called by `httpexec.finish_and`) derives
+  `body_hash`, `normalized_content_hash`, `body_ref`, `structured_payload_ref`.
+  Content-class normalization: JSON re-serialized with sorted keys, HTML
+  stripped of scripts/styles/tags with whitespace collapsed, anything else (or
+  unparseable content) hashed over raw bytes — "we could not normalize" must
+  never look like "nothing changed".
+* Migration v11 does **not** re-add `fetch_attempts.body_ref` (v6) or
+  `job_sources.origin_url` (v7): the latter stays reserved for canonical URL
+  selection (01 §39), so the resolver never overloads it and the resolved URL
+  is carried in `origin_resolution_evidence_json` plus the
+  `acquisition_evidence` row.
+* Origin resolution is pure over already-recorded evidence
+  (`redirect_chain_json`, `final_url`, the observation's own link candidates).
+  A durable bounded unwrap loop is ROAD-04 / Slice 3, not Slice 2.
+  `origin_url` is taken from the *highest-priority* matching candidate
+  (`canonical_job_url → application_url → final_url → recorded hops →
+  raw_source_url → discovery_url`); additional matches raise confidence
+  (0.95 corroborated) but never silently re-point the recorded URL.
+  Below `ORIGIN_CONFIDENCE_THRESHOLD = 0.75` (or on provider conflict) the
+  resolution is `UNRESOLVED` and **all** `origin_*` presence columns stay
+  NULL; the partial signals survive only as evidence.  Persistence is
+  `COALESCE`-based, so a later unresolved sighting can never erase an earlier
+  resolved origin (RUN-21 direction).
+* The driver constructs a `PlanningContext` for `adapter.plan` and a
+  `ParseContext` for `parse`/`next_cursor` (the latter carries the
+  request-scoped `idempotency_namespace`).  Fields whose durable store does
+  not exist yet (`policy_snapshot_ref`, `budget_snapshot_ref`,
+  `query_revision_ref`) are passed as `None` rather than fabricated: Slice 3
+  owns frontier/budget snapshots, Slice 4 owns query revisions.
+* `ParseOutcome.evidence_refs` is accepted and persisted
+  (`parse_attempts.evidence_refs_json`), as is `closure_or_missing_evidence`;
+  the Slice-1 `json_api_feed` parser legitimately reports empty lists on both,
+  and S2.5's provider parser is the first producer.
+
+* Slice-1 schema tests were re-scoped, not weakened: `v1..v10` byte pins
+  remain in `test_schema_slice1.py` **and** are re-pinned by
+  `test_schema_slice2.py::test_slice1_released_bytes_are_untouched`, while the
+  "head equals 10" exactness moved into the executing slice's own schema test
+  (Slice 2 now pins `LATEST_SCHEMA_VERSION == 11` and requires every appended
+  step to be registered exactly once).  Both `verify_slice0.py` and
+  `verify_slice1.py` pass unchanged at v11.
+
 ### S2.2 — companies, multi-location, canonical provenance selection
 
 * `pipeline/companies.py` — company resolution per 01 §33.1. Signals:

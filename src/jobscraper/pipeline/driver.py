@@ -35,12 +35,16 @@ from jobscraper.acquisition.envelope import (
 )
 from jobscraper.acquisition.failures import FailureKind
 from jobscraper.acquisition.httpexec import execute_request
-from jobscraper.acquisition.pagevalidity import PageClass, classify_page
+from jobscraper.acquisition.origin import resolve_origin
+from jobscraper.acquisition.pagevalidity import classify_page
 from jobscraper.adapters.contract import (
+    NORMAL_PARSE_CLASSES,
     AdapterTask,
     AdapterTaskKind,
     CrawlCursor,
-    ValidatedResult,
+    ParseContext,
+    PlanningContext,
+    ValidatedResultEnvelope,
 )
 from jobscraper.adapters.feed_api import FeedApiAdapter, FeedApiConfig
 from jobscraper.adapters.registry import get_adapter
@@ -56,6 +60,7 @@ from jobscraper.pipeline.coverage import (
     record_seen_identity,
 )
 from jobscraper.pipeline.ingest import ingest_observation
+from jobscraper.pipeline.normalize import NORMALIZATION_VERSION
 from jobscraper.pipeline.obligations import drain_all_obligations
 from jobscraper.runtime.cancellation import (
     abandon_request_for_cancellation,
@@ -274,7 +279,18 @@ def _execute_plan(
 
         cursor = _load_cursor(conn, plan_row)
         task = AdapterTask(kind=AdapterTaskKind.ENUMERATE, payload={})
-        request_plan = adapter.plan(task, cursor, ctx=None)
+        # 02 ACQ-09: planning receives the host-resolved pins, never mutable
+        # host state.  Snapshots that do not exist durably yet stay None —
+        # the driver does not fabricate references (Slice 3 frontier/budgets).
+        planning_ctx = PlanningContext(
+            run_id=run_id,
+            run_source_plan_id=plan_row["id"],
+            source_snapshot_ref=f"source://{plan_row['source_id']}",
+            binding_revision_id=plan_row["binding_revision_id"],
+            permission_profile_revision=plan_row["permission_profile_revision"],
+            cursor_schema_version=plan_row["cursor_schema_version"],
+        )
+        request_plan = adapter.plan(task, cursor, ctx=planning_ctx)
         envelope = ExecutionPlanEnvelope(
             plan_id=new_id("plan"),
             request_id=claim.request_id,
@@ -309,27 +325,84 @@ def _execute_plan(
         signal: dict = {}
 
         def mutate(cursor_conn):
-            _persist_fetch_attempt(cursor_conn, envelope, result, ts)
+            fetch_attempt_id = _persist_fetch_attempt(cursor_conn, envelope, result, ts)
+            _record_evidence(
+                cursor_conn,
+                request_id=claim.request_id,
+                attempt_id=claim.attempt_id,
+                fetch_attempt_id=fetch_attempt_id,
+                kind="RESULT_ENVELOPE",
+                ref=result.body_ref,
+                detail=result.as_evidence(),
+                content_hash=result.normalized_content_hash,
+                now=ts,
+            )
+            if result.security_policy_result != "ALLOWED":
+                # the denial itself is durable evidence (04 §5.1): an empty
+                # result must always be explainable as a policy outcome
+                _record_evidence(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    fetch_attempt_id=fetch_attempt_id,
+                    kind="SECURITY_POLICY",
+                    ref=result.security_policy_result,
+                    detail={"result": result.security_policy_result,
+                            "requested_url": result.requested_url},
+                    content_hash=None,
+                    now=ts,
+                )
             cursor_conn.execute(
                 "UPDATE scrape_requests SET page_class = ? WHERE id = ?",
                 (classification.state.value, claim.request_id),
             )
+            _record_evidence(
+                cursor_conn,
+                request_id=claim.request_id,
+                attempt_id=claim.attempt_id,
+                fetch_attempt_id=fetch_attempt_id,
+                kind="PAGE_VALIDITY",
+                ref=f"validity://{classification.state.value}",
+                detail=dict(classification.evidence),
+                content_hash=result.normalized_content_hash,
+                now=ts,
+            )
             # EMPTY is a recognized non-job outcome (§21): the adapter parse
             # yields SUCCESS_EMPTY, which terminates the enumeration
             # authoritatively (ACQ-02).
-            if classification.state in (
-                PageClass.VALID_LIST,
-                PageClass.VALID_JOB,
-                PageClass.EMPTY,
-            ):
-                validated = ValidatedResult(
+            if classification.state in NORMAL_PARSE_CLASSES:
+                validated = ValidatedResultEnvelope(
                     envelope=result,
                     page_class=classification.state,
                     validation_evidence=classification.evidence,
+                    security_policy_result=result.security_policy_result,
+                    cache_representation_ref=result.cache_representation_ref,
                 )
-                outcome_obj = adapter.parse(task, validated, ctx=None)
-                _persist_parse_attempt(cursor_conn, envelope, outcome_obj, ts)
+                parse_ctx = ParseContext(
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    run_source_plan_id=plan_row["id"],
+                    parser_version=plan_row["adapter_version"],
+                    normalization_version=NORMALIZATION_VERSION,
+                    idempotency_namespace=claim.request_id,
+                )
+                outcome_obj = adapter.parse(task, validated, ctx=parse_ctx)
+                parse_attempt_id = _persist_parse_attempt(
+                    cursor_conn, envelope, outcome_obj, validated, ts
+                )
                 for observation in outcome_obj.observations:
+                    # 02 §32 origin resolution — host-owned and network-inert:
+                    # it consumes the recorded redirect chain plus the
+                    # observation's own link candidates.
+                    origin = resolve_origin(
+                        discovery_url=source["entry_url"] if source else None,
+                        raw_source_url=observation.raw_url,
+                        canonical_job_url=observation.canonical_url_candidate,
+                        application_url=observation.application_url_candidate,
+                        redirect_chain=result.redirect_chain,
+                        final_url=result.final_url,
+                        observed_at=ts,
+                    )
                     ingest_observation(
                         cursor_conn,
                         request_id=claim.request_id,
@@ -343,6 +416,9 @@ def _execute_plan(
                         execution_class=plan_row["execution_class"],
                         observed_at=ts,
                         now=ts,
+                        fetch_attempt_id=fetch_attempt_id,
+                        parse_attempt_id=parse_attempt_id,
+                        origin=origin,
                     )
                     if observation.source_job_id:
                         record_seen_identity(
@@ -352,7 +428,7 @@ def _execute_plan(
                 if outcome_obj.kind.value == "SUCCESS_EMPTY":
                     signal["value"] = "EMPTY"
                     return
-                next_cursor = adapter.next_cursor(task, outcome_obj, cursor, ctx=None)
+                next_cursor = adapter.next_cursor(task, outcome_obj, cursor, ctx=parse_ctx)
                 if next_cursor is not None:
                     _save_cursor(cursor_conn, plan_row, next_cursor, ts)
                     enqueue_request(
@@ -438,17 +514,67 @@ def _execute_plan(
     set_group_outcome(conn, plan_row["id"], outcome, now=db_utc_now(conn))
 
 
-def _persist_fetch_attempt(conn, envelope, result, ts) -> None:
+def _record_evidence(
+    conn,
+    *,
+    request_id: str,
+    attempt_id: str | None,
+    fetch_attempt_id: str | None = None,
+    parse_attempt_id: str | None = None,
+    observation_id: str | None = None,
+    kind: str,
+    ref: str | None,
+    detail: dict,
+    content_hash: str | None,
+    now: str,
+) -> str:
+    """One durable evidence row (03 §30): hashes, refs and redacted metadata."""
+    evidence_id = new_id("ev")
     conn.execute(
         """
-        INSERT INTO fetch_attempts (id, attempt_id, request_id, requested_url,
-            final_url, status_code, content_type, body_hash, bytes_downloaded,
-            duration_ms, redirect_chain_json, was_304, failure_kind, failure_json,
-            fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO acquisition_evidence (
+            id, request_id, attempt_id, fetch_attempt_id, parse_attempt_id,
+            observation_id, kind, ref, detail_json, content_hash, observed_at,
+            created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            new_id("fa"),
+            evidence_id,
+            request_id,
+            attempt_id,
+            fetch_attempt_id,
+            parse_attempt_id,
+            observation_id,
+            kind,
+            ref,
+            json.dumps(detail, sort_keys=True, default=str)[:60000],
+            content_hash,
+            now,
+            now,
+        ),
+    )
+    return evidence_id
+
+
+def _persist_fetch_attempt(conn, envelope, result, ts) -> str:
+    """Durable fetch attempt for one ResultEnvelope (02 §11.3, 03 §30)."""
+    fetch_attempt_id = new_id("fa")
+    conn.execute(
+        """
+        INSERT INTO fetch_attempts (
+            id, attempt_id, request_id, requested_url, final_url, status_code,
+            content_type, body_hash, normalized_content_hash, body_ref,
+            bytes_downloaded, duration_ms, redirect_chain_json, was_304,
+            failure_kind, failure_json, fetched_at,
+            contract_version, execution_plan_id, headers_redacted_json,
+            validators_sent_json, robots_decision, transport, browser_used,
+            resource_blocking_applied, security_policy_json,
+            structured_payload_ref)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            fetch_attempt_id,
             envelope.attempt_id,
             envelope.request_id,
             result.requested_url,
@@ -456,6 +582,8 @@ def _persist_fetch_attempt(conn, envelope, result, ts) -> None:
             result.status_code,
             result.content_type,
             result.body_hash,
+            result.normalized_content_hash,
+            result.body_ref,
             result.bytes_downloaded,
             result.duration_ms,
             json.dumps(result.redirect_chain),
@@ -463,29 +591,74 @@ def _persist_fetch_attempt(conn, envelope, result, ts) -> None:
             result.failure.kind.value if result.failure else None,
             json.dumps(result.failure.as_dict()) if result.failure else None,
             ts,
+            result.contract_version,
+            envelope.plan_id,
+            json.dumps(dict(result.headers_redacted), sort_keys=True, default=str),
+            json.dumps(sorted(result.validators_sent)),
+            result.robots_decision,
+            result.transport,
+            1 if result.browser_used else 0,
+            1 if result.resource_blocking_applied else 0,
+            json.dumps(
+                {
+                    "result": result.security_policy_result,
+                    "policy_snapshot_ref": envelope.policy_snapshot_ref,
+                    "permission_profile_revision": envelope.permission_profile_revision,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            result.structured_payload_ref,
         ),
     )
+    return fetch_attempt_id
 
 
-def _persist_parse_attempt(conn, envelope, outcome, ts) -> None:
+def _persist_parse_attempt(conn, envelope, outcome, validated, ts) -> str:
+    """Durable parse attempt under the ACQ-09 contract (02 §11.3, 03 §30)."""
+    parse_attempt_id = new_id("pa")
     conn.execute(
         """
-        INSERT INTO parse_attempts (id, attempt_id, request_id, parser_kind,
-            parser_version, outcome_kind, observation_count, failure_kind,
-            failure_json, parsed_at)
-        VALUES (?, ?, ?, 'feed_api', '1.0.0', ?, ?, ?, ?, ?)
+        INSERT INTO parse_attempts (
+            id, attempt_id, request_id, parser_kind, parser_version,
+            outcome_kind, observation_count, child_task_count, failure_kind,
+            failure_json, parsed_at, contract_version, validated_page_class,
+            validation_evidence_json, result_envelope_ref,
+            cursor_proposal_json, coverage_proposal_json,
+            continuation_required, closure_evidence_json, review_evidence_json,
+            evidence_refs_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            new_id("pa"),
+            parse_attempt_id,
             envelope.attempt_id,
             envelope.request_id,
+            envelope.adapter_id,
+            envelope.adapter_version,
             outcome.kind.value,
             len(outcome.observations),
+            len(outcome.discovered_tasks),
             outcome.failure.kind.value if outcome.failure else None,
             json.dumps(outcome.failure.as_dict()) if outcome.failure else None,
             ts,
+            outcome.contract_version,
+            validated.validated_page_class.value,
+            json.dumps(dict(validated.validation_evidence), sort_keys=True, default=str),
+            validated.result_envelope_ref,
+            # already serialized JSON text (CrawlCursor.state_json)
+            outcome.cursor_proposal.state_json
+            if outcome.cursor_proposal is not None
+            else None,
+            json.dumps(outcome.coverage_proposal, sort_keys=True, default=str)
+            if outcome.coverage_proposal
+            else None,
+            1 if outcome.continuation_required else 0,
+            json.dumps([dict(e) for e in outcome.closure_or_missing_evidence], default=str),
+            json.dumps([dict(e) for e in outcome.review_evidence], default=str),
+            json.dumps(list(outcome.evidence_refs), default=str),
         ),
     )
+    return parse_attempt_id
 
 
 __all__ = ["execute_run", "source_policy"]

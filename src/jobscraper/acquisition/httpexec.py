@@ -40,11 +40,19 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
 def finish_and(result: ResultEnvelope, started: float, failure: FailureRecord | None) -> ResultEnvelope:
+    """Close one execution: timing, typed failure, and the derived evidence.
+
+    ``finalize()`` computes body/normalized-content hashes and the
+    content-addressed references (02 §11.3, 03 §30).  A policy denial is
+    recorded on the envelope itself so the durable evidence shows *why* there
+    is no content, rather than an empty result looking like a successful one.
+    """
     result.duration_ms = int((time.monotonic() - started) * 1000)
     result.failure = failure
-    if result.body and not result.was_304:
-        result.body_hash = ResultEnvelope.make_body_hash(result.body)
-    return result
+    if failure is not None and failure.kind is FailureKind.POLICY_REJECTED:
+        reason = (failure.details_redacted or {}).get("reason_code") or "UNSPECIFIED"
+        result.security_policy_result = f"DENIED:{reason}"
+    return result.finalize()
 
 
 def _failure(envelope: ExecutionPlanEnvelope, kind: FailureKind, retryable: bool,
@@ -138,11 +146,7 @@ def execute_request(
         )
 
     def finish(failure: FailureRecord | None = None) -> ResultEnvelope:
-        result.duration_ms = int((time.monotonic() - started) * 1000)
-        result.failure = failure
-        if result.body is not None and not result.was_304:
-            result.body_hash = ResultEnvelope.make_body_hash(result.body)
-        return result
+        return finish_and(result, started, failure)
 
     url = envelope.payload.url
     current_base: str | None = None

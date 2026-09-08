@@ -193,7 +193,12 @@ def test_migrations_apply_and_versions_recorded(tmp_path):
     db = Database(tmp_path / "fresh.db")
     applied = migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
     assert applied == list(range(1, LATEST_SCHEMA_VERSION + 1))
-    assert LATEST_SCHEMA_VERSION == SCHEMA_VERSION == 10
+    # Slice 1 shipped through v10.  The *exact* current head is owned by the
+    # currently executing slice's schema test (Slice 2:
+    # tests/integration/test_schema_slice2.py), which keeps "every appended
+    # step is a deliberate, pinned change" intact.
+    assert LATEST_SCHEMA_VERSION == SCHEMA_VERSION
+    assert LATEST_SCHEMA_VERSION >= 10
     # Re-running at latest is a no-op.
     assert migrate_schema(db.conn, LATEST_SCHEMA_VERSION) == []
     db.close()
@@ -208,7 +213,13 @@ def test_downgrade_rejected(tmp_path):
 
 
 def test_released_steps_are_byte_stable():
+    # Slice 1 owns the byte pins for v1-v10; later slices append their own
+    # pinned steps in their own schema test (Slice 2:
+    # tests/integration/test_schema_slice2.py::test_slice1_released_bytes_are_untouched
+    # re-pins the exact same digests so nobody can quietly edit this range).
     for version, _name, sql in MIGRATION_STEPS:
+        if version not in RELEASED_STEP_SHA256:
+            continue
         digest = hashlib.sha256(sql.encode()).hexdigest()
         pinned = RELEASED_STEP_SHA256[version]
         assert digest == pinned, f"migration step {version} was edited"
@@ -836,7 +847,8 @@ def test_v10_rebuild_preserves_existing_v9_data(tmp_path):
         conn.commit()
 
     applied = migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
-    assert applied == [10]
+    assert applied[0] == 10
+    assert applied == list(range(10, LATEST_SCHEMA_VERSION + 1))
 
     # Rows survived the rebuilds.
     assert conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1

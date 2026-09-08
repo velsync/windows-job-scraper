@@ -18,7 +18,13 @@ from jobscraper.acquisition.failures import FailureKind, FailureRecord
 from jobscraper.acquisition.pagevalidity import PageClass
 from jobscraper.acquisition.result import ResultEnvelope
 
-CONTRACT_VERSION = 1
+#: Versioned cross-component data contracts (02 ACQ-09).  Slice 2 bumped this
+#: additively: PlanningContext/ParseContext became concrete, and
+#: ValidatedResult gained the §11.3/ACQ-09 reference fields plus a hard gate
+#: that refuses an unvalidated page class.  Readers must accept every version
+#: they claim.
+CONTRACT_VERSION = 2
+PARSE_CONTRACT_VERSION = CONTRACT_VERSION
 
 _KNOWN_CAPABILITIES = frozenset(
     {
@@ -113,13 +119,93 @@ class AdapterTask:
     query_id: str | None = None
 
 
+#: Page classes a *normal* parser may be handed at all (02 ACQ-02 gate).
+#: EMPTY is included because a recognized empty enumeration is a successful
+#: outcome, not an invalid page; everything else is host-policy territory.
+NORMAL_PARSE_CLASSES = frozenset(
+    {PageClass.VALID_LIST, PageClass.VALID_JOB, PageClass.EMPTY}
+)
+
+
 @dataclass(frozen=True)
-class ValidatedResult:
-    """The only parse input: an envelope plus its validity classification."""
+class ValidatedResultEnvelope:
+    """The only parse input (02 ACQ-02 + ACQ-09 ``ValidatedResultEnvelope``).
+
+    Constructing one is itself the validity gate: an invalid class raises, so
+    a parser can never be handed login/challenge/rate-limited content and
+    emit normal observations from it.
+    """
 
     envelope: ResultEnvelope
     page_class: PageClass
     validation_evidence: Mapping[str, Any] = field(default_factory=dict)
+    contract_version: int = PARSE_CONTRACT_VERSION
+    security_policy_result: str = "ALLOWED"
+    cache_representation_ref: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.page_class not in NORMAL_PARSE_CLASSES:
+            raise ValueError(
+                f"{self.page_class.value} is not a valid class for normal "
+                "observation extraction (02 ACQ-02); host policy/health/retry "
+                "must handle it instead"
+            )
+
+    @property
+    def validated_page_class(self) -> PageClass:
+        """ACQ-09 field name for the class the validity gate produced."""
+        return self.page_class
+
+    @property
+    def result_envelope_ref(self) -> str | None:
+        """Reference to the durable result evidence (never the body itself)."""
+        return self.envelope.body_ref
+
+    @property
+    def validation_evidence_ref(self) -> str | None:
+        digest = self.envelope.normalized_content_hash or self.envelope.body_hash
+        if digest is None:
+            return None
+        return f"validity://{self.page_class.value}/{digest[:16]}"
+
+
+#: Slice-1 name for the same contract (kept so the accepted call sites and
+#: fixtures remain valid).
+ValidatedResult = ValidatedResultEnvelope
+
+
+@dataclass(frozen=True)
+class PlanningContext:
+    """Host-owned planning input (02 ACQ-09): pins only, never mutable state.
+
+    An adapter may read these values to shape a plan; every one of them is an
+    immutable reference resolved by the host.
+    """
+
+    contract_version: int = PARSE_CONTRACT_VERSION
+    run_id: str | None = None
+    run_source_plan_id: str | None = None
+    source_snapshot_ref: str | None = None
+    binding_revision_id: str | None = None
+    permission_profile_revision: int | None = None
+    policy_snapshot_ref: str | None = None
+    query_revision_ref: str | None = None
+    budget_snapshot_ref: str | None = None
+    cursor_schema_version: int = 1
+
+
+@dataclass(frozen=True)
+class ParseContext:
+    """Host-owned parse input (02 ACQ-09) with the request-scoped
+    idempotency namespace the parser must key deterministic child work on."""
+
+    contract_version: int = PARSE_CONTRACT_VERSION
+    request_id: str | None = None
+    attempt_id: str | None = None
+    run_source_plan_id: str | None = None
+    parser_version: str | None = None
+    normalization_version: str | None = None
+    idempotency_namespace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -154,11 +240,16 @@ class ParseOutcomeKind(enum.Enum):
 
 @dataclass(frozen=True)
 class FieldEvidenceRecord:
+    """One extracted field with its locator and span (03 §30 field evidence)."""
+
     field_name: str
     locator_kind: str
     locator_value: str
     value_hash: str
     excerpt: str = ""
+    evidence_start: int | None = None
+    evidence_end: int | None = None
+    source_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +292,12 @@ class ParseOutcome:
     coverage_proposal: dict | None = None
     continuation_required: bool = False
     failure: FailureRecord | None = None
+    #: typed closure/missing evidence (02 ACQ-02/ACQ-09): a parser reports
+    #: "closed"/"not found" through this channel, never as a fabricated
+    #: normal observation.
+    closure_or_missing_evidence: tuple[dict, ...] = ()
+    #: references to the durable evidence rows supporting this outcome
+    evidence_refs: tuple[str, ...] = ()
 
 
 # ------------------------------------------------------- loop/trap protection
@@ -252,6 +349,9 @@ def json_dumps(value: Any) -> str:
 
 
 __all__ = [
+    "CONTRACT_VERSION",
+    "NORMAL_PARSE_CLASSES",
+    "PARSE_CONTRACT_VERSION",
     "AdapterManifest",
     "AdapterTask",
     "AdapterTaskKind",
@@ -262,10 +362,13 @@ __all__ = [
     "ObservationRecord",
     "PageSignature",
     "PaginationTracker",
+    "ParseContext",
     "ParseOutcome",
     "ParseOutcomeKind",
+    "PlanningContext",
     "StopPolicy",
     "ValidatedResult",
+    "ValidatedResultEnvelope",
     "validate_manifest",
     "value_hash",
 ]
