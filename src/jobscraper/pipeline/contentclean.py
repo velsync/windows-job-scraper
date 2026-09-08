@@ -8,28 +8,26 @@ Pipeline:
 This module is the single owner of the deterministic cleaner that turns a
 raw job description (HTML, Markdown or plain text) into the Markdown and
 plain-text representations recorded on the canonical row.  ``clean`` is
-deterministic and idempotent: re-cleaning its own output changes nothing, so
-re-processing an observation can never churn content that a previous pass
-already produced.
+deterministic and idempotent for stable stored representations: re-processing
+an observation never invents content or executable links.
 
 Hardening rules (all versioned behind ``CONTENT_CLEANING_VERSION``):
 
 * script/style blocks and their content are removed;
-* HTML entities are decoded exactly once (a decoded ``&`` is never decoded
-  again on re-cleaning);
+* HTML entities are decoded exactly once;
 * structural Markdown is retained (headings, lists, emphasis, links);
 * a link is retained only when its scheme is one of the non-executable
   ``http``/``https``/``mailto`` schemes; ``javascript:``, ``data:``,
   ``vbscript:`` and every other scheme (including schemeless and relative
   targets) is neutralized to the link's visible text — the URL is never
   stored;
-* tracking parameters (versioned list; ``utm_*`` family plus the common
-  click-tracking ids) are dropped from *retained* links only;
-* plain text passes through unchanged.
+* tracking parameters are dropped from retained links only;
+* ordinary plain text passes through without Markdown interpretation unless it
+  contains explicit Markdown structure.
 
 The canonical row records which cleaning revision produced its description
-(``jobs.content_cleaning_version``, migration v13) so a later cleaner
-revision can never silently rewrite history (RUN-21).
+(``jobs.content_cleaning_version``, migration v13) so a later cleaner revision
+cannot silently rewrite provenance (RUN-21).
 """
 
 from __future__ import annotations
@@ -40,13 +38,8 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-#: Version of the deterministic cleaning rules implemented here.  Recorded on
-#: the canonical row (jobs.content_cleaning_version) and on every
-#: CONTENT_CLEANING acquisition-evidence row.
 CONTENT_CLEANING_VERSION = "content-clean-v1"
 
-#: Tracking parameters removed from retained links (01 §34 + §31 spirit).
-#: Prefixes are matched against the parameter name; exact names as written.
 TRACKING_PARAM_PREFIXES = ("utm_",)
 TRACKING_PARAM_NAMES = frozenset(
     {
@@ -66,9 +59,6 @@ TRACKING_PARAM_NAMES = frozenset(
     }
 )
 
-#: Link schemes that cannot execute code and are therefore retained verbatim.
-#: Everything else — javascript:, data:, vbscript:, file:, relative targets,
-#: schemeless targets — is neutralized to the visible label.
 SAFE_LINK_SCHEMES = frozenset({"http", "https", "mailto"})
 
 _BLOCK_TAGS = re.compile(
@@ -79,21 +69,21 @@ _SCRIPT_STYLE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | r
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _HTML_TAG = re.compile(r"<[^>]+>")
 _HTML_LIKE = re.compile(r"</?[a-zA-Z][^>]*>")
-#: Markdown link with one nesting level of balanced parentheses in the URL
-#: (``[x](javascript:void(0))`` must consume the whole URL, not split at the
-#: first ``)``).
 _MD_LINK = re.compile(r"!?\[([^\]]*)\]\(((?:[^()]|\([^)]*\))*)\)")
 _MD_HEADING = re.compile(r"^#{1,6}\s*", re.MULTILINE)
 _MD_FENCE = re.compile(r"^```.*$", re.MULTILINE)
 _MD_BULLET = re.compile(r"^\s*[-*+]\s+", re.MULTILINE)
 _MD_NUMBERED = re.compile(r"^\s*\d+[.)]\s+", re.MULTILINE)
+_MD_BLOCK_SIGNAL = re.compile(
+    r"^(?:\s{0,3}#{1,6}\s+|\s*[-*+]\s+|\s*\d+[.)]\s+|\s*>\s?|\s*```)",
+    re.MULTILINE,
+)
+_MD_INLINE_SIGNAL = re.compile(
+    r"(?:\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|(?<!\*)\*[^*\n]+\*(?!\*))"
+)
 _WHITESPACE = re.compile(r"[ \t]+")
 _NEWLINES = re.compile(r"\n{3,}")
-#: Stray tag-removal spaces before terminal punctuation in *derived text*
-#: (``</a>.`` must read ``.``, never `` .``).  Applied to text derived from
-#: HTML/Markdown only — plain text passes through byte-for-byte.
 _SPACE_BEFORE_PUNCT = re.compile(r"[ \t]+([,.;:!?)\]])")
-
 _SCHEME = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*):")
 
 
@@ -104,12 +94,10 @@ def _collapse(text: str) -> str:
 
 
 def _derived_text(raw_text: str) -> str:
-    """Post-processing shared by HTML/Markdown-derived plain text."""
     return _SPACE_BEFORE_PUNCT.sub(r"\1", _collapse(raw_text))
 
 
 def _drop_tracking_params(url: str) -> str:
-    """Remove versioned tracking parameters from an http(s) URL."""
     parts = urlsplit(url)
     if not parts.query:
         return url
@@ -124,14 +112,11 @@ def _drop_tracking_params(url: str) -> str:
 
 
 def _neutralize_url(url: str) -> str | None:
-    """Return the retained URL, or None when the target must not be kept."""
     candidate = (url or "").strip()
     if not candidate:
         return None
     match = _SCHEME.match(candidate)
     if not match:
-        # relative / schemeless target: not executable, but not a stable
-        # absolute link either — keep only the label (deterministic)
         return None
     scheme = match.group(1).lower()
     if scheme not in SAFE_LINK_SCHEMES:
@@ -144,47 +129,53 @@ def _neutralize_url(url: str) -> str | None:
 
 
 def _safe_link(url: str, label: str) -> str:
-    """One <a> element → Markdown with a retained (or dropped) URL.
-
-    The label is stripped of any residual inner markup (e.g. <span>) and
-    whitespace-collapsed, so nested inline tags never leak stray spaces
-    inside the link brackets.  Entity decoding of the label happens once,
-    with the document-wide unescape that follows this substitution.
-    """
+    """One HTML anchor → safe Markdown link or visible label only."""
     url = html_lib.unescape(url or "").strip()
     label = _collapse(_HTML_TAG.sub(" ", label or ""))
     retained = _neutralize_url(url)
     if retained is None:
-        # neutralized executable/relative/schemeless target: label only
         return label
     return f"[{label}]({retained})"
 
 
 def _html_to_markdown(markup: str) -> str:
-    """HTML → deterministic Markdown (structural tags retained)."""
     text = _HTML_COMMENT.sub(" ", markup or "")
     text = _SCRIPT_STYLE.sub(" ", text)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<li[^>]*>", "- ", text, flags=re.IGNORECASE)
     text = re.sub(r"</li>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"<h([1-6])[^>]*>", lambda m: "#" * int(m.group(1)) + " ", text,
+        r"<h([1-6])[^>]*>",
+        lambda m: "#" * int(m.group(1)) + " ",
+        text,
         flags=re.IGNORECASE,
     )
     text = re.sub(r"</h[1-6]>", "\n", text, flags=re.IGNORECASE)
-    # paragraph/block boundaries survive as blank-line separators
     text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(
-        r"</(div|section|article|header|footer|ul|ol|table|tr)>", "\n", text,
+        r"</(div|section|article|header|footer|ul|ol|table|tr)>",
+        "\n",
+        text,
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"<(p|div|section|article|header|footer|ul|ol|table|tr)\b[^>]*>", "\n", text,
+        r"<(p|div|section|article|header|footer|ul|ol|table|tr)\b[^>]*>",
+        "\n",
+        text,
         flags=re.IGNORECASE,
     )
-    text = re.sub(r"<(strong|b)>(.*?)</\1>", r"**\2**", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"<(em|i)>(.*?)</\1>", r"*\2*", text, flags=re.IGNORECASE | re.DOTALL)
-    # links: entity-decoded href and label, then scheme/parameter rules
+    text = re.sub(
+        r"<(strong|b)>(.*?)</\1>",
+        r"**\2**",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"<(em|i)>(.*?)</\1>",
+        r"*\2*",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     text = re.sub(
         r"<a\b[^>]*href\s*=\s*[\"']([^\"']*)[\"'][^>]*>(.*?)</a>",
         lambda m: _safe_link(m.group(1), m.group(2)),
@@ -196,7 +187,6 @@ def _html_to_markdown(markup: str) -> str:
 
 
 def _html_to_text(markup: str) -> str:
-    """HTML → plain text (block boundaries preserved as newlines)."""
     text = _HTML_COMMENT.sub(" ", markup or "")
     text = _SCRIPT_STYLE.sub(" ", text)
     text = _BLOCK_TAGS.sub("\n", text)
@@ -205,9 +195,8 @@ def _html_to_text(markup: str) -> str:
 
 
 def _clean_markdown(raw: str) -> str:
-    """Markdown input: neutralize unsafe links, drop tracking params."""
-    text = _MD_FENCE.sub("", raw or "")
-    text = _MD_HEADING.sub("", text)
+    """Preserve Markdown structure while sanitizing every retained link."""
+    text = raw or ""
 
     def _md_link(match: re.Match) -> str:
         label, url = match.group(1), match.group(2)
@@ -222,7 +211,7 @@ def _clean_markdown(raw: str) -> str:
 
 
 def _markdown_to_text(markdown: str) -> str:
-    """Markdown → plain text (labels only, no syntax residue)."""
+    """Markdown → plain text (labels only, no Markdown syntax residue)."""
     text = markdown or ""
     text = _MD_FENCE.sub("", text)
     text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
@@ -244,7 +233,13 @@ def _looks_like_html(raw: str) -> bool:
 
 
 def _looks_like_markdown(raw: str) -> bool:
-    return bool(re.search(r"\[[^\]]*\]\([^)]*\)", raw or ""))
+    """Recognize explicit Markdown structure, not only Markdown links."""
+    text = raw or ""
+    return bool(
+        _MD_LINK.search(text)
+        or _MD_BLOCK_SIGNAL.search(text)
+        or _MD_INLINE_SIGNAL.search(text)
+    )
 
 
 _EN_STOP = frozenset(
@@ -259,7 +254,6 @@ _RO_STOP = frozenset(
 
 
 def detect_language(text: str) -> str | None:
-    """Cheap deterministic stopword heuristic; None when undeterminable."""
     words = re.findall(r"[a-zăâîșțäöüß]+", (text or "").lower())
     if len(words) < 12:
         return None
@@ -276,12 +270,6 @@ def detect_language(text: str) -> str | None:
 
 @dataclass(frozen=True)
 class CleanedContent:
-    """Deterministic cleaning result for one raw description.
-
-    ``content_hash`` is the sha256 of the plain-text bytes (``None`` when no
-    text survived cleaning — an empty claim, never a fabricated hash).
-    """
-
     markdown: str | None
     text: str | None
     lang: str | None
@@ -289,12 +277,8 @@ class CleanedContent:
 
 
 def clean(raw: str) -> CleanedContent:
-    """Deterministically clean one raw description (01 §34).
-
-    Returns ``(markdown, text, lang, hash)``.  Idempotent: cleaning the
-    returned Markdown or plain text reproduces it exactly.
-    """
-    if raw is None:  # defensive: callers guard, but never crash on None
+    """Deterministically clean one raw description (01 §34)."""
+    if raw is None:
         raw = ""
     raw = str(raw)
     if not raw.strip():
@@ -310,9 +294,7 @@ def clean(raw: str) -> CleanedContent:
         text = _collapse(raw)
         markdown = text
 
-    content_hash = (
-        hashlib.sha256(text.encode()).hexdigest() if text else None
-    )
+    content_hash = hashlib.sha256(text.encode()).hexdigest() if text else None
     return CleanedContent(
         markdown=markdown,
         text=text,
