@@ -1,19 +1,20 @@
-"""Capability-gated, idempotent provisioning of the FTS5 search index.
+"""Capability-gated, idempotent provisioning of the S2.3 search surface.
 
-The migration (v13) creates only plain bookkeeping tables.  This module owns
-the FTS5 virtual table and its sync triggers and creates them only when the
-connection really supports FTS5 (``fts5_available``), so a non-FTS5 host
-migrates cleanly and records an honest ``SUBSTRING_FALLBACK`` capability.
+Migration v13 creates only plain bookkeeping tables.  This module owns the
+host-side derived search surfaces:
 
-Invariants:
+* ``job_search_docs`` / ``job_search_state`` are backfilled from canonical jobs
+  at provisioning time, so a v12→v13 upgrade is searchable immediately even
+  before any job is re-observed;
+* the FTS5 virtual table and sync triggers are created only when the connection
+  really supports FTS5;
+* whenever FTS5 is (re-)provisioned, the virtual table is reconciled exactly
+  from durable ``job_search_docs`` before ``FTS5_ACTIVE`` is recorded.  This
+  closes the recovery window where documents may have changed while sync
+  triggers were absent.
 
-* ``FTS5_ACTIVE`` is recorded only after the virtual table and all three
-  triggers exist;
-* provisioning is idempotent — repeated calls never duplicate objects and
-  never rewrite ``search_capability.provisioned_at``;
-* the sync triggers mirror every ``job_search_docs`` row into the FTS5
-  table on INSERT/UPDATE/DELETE, so document maintenance and the index can
-  never diverge.
+``search_capability`` is written last, so the application never advertises
+FTS5/BM25 over an incomplete derived index.
 """
 
 from __future__ import annotations
@@ -105,17 +106,55 @@ def _provision_fts_objects(conn: sqlite3.Connection) -> None:
             conn.execute(sql)
 
 
-def provision_search(conn: sqlite3.Connection, *, now: str | None = None) -> dict:
-    """Provision search for this connection; idempotent and capability-gated.
+def _sync_durable_docs(conn: sqlite3.Connection, *, now: str) -> None:
+    """Backfill/refresh the durable search corpus from every canonical job.
 
-    Returns ``{"mode", "fts5_detected", "warning"}``.  Runs outside an
-    explicit transaction: FTS5 DDL is idempotent (``IF NOT EXISTS`` +
-    existence checks) and the capability row is written last, so a recorded
-    ``FTS5_ACTIVE`` always implies the objects exist.
+    ``sync_search_doc`` is revision-checked, so normal repeated service starts
+    are no-ops.  This pass matters on the first v13 start because migration
+    deliberately does not perform data-dependent search writes.
     """
+    from jobscraper.search.index import sync_search_doc
+
+    for row in conn.execute("SELECT id FROM jobs ORDER BY id").fetchall():
+        sync_search_doc(conn, job_id=row["id"], now=now)
+
+
+def _reconcile_fts_from_docs(conn: sqlite3.Connection) -> None:
+    """Make the derived FTS table an exact mirror of durable search docs.
+
+    Recreating missing triggers is insufficient when docs changed while those
+    triggers were absent.  The virtual table is derived state, so rebuilding it
+    from ``job_search_docs`` is safe and deterministic.  Capability is recorded
+    only after this reconciliation succeeds.
+    """
+    conn.execute(f"DELETE FROM {FTS_TABLE}")
+    conn.execute(
+        f"INSERT INTO {FTS_TABLE}"
+        " (rowid, job_id, title, company, description_text, locations_text, fact_text)"
+        " SELECT doc_id, job_id, title, company, description_text, locations_text, fact_text"
+        " FROM job_search_docs ORDER BY doc_id"
+    )
+
+
+def provision_search(conn: sqlite3.Connection, *, now: str | None = None) -> dict:
+    """Provision a complete search surface; idempotent and capability-gated.
+
+    Returns ``{"mode", "fts5_detected", "warning"}``.  The durable search
+    corpus is synchronized on every provisioning pass.  When FTS5 is present,
+    its objects are created/repaired and the index is then reconciled exactly
+    from the durable corpus before ``FTS5_ACTIVE`` is recorded.
+    """
+    effective_now = now or utc_now_s()
+
+    # Always maintain the durable corpus, including on non-FTS5 hosts where it
+    # is the authoritative SUBSTRING_FALLBACK search surface.
+    _sync_durable_docs(conn, now=effective_now)
+
     detected = fts5_available(conn)
     if detected:
         _provision_fts_objects(conn)
+        _reconcile_fts_from_docs(conn)
+
     warning = None if detected else SUBSTRING_WARNING
     mode = SEARCH_MODE_FTS5 if detected else SEARCH_MODE_SUBSTRING
     record_capability(
@@ -123,7 +162,7 @@ def provision_search(conn: sqlite3.Connection, *, now: str | None = None) -> dic
         mode=mode,
         fts5_detected=detected,
         warning=warning,
-        now=now or utc_now_s(),
+        now=effective_now,
     )
     return {"mode": mode, "fts5_detected": detected, "warning": warning}
 
