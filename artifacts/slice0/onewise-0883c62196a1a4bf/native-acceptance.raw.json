@@ -1,0 +1,271 @@
+{
+  "details": {
+    "W0-01": {
+      "details": {
+        "url_shape": "fragment"
+      },
+      "status": "PASS",
+      "summary": "packaged launch works; service healthy; dashboard URL produced"
+    },
+    "W0-02": {
+      "details": {
+        "bound_host": "127.0.0.1",
+        "listener_lines": 0
+      },
+      "status": "PASS",
+      "summary": "service binds loopback only"
+    },
+    "W0-03": {
+      "details": {
+        "assigned_port": 58820,
+        "occupied_port": 58819
+      },
+      "status": "PASS",
+      "summary": "port allocation is collision-safe (OS-assigned)"
+    },
+    "W0-04": {
+      "details": {
+        "same_service_instance": true,
+        "second_exit": 0
+      },
+      "status": "PASS",
+      "summary": "second launch attaches to the existing service instance"
+    },
+    "W0-05": {
+      "details": {
+        "new_pid": 14044,
+        "old_pid": 14968
+      },
+      "status": "PASS",
+      "summary": "stale descriptor rejected; new valid instance established"
+    },
+    "W0-06": {
+      "details": {
+        "impersonator_port": 58842
+      },
+      "status": "PASS",
+      "summary": "old-port impersonator rejected by service-instance validation"
+    },
+    "W0-07": {
+      "details": {
+        "acl_ok": true,
+        "acl_reason": "app-owned",
+        "protected_at_rest": true,
+        "stable_across_restart": true
+      },
+      "status": "PASS",
+      "summary": "install secret survives restart, is protected at rest, auth dir app-owned"
+    },
+    "W0-08": {
+      "details": {
+        "exchange_status": 200,
+        "private_denied": true
+      },
+      "status": "PASS",
+      "summary": "bootstrap succeeds; private routes denied without session"
+    },
+    "W0-09": {
+      "details": {
+        "leaked_files": [],
+        "ticket_location": "url-fragment-only"
+      },
+      "status": "PASS",
+      "summary": "bootstrap ticket absent from request-path evidence (files/events)"
+    },
+    "W0-10": {
+      "details": {
+        "pragmas": {
+          "busy_timeout_ms": 5000,
+          "foreign_keys": 1,
+          "journal_mode": "WAL",
+          "synchronous": 2
+        }
+      },
+      "status": "PASS",
+      "summary": "SQLite packaged settings verified (fk/WAL/FULL/busy timeout)"
+    },
+    "W0-11": {
+      "details": {
+        "artifacts": 2,
+        "generation": "20260908T131456-951575Z-f823c559",
+        "restored_doctor": "PASS"
+      },
+      "status": "PASS",
+      "summary": "backup generation restores into a clean isolated root"
+    },
+    "W0-12": {
+      "details": {
+        "details_tz": {
+          "autumn_fold_policy": "EXACT",
+          "spring_gap_policy": "EXACT",
+          "tzdata_version": "unknown",
+          "zone": "Europe/Bucharest",
+          "zone_key": "Europe/Bucharest"
+        }
+      },
+      "status": "PASS",
+      "summary": "pinned tzdata present; named IANA zone resolves"
+    },
+    "W0-13": {
+      "details": {
+        "chromium_version": "143.0.7499.4",
+        "worker_pid": 9360
+      },
+      "status": "PASS",
+      "summary": "browser worker + Chromium launch outside service process"
+    },
+    "W0-14": {
+      "details": {
+        "residual_count": 0,
+        "residual_processes": []
+      },
+      "status": "PASS",
+      "summary": "no orphan browser/worker processes after clean shutdown"
+    },
+    "W0-15": {
+      "details": {
+        "doctor_failed_checks": [],
+        "doctor_status": null,
+        "old_worker_pid": 1452,
+        "restarted_worker_pid": 5944,
+        "service_healthy_after": true
+      },
+      "status": "PASS",
+      "summary": "service survives browser-worker termination; bounded restart; doctor healthy"
+    },
+    "W0-16": {
+      "details": {
+        "new_pid": 21120
+      },
+      "status": "PASS",
+      "summary": "forced service termination recovered by supervising launcher"
+    },
+    "W0-17": {
+      "details": {
+        "target": "exe"
+      },
+      "status": "PASS",
+      "summary": "app/doctor work from a clean environment (no dev venv/PYTHONPATH)"
+    },
+    "W0-18": {
+      "details": {},
+      "status": "PASS",
+      "summary": "idle service + browser-tree observations recorded (no invented ceilings)"
+    },
+    "W1-01": {
+      "details": {
+        "application": true,
+        "disposition": true,
+        "inbox": true,
+        "job_detail": true,
+        "profile": "prof_01M20JHBB9PH25BKE3JH0DVXDX",
+        "run": true
+      },
+      "status": "PASS",
+      "summary": "packaged E2E vertical slice: profile \u2192 run \u2192 jobs \u2192 scores \u2192 inbox \u2192 disposition \u2192 application"
+    },
+    "W1-02": {
+      "details": {
+        "application": true,
+        "inbox": true,
+        "job": true,
+        "profiles": true
+      },
+      "status": "PASS",
+      "summary": "restart persistence: profile/inbox/job/application survive (PROD-08)"
+    },
+    "W1-03": {
+      "details": {
+        "events": [
+          2,
+          2
+        ],
+        "jobs": [
+          2,
+          2
+        ],
+        "observations": [
+          2,
+          2
+        ],
+        "run": true
+      },
+      "status": "PASS",
+      "summary": "idempotent resume after restart: no duplicate jobs, observations, or inbox events"
+    },
+    "W1-04": {
+      "details": {
+        "request": {
+          "failure_json": "{\"kind\": \"POLICY_REJECTED\", \"retryable\": false, \"source_health_impact\": \"NONE\", \"http_status\": null, \"details_redacted\": {\"reason_code\": \"HOST_NOT_ALLOWED\", \"detail\": \"host '192.0.2.1' is not in the source allow-host policy\"}}",
+          "fetch_kind": "POLICY_REJECTED",
+          "page_class": "UNKNOWN",
+          "status": "SUCCEEDED"
+        },
+        "run_status": "PARTIAL"
+      },
+      "status": "PASS",
+      "summary": "SSRF negative: private/test destination denied fail-closed (typed POLICY_REJECTED, nothing fetched)"
+    },
+    "W1-05": {
+      "details": {
+        "failure_kind": "POLICY_REJECTED",
+        "run_status": "PARTIAL"
+      },
+      "status": "PASS",
+      "summary": "SSRF negative: redirect to unauthorized destination denied per hop"
+    },
+    "W1-06": {
+      "details": {
+        "application_url": null,
+        "apply_url": null,
+        "canonical_job_url": null,
+        "job_created": true
+      },
+      "status": "PASS",
+      "summary": "unsafe source links (javascript:/data:) never surfaced clickable"
+    },
+    "W1-07": {
+      "details": {
+        "exit_code": 0,
+        "failed_checks": []
+      },
+      "status": "PASS",
+      "summary": "doctor healthy on the root after the Slice-1 workload"
+    }
+  },
+  "finished_at_utc": "2026-09-08T13:15:31.923875+00:00",
+  "promotion": null,
+  "schema_version": 1,
+  "slice": "0+1",
+  "spec_version": "0.3.1.3",
+  "started_at_utc": "2026-09-08T13:14:40.040769+00:00",
+  "target": "exe",
+  "tests": {
+    "W0-01": "PASS",
+    "W0-02": "PASS",
+    "W0-03": "PASS",
+    "W0-04": "PASS",
+    "W0-05": "PASS",
+    "W0-06": "PASS",
+    "W0-07": "PASS",
+    "W0-08": "PASS",
+    "W0-09": "PASS",
+    "W0-10": "PASS",
+    "W0-11": "PASS",
+    "W0-12": "PASS",
+    "W0-13": "PASS",
+    "W0-14": "PASS",
+    "W0-15": "PASS",
+    "W0-16": "PASS",
+    "W0-17": "PASS",
+    "W0-18": "PASS",
+    "W1-01": "PASS",
+    "W1-02": "PASS",
+    "W1-03": "PASS",
+    "W1-04": "PASS",
+    "W1-05": "PASS",
+    "W1-06": "PASS",
+    "W1-07": "PASS"
+  },
+  "unresolved_critical_findings": 0
+}

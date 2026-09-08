@@ -1,0 +1,127 @@
+{
+  "checks": [
+    {
+      "details": {
+        "application_version": "0.0.0",
+        "browser_revision": "NOT_INSTALLED",
+        "fastapi_version": "NOT_INSTALLED",
+        "playwright_version": "NOT_INSTALLED",
+        "pyinstaller_version": "NOT_INSTALLED",
+        "python_version": "3.12.14",
+        "tzdata_version": "NOT_INSTALLED"
+      },
+      "name": "app_build",
+      "status": "PASS",
+      "summary": "application 0.0.0"
+    },
+    {
+      "details": {
+        "path": "E:\\Local AI\\work files\\wjs-test-temp\\wjs-w0-vsqrmxkc\\W0"
+      },
+      "name": "data_root",
+      "status": "PASS",
+      "summary": "data root writable"
+    },
+    {
+      "details": {
+        "expected_schema_version": 10,
+        "foreign_key_check": 0,
+        "fts5": true,
+        "integrity_check": "ok",
+        "path": "E:\\Local AI\\work files\\wjs-test-temp\\wjs-w0-vsqrmxkc\\W0\\db\\jobscraper.sqlite3",
+        "pragmas": {
+          "busy_timeout_ms": 5000,
+          "foreign_keys": 1,
+          "journal_mode": "WAL",
+          "synchronous": 2
+        },
+        "problems": [],
+        "schema_version": 10
+      },
+      "name": "database",
+      "status": "PASS",
+      "summary": "database healthy"
+    },
+    {
+      "details": {},
+      "name": "backup",
+      "status": "WARN",
+      "summary": "no backup generation yet (created automatically before migrations and on demand)"
+    },
+    {
+      "details": {
+        "csp_default_self": true,
+        "loopback_host": "127.0.0.1"
+      },
+      "name": "security_config",
+      "status": "PASS",
+      "summary": "loopback + strict CSP configuration"
+    },
+    {
+      "details": {
+        "acl_ok": true,
+        "acl_reason": "app-owned",
+        "protector": "DPAPI",
+        "secret_decryptable": true
+      },
+      "name": "auth_storage",
+      "status": "PASS",
+      "summary": "install secret decryptable for current user"
+    },
+    {
+      "details": {},
+      "name": "stale_runtime_markers",
+      "status": "PASS",
+      "summary": "no stale runtime markers"
+    },
+    {
+      "details": {
+        "app_version": "0.0.0",
+        "chromium_executable": "E:\\Local AI\\work files\\wjs-package-verify\\dist\\JobScraper\\_internal\\playwright\\driver\\package\\.local-browsers\\chromium-1200\\chrome-win64\\chrome.exe",
+        "chromium_installed": false,
+        "chromium_revision": "chromium-1200",
+        "platform": "win32",
+        "playwright_version": "unknown",
+        "python_version": "3.12.14",
+        "smoke": "CHROMIUM_NOT_INSTALLED",
+        "worker_pid": 22476
+      },
+      "name": "browser_worker",
+      "status": "WARN",
+      "summary": "browser runtime not installed yet (installed on first run / by setup)"
+    },
+    {
+      "details": {
+        "free_bytes": 316681347072,
+        "free_mib": 302010.9
+      },
+      "name": "free_disk",
+      "status": "PASS",
+      "summary": "sufficient free disk space"
+    },
+    {
+      "details": {
+        "autumn_fold_policy": "EXACT",
+        "spring_gap_policy": "EXACT",
+        "tzdata_version": "unknown",
+        "zone": "Europe/Bucharest",
+        "zone_key": "Europe/Bucharest"
+      },
+      "name": "timezone",
+      "status": "PASS",
+      "summary": "pinned tzdata unknown resolves Europe/Bucharest with deterministic DST policy"
+    },
+    {
+      "details": {
+        "files": 6
+      },
+      "name": "resource_manifest",
+      "status": "PASS",
+      "summary": "packaged web resources present"
+    }
+  ],
+  "exit_code": 0,
+  "failed": 0,
+  "schema_version": 1,
+  "warned": 2
+}

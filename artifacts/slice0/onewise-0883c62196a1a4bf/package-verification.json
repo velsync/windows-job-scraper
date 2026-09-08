@@ -1,0 +1,63 @@
+{
+  "bootstrap": {
+    "dashboard_url_shape": "fragment-ticket",
+    "health_fields": [
+      "service_instance_id",
+      "status"
+    ],
+    "health_instance_id_present": true,
+    "local_assets": true,
+    "loopback_host": "127.0.0.1",
+    "no_cdn_reference": true,
+    "os_assigned_port": "50163",
+    "private_route_denied_without_session": true,
+    "ticket_not_in_query": true
+  },
+  "build_id": "onewise-0883c62196a1a4bf",
+  "build_sha256": "0883c62196a1a4bf39b3092a1a5068d0cf50a143159823daf3a312e7f54f4dff",
+  "doctor": {
+    "checks": {
+      "app_build": "PASS",
+      "auth_storage": "PASS",
+      "backup": "WARN",
+      "browser_worker": "WARN",
+      "data_root": "PASS",
+      "database": "PASS",
+      "free_disk": "PASS",
+      "resource_manifest": "PASS",
+      "security_config": "PASS",
+      "stale_runtime_markers": "PASS",
+      "timezone": "PASS"
+    },
+    "exit_code": 0,
+    "failed": 0,
+    "warned": 2
+  },
+  "executable": "E:\\Local AI\\work files\\wjs-package-verify\\dist\\JobScraper\\JobScraper.exe",
+  "file_count": 1015,
+  "metadata": {
+    "application_version": "0.0.0",
+    "browser_revision": "NOT_INSTALLED",
+    "fastapi_version": "0.128.2",
+    "playwright_version": "1.57.0",
+    "pyinstaller_version": "6.22.2",
+    "python_version": "3.12.14",
+    "tzdata_version": "2026.2"
+  },
+  "package_kind": "pyinstaller-onedir",
+  "resource_manifest": {
+    "missing": [],
+    "ok": true,
+    "required": [
+      "_internal/jobscraper/web/templates/bootstrap.html",
+      "_internal/jobscraper/web/templates/dashboard.html",
+      "_internal/jobscraper/web/templates/error.html",
+      "_internal/jobscraper/web/static/app.js",
+      "_internal/jobscraper/web/static/styles.css",
+      "_internal/jobscraper/web/static/vendor/htmx.min.js"
+    ]
+  },
+  "result": "PASS",
+  "schema_version": 1,
+  "slice": "0"
+}
