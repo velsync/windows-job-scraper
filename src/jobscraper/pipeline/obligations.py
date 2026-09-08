@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
+from jobscraper.inbox.events import maybe_emit_inbox_event
 from jobscraper.pipeline.eligibility import (
     EVALUATOR_VERSION,
     evaluate_eligibility,
@@ -37,6 +38,10 @@ _LISTING_PRECEDENCE = ("CLOSED", "EXPIRED", "WITHDRAWN", "UNCERTAIN", "ACTIVE", 
 
 def reconcile_job(conn: sqlite3.Connection, job_id: str, *, now: str) -> str:
     """Derive jobs.listing_status from current presence evidence (RUN-14)."""
+    prior = conn.execute(
+        "SELECT listing_status FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    prior_status = prior["listing_status"] if prior else "UNKNOWN"
     states = [
         row["presence_state"]
         for row in conn.execute(
@@ -55,6 +60,30 @@ def reconcile_job(conn: sqlite3.Connection, job_id: str, *, now: str) -> str:
         "UPDATE jobs SET listing_status = ?, updated_at = ? WHERE id = ?",
         (derived, now, job_id),
     )
+    if (
+        derived == "ACTIVE"
+        and prior_status in ("CLOSED", "EXPIRED", "WITHDRAWN")
+    ):
+        # a trusted active sighting superseded older closure evidence
+        # (RUN-14A): record the reopen and surface it per profile.
+        from jobscraper.ids import new_id
+
+        history_id = new_id("jh")
+        conn.execute(
+            "INSERT INTO job_history (id, job_id, at, change_class, detail_json)"
+            " VALUES (?, ?, ?, 'JOB_REOPENED', '{}')",
+            (history_id, job_id, now),
+        )
+        for profile_row in list_profiles(conn):
+            maybe_emit_inbox_event(
+                conn,
+                job_id=job_id,
+                profile_id=profile_row["id"],
+                event_kind="REOPENED",
+                trigger_history_id=history_id,
+                now=now,
+                commit=False,
+            )
     return derived
 
 
@@ -122,6 +151,26 @@ def _evaluate_for_profiles(conn: sqlite3.Connection, job_id: str, *, now: str) -
             "salary_period": job["salary_period"],
             "eligibility_verdict": verdict.verdict,
         }
+        # Inbox surfacing after evaluation (PROD-02): the first eligible
+        # appearance and per-content-revision meaningful changes, both
+        # deterministically deduplicated.
+        maybe_emit_inbox_event(
+            conn,
+            job_id=job_id,
+            profile_id=profile_row["id"],
+            event_kind="NEW_ELIGIBLE_APPEARANCE",
+            now=now,
+            commit=False,
+        )
+        maybe_emit_inbox_event(
+            conn,
+            job_id=job_id,
+            profile_id=profile_row["id"],
+            event_kind="MEANINGFUL_CHANGE",
+            trigger_content_revision=int(presence_rev),
+            now=now,
+            commit=False,
+        )
         result = score_job(job_data=job_data, profile=profile)
         conn.execute(
             """
