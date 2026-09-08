@@ -2,8 +2,8 @@
 
 "Weak evidence must not aggressively merge companies."  These tests pin the
 resolution rules: an attach needs a strong identifier (same ATS board, or same
-application/careers host); a bare normalized name is *never* enough; a
-strong-identifier attach with a conflicting display name is attached and
+employer application/careers host); a bare normalized name is *never* enough;
+a strong-identifier attach with a conflicting display name is attached and
 recorded for review instead of silently renaming anyone; every decision is
 durable in ``company_resolution_events``.
 """
@@ -72,7 +72,9 @@ def test_first_sighting_creates_a_company_with_its_identifiers(db):
             (result.company_id,),
         )
     }
-    assert {"ATS_BOARD", "APP_HOST"} <= kinds
+    # The provider-scoped board token is strong identity.  The shared
+    # boards.greenhouse.io infrastructure is evidence only, never a company key.
+    assert kinds == {"ATS_BOARD"}
     assert result.resolution_version == COMPANY_RESOLUTION_VERSION
 
 
@@ -237,7 +239,7 @@ def test_late_older_sighting_never_moves_last_posting_backwards(db):
         db.conn,
         signals=_signals(careers_url="https://careers.acme.example/jobs"),
         observation_id=None,
-        observed_at=NOW,  # *older* than the first sighting's timestamp
+        observed_at=NOW,
         now="2026-09-08T19:00:00.000000Z",
     )
     assert later.decision == "ATTACHED"
@@ -248,14 +250,7 @@ def test_late_older_sighting_never_moves_last_posting_backwards(db):
 
 
 def test_an_unresolved_origin_never_mints_a_board_identity():
-    """02 §32: only a *resolved* origin identity may become an ``ATS_BOARD`` key.
-
-    The resolver reports partial matches (board seen, confidence too low) as
-    ``UNRESOLVED`` while still carrying the candidate values, and the substring
-    ``UNRESOLVED`` ends with ``RESOLVED`` — so the comparison must be explicit,
-    or a refused resolution would merge companies on evidence the resolver said
-    was insufficient.
-    """
+    """02 §32: only a *resolved* origin identity may become an ``ATS_BOARD`` key."""
     from types import SimpleNamespace
 
     from jobscraper.acquisition.origin import OriginResolution, OriginStatus
