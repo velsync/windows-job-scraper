@@ -18,6 +18,7 @@ This repository is the authoritative implementation workspace for Windows Job Sc
 6. Slice 2 execution/corrective authority on the active Slice-2 implementation lineage:
    - `docs/plans/slice-2-worker-implementation-plan-v0313.md`
    - `docs/reviews/slice-2-s2.2-corrective-review-2026-09-08.md` (later authority for corrected S2.2 company/origin-resolution behavior)
+   - `docs/reviews/slice-2-s2.3-corrective-review-2026-09-08.md` (later authority for reconciled/corrected S2.3 content-cleaning/search behavior and explicit structured-filter deferrals)
 
 Later authority controls where an earlier plan/status note conflicts with an explicit corrective or promotion record.
 
@@ -28,8 +29,10 @@ Do not redesign the architecture unless a genuine contradiction or implementatio
 - Slice 0 is **PROMOTED**: implementation, automated gate, packaged Windows verification, and W0-01…W0-18 native acceptance are complete.
 - Slice 1 is **ACCEPTED**: implementation, automated acceptance, and W1-01…W1-07 packaged native Windows acceptance are complete.
 - Accepted package build: `onewise-0883c62196a1a4bf`; evidence is committed under `artifacts/slice0/onewise-0883c62196a1a4bf/`.
-- On the active Slice-2 implementation lineage, S2.0–S2.2 are implemented and S2.2 has received the corrective review above. S2.3 is the next bounded package; S2.4+ must not start before S2.3 is implemented and reviewed.
-- Slice 2 is not yet promoted as a whole. Ordinary CI or an intermediate package correction does not constitute Slice-2 promotion.
+- On the active Slice-2 implementation lineage, S2.0–S2.3 are implemented and reviewed. S2.2 and S2.3 are governed by the corrective records above.
+- Reviewed S2.3 behavior-bearing HEAD: `67840e82f6106ce6eb8452b64f5686cb91113c64`; GitHub Actions run `34276037221` passed on Ubuntu and Windows before the docs-only acceptance record/status update.
+- **S2.4 — ATS fingerprinting + strategy router is the next bounded package and may now begin from the active Slice-2 branch containing the S2.3 corrective record.** S2.5 must not start before S2.4 is implemented and reviewed.
+- Slice 2 is not yet promoted as a whole. Ordinary CI, intermediate package acceptance, or the start of S2.4 does not constitute Slice-2 promotion.
 - Do not import, cherry-pick, or count divergent experimental-branch future-slice code as accepted Slice 2 work unless it is explicitly reviewed and reconciled.
 
 ## Worker boundary
