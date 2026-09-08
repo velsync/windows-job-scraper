@@ -164,6 +164,29 @@ def test_predicate_gates_on_score_and_eligibility(db):
 # --------------------------------------------------------- transition matrix
 
 
+def test_meaningful_change_requires_an_actual_change(db):
+    """§42/PROD-02: the first sighting (content revision 1) is
+    NEW_ELIGIBLE_APPEARANCE's identity, never a MEANINGFUL_CHANGE — the
+    two trigger identities must stay distinguishable."""
+    pid = _profile(db)
+    _evaluate(db, "job-1", pid)
+    e, outcome = maybe_emit_inbox_event(
+        db.conn, job_id="job-1", profile_id=pid, event_kind="MEANINGFUL_CHANGE",
+        trigger_content_revision=1, now=NOW,
+    )
+    assert e is None and outcome == "NOT_A_CHANGE"
+    e, outcome = maybe_emit_inbox_event(
+        db.conn, job_id="job-1", profile_id=pid, event_kind="MEANINGFUL_CHANGE",
+        trigger_content_revision=None, now=NOW,
+    )
+    assert e is None and outcome == "NOT_A_CHANGE"
+    # no event rows were fabricated for the first sighting
+    rows = db.conn.execute(
+        "SELECT event_kind FROM job_profile_inbox_events WHERE profile_id = ?", (pid,)
+    ).fetchall()
+    assert rows == []
+
+
 def test_meaningful_change_dedupes_per_content_revision(db):
     pid = _profile(db)
     _evaluate(db, "job-1", pid)

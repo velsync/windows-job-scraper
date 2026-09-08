@@ -94,6 +94,15 @@ def maybe_emit_inbox_event(
     if event_kind == "SNOOZE_EXPIRED" and disposition != "SNOOZED":
         return None, "NOT_SNOOZED"
 
+    if event_kind == "MEANINGFUL_CHANGE" and (
+        trigger_content_revision is None or trigger_content_revision < 2
+    ):
+        # §42/PROD-02: MEANINGFUL_CHANGE is a *change* trigger and must
+        # stay distinguishable from NEW_ELIGIBLE_APPEARANCE.  The first
+        # content revision is the first sighting, not a change; a change
+        # trigger only exists from the second revision onwards.
+        return None, "NOT_A_CHANGE"
+
     # §42 predicate: score floor + eligibility exclusion.
     score_row = conn.execute(
         "SELECT score FROM job_scores WHERE job_id = ? AND profile_id = ?",
