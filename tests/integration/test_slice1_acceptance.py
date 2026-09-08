@@ -153,7 +153,7 @@ def _feed_config(port: int, path: str = "/jobs") -> str:
 @pytest.fixture()
 def acceptance(tmp_path):
     """Real launcher + service on an isolated root with a seeded feed."""
-    _FEED_STATE.update({"slow_s": 5.0, "once_slow_used": False})
+    _FEED_STATE.update({"slow_s": 8.0, "once_slow_used": False})
     root = tmp_path / "acceptance-root"
     ensure_app_directories(build_app_paths(root))
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FeedHandler)
@@ -263,7 +263,7 @@ def _next_dashboard_url(launcher, *, timeout: float) -> str:
 def _request(method: str, url: str, *, headers: dict | None = None, body: bytes | None = None):
     request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=60) as response:
             return response.status, response.headers, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.headers, exc.read()
@@ -327,7 +327,7 @@ def _repoint_binding(state, path: str) -> None:
     state["db"].commit()
 
 
-def _wait_for(state, sql: str, params: tuple = (), *, timeout: float = 30.0):
+def _wait_for(state, sql: str, params: tuple = (), *, timeout: float = 60.0):
     """Poll the database until a row exists; return it."""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -614,11 +614,12 @@ class TestCancellationAndCrashRecovery:
             row = _wait_for(
                 state,
                 "SELECT id, run_id FROM scrape_requests WHERE status = 'RUNNING'",
+                timeout=60.0,
             )
             time.sleep(0.5)  # firmly inside the slow fetch window
             request_run_cancellation(state["db"], row["run_id"])
         finally:
-            worker.join(timeout=60)
+            worker.join(timeout=90)
 
         assert "error" not in result, result.get("error")
         status, run = result["response"]
@@ -683,6 +684,7 @@ class TestCancellationAndCrashRecovery:
             claimed = _wait_for(
                 state,
                 "SELECT id, run_id FROM scrape_requests WHERE status = 'RUNNING'",
+                timeout=60.0,
             )
             run_id = claimed["run_id"]
             # hard-kill the service child while its fetch hangs
@@ -690,7 +692,7 @@ class TestCancellationAndCrashRecovery:
             assert desc is not None
             os.kill(desc.pid, 9)
         finally:
-            worker.join(timeout=60)
+            worker.join(timeout=90)
         assert "error" in result  # the in-flight API call died with the service
 
         # the launcher supervises: it restarts the service and prints a

@@ -265,6 +265,12 @@ def test_no_new_runtime_dependencies():
         "winerror",
     }
 
+    # POSIX-only stdlib modules that appear in the non-Windows fallback
+    # branches of the launcher (single-instance advisory lock).  They are
+    # absent from sys.stdlib_module_names on Windows, so the check must
+    # not be platform-naive.
+    platform_fallback_stdlib = {"fcntl"}
+
     # every import inside the package is stdlib, jobscraper, or locked
     for path in SRC.rglob("*.py"):
         tree = _parse(path)
@@ -278,6 +284,7 @@ def test_no_new_runtime_dependencies():
             assert (
                 root == "jobscraper"
                 or root in sys.stdlib_module_names
+                or root in platform_fallback_stdlib
                 or root.replace("_", "-") in import_roots
             ), f"{path.relative_to(REPO_ROOT)}: unexpected import {root!r}"
 
