@@ -9,6 +9,8 @@ slice.  So:
 
 * an attach requires a strong identifier: the same ``(ats_provider, board)``,
   or the same employer application/careers/organization host;
+* shared ATS platform infrastructure is evidence, not employer identity, and
+  therefore never becomes a ``company_identifiers`` merge key;
 * a bare matching normalized name is *never* sufficient — it creates a new
   company and records why;
 * a strong-identifier attach with a conflicting display name does not rename
@@ -36,20 +38,22 @@ from jobscraper.ids import new_id
 from jobscraper.pipeline.normalize import normalize_company
 
 #: Version of the resolution rules (ARC-10): recorded on every event so a
-#: later rule change is never mistaken for a data change.
-COMPANY_RESOLUTION_VERSION = "company-resolution-v1"
+#: later rule change is never mistaken for a data change.  v2 corrects v1's
+#: treatment of shared ATS platform hosts as globally unique company keys.
+COMPANY_RESOLUTION_VERSION = "company-resolution-v2"
 
 #: Strong identifier kinds indexed in ``company_identifiers``.
 IDENTIFIER_KINDS = ("ATS_BOARD", "APP_HOST", "ORG_DOMAIN", "CAREERS_HOST")
 
 #: Attach priority.  A board identity is provider-scoped and therefore the
-#: most specific; a shared employer host is next; the ATS's own host is a
-#: weaker (but still strong) application-host signal used only when the
-#: employer host is unknown.
+#: most specific; employer-owned hosts follow.  Shared ATS infrastructure is
+#: filtered before it can enter this ordering.
 _MATCH_PRIORITY = ("ATS_BOARD", "APP_HOST", "ORG_DOMAIN", "CAREERS_HOST")
 
-# Hosts that belong to the ATS platform rather than to the employer, so they
-# are recorded as identifiers but never stored as the company's own domain.
+# Hosts that belong to the ATS platform rather than to the employer.  They may
+# remain visible in the observation/company-resolution evidence snapshot, but
+# they are neither a company domain nor a strong ``company_identifiers`` key:
+# many unrelated employers legitimately share each host.
 _PLATFORM_HOSTS = frozenset(
     {
         "boards.greenhouse.io",
@@ -87,6 +91,20 @@ def host_key(value: str | None) -> str | None:
     if host.startswith("www."):
         host = host[4:]
     return host or None
+
+
+def _strong_host_key(value: str | None) -> str | None:
+    """Return an employer-owned host suitable for a company identity key.
+
+    ATS platform hosts are intentionally refused here rather than merely
+    deprioritized: ``company_identifiers(kind, value)`` is globally unique and
+    represents evidence strong enough to carry a merge, which shared provider
+    infrastructure is not (01 §33.1).
+    """
+    key = host_key(value)
+    if key is None or key in _PLATFORM_HOSTS:
+        return None
+    return key
 
 
 @dataclass(frozen=True)
@@ -137,14 +155,14 @@ class CompanySignals:
                     f"{self.ats_provider.strip().upper()}/{self.ats_board.strip().lower()}",
                 )
             )
-        app_host = host_key(self.application_host)
+        app_host = _strong_host_key(self.application_host)
         if app_host:
             keys.append(("APP_HOST", app_host))
         for value in self.organization_domains:
-            key = host_key(value)
+            key = _strong_host_key(value)
             if key:
                 keys.append(("ORG_DOMAIN", key))
-        careers_host = host_key(self.careers_url)
+        careers_host = _strong_host_key(self.careers_url)
         if careers_host:
             keys.append(("CAREERS_HOST", careers_host))
         # de-duplicate while keeping the deterministic priority order
