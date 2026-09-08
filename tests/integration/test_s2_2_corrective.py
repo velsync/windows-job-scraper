@@ -11,8 +11,12 @@ from types import SimpleNamespace
 
 import jobscraper.pipeline.ingest as ingest_module
 from jobscraper.acquisition.origin import OriginResolution, OriginStatus
-from jobscraper.pipeline.companies import CompanySignals
+from jobscraper.db.connection import Database
+from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
+from jobscraper.pipeline.companies import CompanySignals, resolve_company
 from jobscraper.pipeline.entity import EntityResolution, resolve_entity
+
+NOW = "2026-09-08T09:00:00.000000Z"
 
 
 def test_shared_ats_platform_hosts_are_not_company_merge_identifiers():
@@ -55,6 +59,54 @@ def test_shared_ats_platform_hosts_are_not_company_merge_identifiers():
     )
     assert ("APP_HOST", "jobs.acme.example") in employer_owned.identifier_keys()
     assert ("CAREERS_HOST", "careers.acme.example") in employer_owned.identifier_keys()
+
+
+def test_two_greenhouse_tenants_on_the_same_platform_host_do_not_merge(tmp_path):
+    """Regression for the actual v1 failure mode, not only its key-generation cause."""
+    db = Database(tmp_path / "platform-host-company-resolution.db")
+    try:
+        migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
+        acme = resolve_company(
+            db.conn,
+            signals=CompanySignals(
+                name="Acme",
+                ats_provider="GREENHOUSE",
+                ats_board="acme",
+                application_host="boards.greenhouse.io",
+                careers_url="https://boards.greenhouse.io/acme",
+            ),
+            observed_at=NOW,
+            now=NOW,
+        )
+        beta = resolve_company(
+            db.conn,
+            signals=CompanySignals(
+                name="Beta",
+                ats_provider="GREENHOUSE",
+                ats_board="beta",
+                application_host="boards.greenhouse.io",
+                careers_url="https://boards.greenhouse.io/beta",
+            ),
+            observed_at=NOW,
+            now=NOW,
+        )
+
+        assert acme.company_id != beta.company_id
+        assert acme.decision == "CREATED"
+        assert beta.decision == "CREATED"
+        assert db.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 2
+        keys = {
+            (row["kind"], row["value"])
+            for row in db.conn.execute(
+                "SELECT kind, value FROM company_identifiers ORDER BY kind, value"
+            )
+        }
+        assert keys == {
+            ("ATS_BOARD", "GREENHOUSE/acme"),
+            ("ATS_BOARD", "GREENHOUSE/beta"),
+        }
+    finally:
+        db.close()
 
 
 def _origin_match_connection() -> sqlite3.Connection:
