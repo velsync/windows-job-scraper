@@ -39,3 +39,29 @@ def db(data_root) -> Database:
     migrate_schema(database.conn, LATEST_SCHEMA_VERSION)
     yield database
     database.close()
+
+
+# ------------------------------------------------- CI failure annotations
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Emit failing tests as GitHub workflow annotations under Actions.
+
+    Raw run-log downloads are unavailable from some review environments;
+    check-run annotations stay readable through the standard GitHub API.
+    This only *reports* failures — it never changes test outcomes or
+    runs outside CI (no-op unless GITHUB_ACTIONS=true).
+    """
+    import os
+
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    failed = terminalreporter.stats.get("failed", []) or []
+    for report in failed[:10]:  # GitHub caps annotations per step
+        title = report.nodeid.replace("::", " / ")[:250] or "failed test"
+        message = getattr(report, "longreprtext", "") or str(
+            getattr(report, "longrepr", "")
+        )
+        message = (
+            message.replace("\r", " ").replace("\n", " ").replace("::", "; ").strip()
+        )
+        # the decisive assertion lines sit at the end of the repr
+        print(f"::error title={title}::{message[-380:]}", flush=True)
