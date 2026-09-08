@@ -2,8 +2,8 @@
 
 These tests pin only the defects found after the original S2.3 implementation:
 search provisioning must make the durable corpus complete before claiming FTS5,
-and deterministic cleaning must recognize ordinary Markdown even when it has no
-links.
+deterministic cleaning must recognize ordinary Markdown even when it has no
+links, and re-cleaning the stored Markdown representation must be byte-stable.
 """
 
 from __future__ import annotations
@@ -104,3 +104,13 @@ def test_markdown_without_links_is_recognized_and_plain_text_drops_syntax() -> N
     assert "Role" in result.text
     assert "Python" in result.text
     assert "Strong experience" in result.text
+
+
+def test_cleaned_html_list_is_idempotent_when_recleaning_stored_markdown() -> None:
+    """The canonical Markdown representation is the cleaner's stable replay input."""
+    once = clean("<ul><li>One</li><li>Two</li></ul>")
+    assert once.markdown == "- One\n- Two"
+
+    again = clean(once.markdown)
+
+    assert again == once
