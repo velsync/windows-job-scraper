@@ -52,6 +52,7 @@ RELEASED_STEP_SHA256: dict[int, str] = {
     11: "dc3a29389a35b1e24396ac9d662cd6c6dfd460341d95125a3171a504f65e8ddb",
     12: "912888da60343657e561504d7458e9e45707029a3c8e67399f2157f1b9faef60",
     13: "bc4c4da5fadfb9a9a1f4d99a3153cc03e1351c10378ab06568b3e222e5d0d24f",
+    14: "eeffc8fe0178518b9b8129fe7739579f94084db3fe72c4389fbfab5146c0f18f",
 }
 
 
@@ -255,6 +256,9 @@ def test_v10_migrates_forward_with_rows_preserved(tmp_path):
         ("job_search_docs", 0),
         ("job_search_state", 0),
         ("search_capability", 0),
+        # v14 S2.4 evidence tables are empty after the append
+        ("ats_fingerprints", 0),
+        ("source_route_decisions", 0),
     ):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == expected, table
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -278,7 +282,10 @@ def test_v13_steps_record_cleaning_version_and_search_tables(tmp_path):
     later-slice objects, and the v12 rows survive untouched."""
     from jobscraper.db.schema_sql import MIGRATION_STEPS
 
-    version, name, sql = MIGRATION_STEPS[-1]
+    # v13 is no longer the last step (v14 was appended for S2.4), so look it
+    # up by version number rather than assuming MIGRATION_STEPS[-1].
+    v13_entry = next(e for e in MIGRATION_STEPS if e[0] == 13)
+    version, name, sql = v13_entry
     assert version == 13
     assert name == "s2_3_content_cleaning_and_search_docs"
     # plain bookkeeping: the FTS5 virtual table is provisioned by capability-

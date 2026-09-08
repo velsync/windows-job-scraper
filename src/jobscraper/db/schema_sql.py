@@ -1272,6 +1272,60 @@ CREATE TABLE search_capability (
 
 
 
+# --------------- v14 ATS fingerprint + route decision evidence (S2.4, 02 §12)
+# Slice 2 S2.4 (02 §12.1 fingerprinting, §12.2 strategy router).
+# Append-only: two new evidence tables for the fingerprint classifier and
+# strategy router.  Evidence rows are immutable once written.  No released
+# step (v1–v13) is touched.
+@_step(14, "s2_4_ats_fingerprint_and_route_decision")
+def _(sql: str = """
+-- Fingerprint evidence (02 §12.1): one row per classify_content() call.
+-- Append-only: never deleted or updated.  The source_id is nullable at the
+-- table level because a provisional discovery source may not yet exist when
+-- the first probe is fingerprinted, but provisioning links it once the source
+-- row is created.
+CREATE TABLE ats_fingerprints (
+    id TEXT PRIMARY KEY,
+    source_id TEXT,
+    url TEXT NOT NULL,
+    family TEXT,
+    confidence REAL NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    recommended_adapter_id TEXT,
+    fingerprint_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_ats_fingerprints_source
+    ON ats_fingerprints(source_id, created_at);
+CREATE INDEX idx_ats_fingerprints_family
+    ON ats_fingerprints(family, confidence);
+
+-- Route decision evidence (02 §12.2): one row per plan_routes() call.
+-- Append-only: never deleted or updated.  Records the complete routing
+-- decision including any candidates the host filtered out as unsupported
+-- execution class.
+CREATE TABLE source_route_decisions (
+    id TEXT PRIMARY KEY,
+    source_id TEXT,
+    outcome TEXT NOT NULL
+        CHECK (outcome IN ('SPECIALIZED', 'GENERIC_DISCOVERY_FALLBACK')),
+    fingerprint_family TEXT,
+    fingerprint_confidence REAL NOT NULL,
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    unsupported_candidates_json TEXT NOT NULL DEFAULT '[]',
+    fallback_reason TEXT,
+    router_version INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_route_decisions_source
+    ON source_route_decisions(source_id, created_at);
+CREATE INDEX idx_route_decisions_outcome
+    ON source_route_decisions(outcome, created_at);
+"""
+) -> None:
+    return sql
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1286,6 +1340,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 13, (
-    "Slice 1 ships versions 1-10 (v10 corrective); Slice 2 appends v11-v13"
+assert LATEST_SCHEMA_VERSION == 14, (
+    "Slice 1 ships versions 1-10 (v10 corrective); Slice 2 appends v11-v14"
 )

@@ -217,6 +217,8 @@ def test_only_pipeline_writes_canonical_and_observation_state(table: str):
         "fetch_attempts",
         "parse_attempts",
         "acquisition_evidence",
+        "ats_fingerprints",
+        "source_route_decisions",
     ],
 )
 def test_immutable_evidence_is_never_deleted(table: str):
