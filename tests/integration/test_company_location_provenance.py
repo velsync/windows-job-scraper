@@ -228,7 +228,7 @@ def test_both_sources_land_on_one_canonical_job_with_the_employer_presenting(db)
         binding_id="bnd-agg",
         observation=_aggregator_observation(),
         content_kind="STRUCTURED",
-        at=LATER,  # the aggregator arrives later, yet must not take over
+        at=LATER,
     )
     assert db.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
     job = db.conn.execute("SELECT * FROM jobs").fetchone()
@@ -238,7 +238,6 @@ def test_both_sources_land_on_one_canonical_job_with_the_employer_presenting(db)
         "SELECT source_id FROM job_sources WHERE id = ?", (job["canonical_provenance_id"],)
     ).fetchone()
     assert winner["source_id"] == "src-employer"
-    # both presences remain fully inspectable (presentation, not deletion)
     assert {
         r[0] for r in db.conn.execute("SELECT source_id FROM job_sources")
     } == {"src-employer", "src-agg"}
@@ -257,7 +256,6 @@ def test_quality_class_is_recorded_per_presence_from_its_own_evidence(db):
     presence = db.conn.execute(
         "SELECT * FROM job_sources WHERE source_id = 'src-employer'"
     ).fetchone()
-    # employer host, structured content, and the ATS origin corroborates it
     assert presence["source_quality_class"] == EMPLOYER_STRUCTURED_ATS
     assert presence["content_kind"] == "STRUCTURED"
     assert presence["same_host_as_source"] == 1
@@ -298,8 +296,7 @@ def test_origin_identity_and_categorical_projection_roll_up_from_the_winner(db):
     assert job["remote_worldwide"] == 0
     assert job["provenance_selector_version"] == "canonical-provenance-selector-v2"
     assert job["location_rules_version"] == "location-rules-v1"
-    assert job["company_resolution_version"] == "company-resolution-v1"
-    # §33.2: the model keeps a set of structured locations, never one string
+    assert job["company_resolution_version"] == "company-resolution-v2"
     rows = db.conn.execute(
         "SELECT * FROM job_locations WHERE job_id = ? ORDER BY raw_text", (job["id"],)
     ).fetchall()
@@ -329,26 +326,23 @@ def test_one_company_serves_both_sources_through_strong_identifiers_only(db):
         content_kind="STRUCTURED",
     )
     companies = db.conn.execute("SELECT * FROM companies").fetchall()
-    assert len(companies) == 1  # same ATS board identity, not a name guess
+    assert len(companies) == 1
     assert companies[0]["ats_provider"] == "GREENHOUSE"
     assert companies[0]["ats_board"] == "acme"
-    assert companies[0]["domain"] == "careers.acme.example"  # employer's own host
+    assert companies[0]["domain"] == "careers.acme.example"
     kinds = {
         (r["kind"], r["value"])
         for r in db.conn.execute("SELECT kind, value FROM company_identifiers")
     }
-    assert {k for k, _ in kinds} == {"ATS_BOARD", "APP_HOST", "CAREERS_HOST"}
+    assert {k for k, _ in kinds} == {"ATS_BOARD", "CAREERS_HOST"}
     assert ("ATS_BOARD", "GREENHOUSE/acme") in kinds
     assert ("CAREERS_HOST", "careers.acme.example") in kinds
-    # an ATS platform host is recorded as an identifier, never as the
-    # company's own domain
-    assert ("APP_HOST", "boards.greenhouse.io") in kinds
+    assert ("APP_HOST", "boards.greenhouse.io") not in kinds
     events = db.conn.execute(
         "SELECT * FROM company_resolution_events ORDER BY created_at, id"
     ).fetchall()
     assert [e["decision"] for e in events] == ["CREATED", "ATTACHED"]
     assert all(e["observation_id"] for e in events)
-    # the display name stays whatever the first sighting recorded
     assert companies[0]["name"] == "Acme Data"
 
 
@@ -368,8 +362,6 @@ def test_meaningful_location_disagreement_does_not_attach(db):
         claim=agg_claim,
         source_id="src-agg",
         binding_id="bnd-agg",
-        # same origin identity, but a location set that cannot overlap:
-        # §38 stage 5 says cluster, do not merge
         observation=_aggregator_observation(locations=["Amsterdam, Netherlands"]),
         content_kind="STRUCTURED",
     )
@@ -378,11 +370,11 @@ def test_meaningful_location_disagreement_does_not_attach(db):
         "SELECT * FROM entity_resolution_events ORDER BY decided_at DESC, id DESC LIMIT 1"
     ).fetchone()
     assert event["decision"] == "CREATED"
+    assert event["stage"] == "origin_identity_stage2"
     assert event["reason_code"] == "LOCATION_DISAGREEMENT"
     evidence = json.loads(event["evidence_json"])
     assert evidence["stage"] == "origin_identity"
     assert evidence["location_conflict"] is True
-    # the two jobs keep their own companies distinct only if the evidence says so
     assert db.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1
 
 
@@ -403,7 +395,6 @@ def test_matching_origin_identity_without_conflict_attaches_the_presence(db):
         source_id="src-agg",
         binding_id="bnd-agg",
         observation=_aggregator_observation(
-            # a *different* source-native id, so only §38 stage 2 can link it
             source_job_id="AGG-999",
             urls=["https://aggregator.example.test/jobs/AGG-999", ATS_JOB_URL],
             locations=["Paris, France"],
@@ -412,10 +403,17 @@ def test_matching_origin_identity_without_conflict_attaches_the_presence(db):
     )
     assert db.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
     presence = db.conn.execute(
-        "SELECT source_quality_class FROM job_sources WHERE source_id = 'src-agg'"
+        "SELECT source_quality_class, source_identity_generation FROM job_sources"
+        " WHERE source_id = 'src-agg'"
     ).fetchone()
     assert presence["source_quality_class"] == AGGREGATOR_WITH_RESOLVED_ORIGIN
+    assert presence["source_identity_generation"] == 1
     assert result["decision"] in ("MATCHED_ORIGIN", "MATCHED", "MATCHED_URL")
+    event = db.conn.execute(
+        "SELECT * FROM entity_resolution_events ORDER BY decided_at DESC, id DESC LIMIT 1"
+    ).fetchone()
+    if result["decision"] == "MATCHED_ORIGIN":
+        assert event["stage"] == "origin_identity_stage2"
 
 
 def test_employer_only_feed_without_an_ats_origin_is_structured_api_quality(db):
@@ -433,7 +431,7 @@ def test_employer_only_feed_without_an_ats_origin_is_structured_api_quality(db):
     )
     presence = db.conn.execute("SELECT * FROM job_sources").fetchone()
     assert presence["source_quality_class"] == EMPLOYER_STRUCTURED_API
-    assert presence["origin_provider"] is None  # nothing resolved, nothing claimed
+    assert presence["origin_provider"] is None
     job = db.conn.execute("SELECT * FROM jobs").fetchone()
     assert job["origin_provider"] is None
     location = db.conn.execute(
@@ -453,7 +451,6 @@ def test_replaying_the_same_evidence_is_idempotent(db):
         observation=_employer_observation(),
         content_kind="STRUCTURED",
     )
-    # a retry inside the same request must not duplicate anything
     replay = _ingest(
         db,
         claim=claim,
@@ -478,11 +475,11 @@ def test_replaying_the_same_evidence_is_idempotent(db):
         "jobs": 1,
         "job_sources": 1,
         "companies": 1,
-        "company_identifiers": 3,  # ATS_BOARD, APP_HOST(from apply), CAREERS_HOST
+        "company_identifiers": 2,
         "job_locations": 2,
         "company_resolution_events": 1,
     }
-    assert replay["job_id"] is None  # idempotent short-circuit, nothing to add
+    assert replay["job_id"] is None
     assert db.conn.execute(
         "SELECT COUNT(*) FROM job_observations"
     ).fetchone()[0] == 1
@@ -503,7 +500,7 @@ def test_origin_resolution_status_is_durable_evidence_for_the_class(db):
     detail = json.loads(presence["origin_resolution_evidence_json"])
     assert detail["status"] == OriginStatus.RESOLVED.value
     assert detail["origin_provider"] == "GREENHOUSE"
-    assert detail["confidence"] >= 0.85  # single job-candidate sighting
+    assert detail["confidence"] >= 0.85
     evidence = db.conn.execute(
         "SELECT detail_json FROM acquisition_evidence WHERE kind = 'ORIGIN_RESOLUTION'"
     ).fetchone()
@@ -511,14 +508,7 @@ def test_origin_resolution_status_is_durable_evidence_for_the_class(db):
 
 
 def test_a_late_lower_quality_presence_reasserts_the_winning_projection(db):
-    """§39/§38: canonical presentation is the *winner's*, restated every refresh.
-
-    When a weaker source arrives afterwards it does not own the presentation, so
-    the winner's retained observation payload is re-normalized and re-projected
-    (Slice-1 behavior).  The loser's *absence* of evidence must not erase the
-    employer's locations, and canonical drift is re-asserted rather than left to
-    rot until the winner is seen again.
-    """
+    """§39/§38: canonical presentation is the *winner's*, restated every refresh."""
     employer_claim = _claim(db, source_id="src-employer", binding_id="bnd-employer")
     _ingest(
         db,
@@ -539,7 +529,6 @@ def test_a_late_lower_quality_presence_reasserts_the_winning_projection(db):
         at=LATER,
     )
 
-    # simulate canonical drift (e.g. a partial write from an earlier build)
     db.conn.execute("UPDATE jobs SET title = 'DRIFTED'")
     db.conn.execute("DELETE FROM job_locations")
     db.conn.commit()
@@ -556,10 +545,10 @@ def test_a_late_lower_quality_presence_reasserts_the_winning_projection(db):
     )
 
     job = db.conn.execute("SELECT * FROM jobs").fetchone()
-    assert job["title"] == "Staff Backend Engineer"  # re-projected from the winner
+    assert job["title"] == "Staff Backend Engineer"
     assert db.conn.execute(
         "SELECT COUNT(*) FROM job_locations WHERE job_id = ?", (job["id"],)
-    ).fetchone()[0] == 2  # the employer's Berlin + Paris, not the loser's emptiness
+    ).fetchone()[0] == 2
     history = db.conn.execute(
         "SELECT change_class FROM job_history WHERE job_id = ? ORDER BY rowid", (job["id"],)
     ).fetchall()
