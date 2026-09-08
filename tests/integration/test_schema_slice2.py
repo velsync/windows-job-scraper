@@ -51,6 +51,7 @@ SLICE1_RELEASED_STEP_SHA256 = {
 RELEASED_STEP_SHA256: dict[int, str] = {
     11: "dc3a29389a35b1e24396ac9d662cd6c6dfd460341d95125a3171a504f65e8ddb",
     12: "912888da60343657e561504d7458e9e45707029a3c8e67399f2157f1b9faef60",
+    13: "bc4c4da5fadfb9a9a1f4d99a3153cc03e1351c10378ab06568b3e222e5d0d24f",
 }
 
 
@@ -250,6 +251,10 @@ def test_v10_migrates_forward_with_rows_preserved(tmp_path):
         ("field_evidence", 1),
         ("scrape_requests", 1),
         ("request_attempts", 1),
+        # v13 search bookkeeping tables exist and are empty after the append
+        ("job_search_docs", 0),
+        ("job_search_state", 0),
+        ("search_capability", 0),
     ):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == expected, table
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -265,6 +270,36 @@ def test_v10_migrates_forward_with_rows_preserved(tmp_path):
             " VALUES ('js-2','job-1','src-1','bnd-1','fx-100',?,?,?,?)",
             (NOW, NOW, NOW, NOW),
         )
+    db.close()
+
+
+def test_v13_steps_record_cleaning_version_and_search_tables(tmp_path):
+    """S2.3 append-only step: additive columns/tables, no FTS5 DDL, no
+    later-slice objects, and the v12 rows survive untouched."""
+    from jobscraper.db.schema_sql import MIGRATION_STEPS
+
+    version, name, sql = MIGRATION_STEPS[-1]
+    assert version == 13
+    assert name == "s2_3_content_cleaning_and_search_docs"
+    # plain bookkeeping: the FTS5 virtual table is provisioned by capability-
+    # gated code in jobscraper.search, never by an unconditional step
+    assert "CREATE VIRTUAL TABLE" not in sql
+    for forbidden in ("DELETE", "DROP"):
+        assert forbidden not in sql
+    db = Database(tmp_path / "v13.db")
+    migrate_schema(db.conn, 12)
+    conn = db.conn
+    before = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
+    assert migrate_schema(conn, 13) == [13]
+    assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == before + 1
+    # the new columns/tables exist and the older rows are untouched
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    assert "content_cleaning_version" in cols
+    for table in ("job_search_docs", "job_search_state", "search_capability"):
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = ?", (table,)
+        ).fetchone() is not None, table
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     db.close()
 
 

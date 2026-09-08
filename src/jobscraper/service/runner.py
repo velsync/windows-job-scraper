@@ -137,6 +137,24 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
             ),
         )
 
+    # S2.3 (01 §45): provision the search surface (FTS5 when the host has it,
+    # an honest SUBSTRING_FALLBACK record otherwise).  Capability-gated and
+    # idempotent; never blocks boot.
+    from jobscraper.search.provision import provision_search
+
+    try:
+        provision_search(db.conn, now=utc_now_s())
+    except Exception as exc:  # pragma: no cover - defensive
+        append_event(
+            db.conn,
+            event(
+                "ERROR",
+                "SERVICE_SEARCH_PROVISION_FAILED",
+                f"search provisioning failed: {exc}",
+                data={"error_type": type(exc).__name__},
+            ),
+        )
+
     config_uv = uvicorn.Config(
         app,
         log_level="warning",

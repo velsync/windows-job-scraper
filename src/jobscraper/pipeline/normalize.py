@@ -3,28 +3,31 @@
 raw/structured description → deterministic cleaning → Markdown → plain
 text → language → hashes. Salary parsing preserves the original text and
 never fabricates numbers: unknown salary stays NULL (never zero).
+
+S2.3: the description cleaning step (Markdown/plain text/entities/link
+scheme + tracking-parameter rules) lives in
+``pipeline/contentclean.py`` (``content-clean-v1``); this module consumes
+it so there is exactly one owner of the deterministic cleaner.  The
+cleaning version is surfaced on ``NormalizedContent`` and recorded on the
+canonical row (``jobs.content_cleaning_version``).
 """
 
 from __future__ import annotations
 
 import hashlib
-import html as html_lib
 import re
 from dataclasses import dataclass
 
-#: Version of the deterministic normalization performed here.  Recorded on
-#: every parse attempt and evaluation row (ARC-10, RUN-21).  Slice 2 S2.3 adds
-#: the content-cleaning version on top of it.
-NORMALIZATION_VERSION = "normalize-v1"
-
-_BLOCK_TAGS = re.compile(
-    r"</?(p|div|section|article|header|footer|ul|ol|li|h[1-6]|br|tr|table)[^>]*>",
-    re.IGNORECASE,
+from jobscraper.pipeline.contentclean import (
+    CONTENT_CLEANING_VERSION,
+    clean,
+    detect_language,
 )
-_SCRIPT_STYLE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
-_TAG = re.compile(r"<[^>]+>")
-_WHITESPACE = re.compile(r"[ \t]+")
-_NEWLINES = re.compile(r"\n{3,}")
+
+#: Version of the deterministic normalization performed here.  Recorded on
+#: every parse attempt and evaluation row (ARC-10, RUN-21).  The description
+#: cleaning step is versioned separately (``CONTENT_CLEANING_VERSION``).
+NORMALIZATION_VERSION = "normalize-v1"
 
 _CURRENCY_PATTERNS = [
     ("EUR", re.compile(r"(€|\bEUR\b|\bEuros?\b)", re.IGNORECASE)),
@@ -46,60 +49,6 @@ _RANGE_RE = re.compile(
 _SINGLE_RE = re.compile(
     r"(\d{1,3}(?:[.,\s]\d{3})+|\d+(?:\.\d+)?)(\s*k\b)?", re.IGNORECASE
 )
-
-
-def _strip_html(markup: str) -> str:
-    text = _SCRIPT_STYLE.sub(" ", markup or "")
-    text = _BLOCK_TAGS.sub("\n", text)
-    text = _TAG.sub(" ", text)
-    text = html_lib.unescape(text)
-    text = _WHITESPACE.sub(" ", text)
-    lines = [line.strip() for line in text.split("\n")]
-    return _NEWLINES.sub("\n\n", "\n".join(lines)).strip()
-
-
-def _to_markdown(markup: str) -> str:
-    text = _SCRIPT_STYLE.sub(" ", markup or "")
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<li[^>]*>", "- ", text, flags=re.IGNORECASE)
-    text = re.sub(r"</li>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<h([1-6])[^>]*>", lambda m: "#" * int(m.group(1)) + " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"<(strong|b)>(.*?)</\1>", r"**\2**", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"<(em|i)>(.*?)</\1>", r"*\2*", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", r"[\2](\1)", text, flags=re.IGNORECASE | re.DOTALL)
-    text = _TAG.sub(" ", text)
-    text = html_lib.unescape(text)
-    text = _WHITESPACE.sub(" ", text)
-    lines = [line.strip() for line in text.split("\n")]
-    return _NEWLINES.sub("\n\n", "\n".join(lines)).strip()
-
-
-_EN_STOP = frozenset(
-    "the and for with you your our are have this that will from not per job work".split()
-)
-_DE_STOP = frozenset(
-    "der die das und für mit Sie Ihre sind werden nicht aus dem den job".split()
-)
-_RO_STOP = frozenset(
-    "și de la în pentru care vor fi acest nostru dumneavoastră sunt".split()
-)
-
-
-def detect_language(text: str) -> str | None:
-    """Cheap deterministic stopword heuristic; None when undeterminable."""
-    words = re.findall(r"[a-zăâîșțäöüß]+", (text or "").lower())
-    if len(words) < 12:
-        return None
-    scores = {
-        "en": sum(1 for w in words if w in _EN_STOP),
-        "de": sum(1 for w in words if w in _DE_STOP),
-        "ro": sum(1 for w in words if w in _RO_STOP),
-    }
-    best = max(scores, key=lambda k: scores[k])
-    if scores[best] < 3:
-        return None
-    return best
 
 
 def _number(raw: str, k_suffix: bool) -> float | None:
@@ -169,6 +118,9 @@ class NormalizedContent:
     careers_url: str | None = None
     organization_domains: tuple[str, ...] = ()
     company_country: str | None = None
+    # S2.3: which cleaner revision produced the description projection (None
+    # when the observation carried no description to clean)
+    content_cleaning_version: str | None = None
 
     @property
     def content_hash(self) -> str:
@@ -276,11 +228,16 @@ def normalize_observation(
     title = str(fields.get("title") or "").strip()
     company = str(fields.get("company") or "").strip() or None
     description_raw = str(fields.get("description") or "").strip() or None
-    description_md = _to_markdown(description_raw) if description_raw else None
-    description_text = _strip_html(description_raw) if description_raw else None
-    description_hash = (
-        hashlib.sha256(description_text.encode()).hexdigest() if description_text else None
-    )
+    if description_raw:
+        cleaned = clean(description_raw)
+        description_md = cleaned.markdown
+        description_text = cleaned.text
+        description_lang = cleaned.lang
+        description_hash = cleaned.content_hash
+    else:
+        description_md = description_text = None
+        description_lang = None
+        description_hash = None
     salary_text = str(fields.get("salary") or "").strip() or None
     s_min = s_max = s_cur = s_per = None
     if salary_text:
@@ -315,8 +272,11 @@ def normalize_observation(
         company_country=str(fields.get("company_country") or "").strip() or None,
         description_md=description_md,
         description_text=description_text,
-        description_lang=detect_language(description_text or ""),
+        description_lang=description_lang,
         description_hash=description_hash,
+        content_cleaning_version=(
+            CONTENT_CLEANING_VERSION if description_raw else None
+        ),
         salary_original_text=salary_text,
         salary_min=s_min,
         salary_max=s_max,

@@ -340,6 +340,64 @@ As implemented (S2.2, deviations recorded deliberately):
   route contract stays exact, and Slice-2 gates them with the same
   session+CSRF dependencies.
 
+As implemented (S2.3, deviations recorded deliberately):
+
+* `pipeline/contentclean.py` is the single owner of the deterministic
+  cleaner (`content-clean-v1`) and `pipeline/normalize.py` consumes it, so
+  the §34 description step has exactly one implementation.  The legacy
+  Slice-1 HTML-strip behavior is preserved deliberately for block
+  boundaries (plain text keeps paragraph breaks, `\n\n`), so
+  re-cleaning cleaned output is byte-stable; only *derived* text drops
+  tag-removal spaces before punctuation.  Link retention is
+  scheme-gated (http/https/mailto only) and tracking parameters are
+  removed from retained links only.
+* The cleaner is idempotent over its own Markdown *and* plain-text output;
+  the plain-text `content_hash` covers exactly the stored text bytes, and
+  the canonical row records which cleaner revision produced its
+  description (`jobs.content_cleaning_version`) so a later revision can
+  never silently rewrite history (RUN-21).
+* `search/` owns the FTS5 index (`job_search_fts` + AFTER INSERT/UPDATE/
+  DELETE sync triggers mirroring `job_search_docs`) and is provisioned
+  capability-gated and idempotent at service boot (`service/runner.py`)
+  — never by a migration step.  The FTS5 table is plain (not
+  external-content), so the fallback and FTS read the same corpus;
+  document rows are never deleted in this slice and `job_search_docs`/
+  `job_search_state` use plain FK references (SQLite fires no triggers
+  for FK actions, so a cascading delete could silently orphan FTS rows).
+* `job_search_docs.description_text` is kept byte-identical to the
+  canonical `description_text` (paragraph breaks are meaningful and
+  already normalized); title/company/locations/fact text are
+  whitespace-folded for indexing.  Fact text today covers the categorical
+  fields the canonical row already holds (employment type, experience
+  level, remote mode/worldwide); skills/contacts fact indexing waits for
+  `job_facts` (ROAD-05) and the index layout marker
+  (`SEARCH_DOC_LAYOUT`) forces re-indexing when the layout grows.
+* Search responses always carry the active mode and an explicit warning
+  in `SUBSTRING_FALLBACK`; BM25 scores are `None` there.  `bm25` is a
+  derived boolean in the API payload (mode is the source of truth).
+* A per-observation `CONTENT_CLEANING` row is appended to the immutable
+  `acquisition_evidence` spine when an observation carried a description
+  (version as ref, shape summary + stored-text hash in detail); the raw
+  text itself is never retained there.
+* Index maintenance is invoked from the fenced canonical refresh
+  (`refresh_canonical_presentation`), so a search document changes only
+  when the winning presence's projection changes, and the
+  `job_search_state` revision hash makes re-sync idempotent.
+* Capability honesty also guards the *index's own integrity*: a recorded
+  `FTS5_ACTIVE` is re-verified against the actual provisioned surface
+  (virtual table **and** sync triggers) on every query — a table whose
+  triggers are gone would silently serve a stale index, so queries
+  degrade to `SUBSTRING_FALLBACK` with an explicit warning until the
+  service re-provisions.
+* The salary structured filter is **deferred within S2.3**: the §45 filter
+  list stays outside FTS by construction, but `jobs.salary_min/max` are
+  period-heterogeneous (hourly vs yearly text parse) and
+  `salary_annual_min_ref/max_ref` are schema-reserved and populated by no
+  code yet — a numeric range filter now would either compare
+  incomparable periods or silently match nothing.  The endpoint and the
+  query model will grow the filter when a later slice populates the
+  annualized references.
+
 ### S2.4 — ATS fingerprinting + strategy router
 
 * `adapters/fingerprint.py` — deterministic, evidence-first classifier

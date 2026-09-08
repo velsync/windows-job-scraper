@@ -184,6 +184,36 @@ def ingest_observation(
         "UPDATE job_observations SET parse_evidence_ref = ? WHERE id = ?",
         (normalized.content_hash, observation_id),
     )
+    if normalized.content_cleaning_version is not None:
+        # S2.3 (01 §34): the deterministic cleaning outcome is durable,
+        # append-only evidence on the observation that produced it — version,
+        # shape summary and the hash of the stored text.  The raw text is
+        # never retained here (review can re-derive from the observation's
+        # own retained payload when present).
+        conn.execute(
+            "INSERT INTO acquisition_evidence (id, request_id, attempt_id,"
+            " observation_id, kind, ref, detail_json, content_hash,"
+            " observed_at, created_at) VALUES (?, ?, ?, ?, 'CONTENT_CLEANING',"
+            " ?, ?, ?, ?, ?)",
+            (
+                new_id("ev"),
+                request_id,
+                attempt_id,
+                observation_id,
+                normalized.content_cleaning_version,
+                bounded_json(
+                    {
+                        "description_text_chars": len(normalized.description_text or ""),
+                        "description_md_chars": len(normalized.description_md or ""),
+                        "language": normalized.description_lang,
+                        "description_hash": normalized.description_hash,
+                    }
+                ),
+                normalized.description_hash,
+                observed_at,
+                now,
+            ),
+        )
     for evidence in observation.field_evidence:
         stored_excerpt, excerpt_hash = excerpt_and_hash(evidence.excerpt)
         conn.execute(

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from pathlib import Path
 
 from jobscraper.config import AppConfig, config_from_env
@@ -339,6 +340,62 @@ def _check_timezone() -> CheckResult:
     )
 
 
+def _check_search_index(paths: AppPaths) -> CheckResult:
+    """Search capability/index state (S2.3; 01 §45 capability honesty)."""
+    from jobscraper.db.connection import connect_db
+    from jobscraper.search.index import index_summary
+
+    db_path = paths.database_file
+    if not db_path.is_file():
+        return CheckResult(
+            "search_index",
+            WARN,
+            "no database yet — search is provisioned on first launch",
+            {"indexed_jobs": 0, "mode": None},
+        )
+    try:
+        conn = connect_db(db_path)
+        try:
+            summary = index_summary(conn)
+        finally:
+            conn.close()
+    except Exception as exc:
+        # An older-schema database (no search tables yet) is not a broken
+        # index: the service migrates and provisions on next launch.
+        if isinstance(exc, sqlite3.OperationalError):
+            return CheckResult(
+                "search_index",
+                WARN,
+                "search tables not present at this schema version — starting the"
+                " service migrates and provisions search",
+                {"indexed_jobs": 0, "mode": None},
+            )
+        return CheckResult(
+            "search_index", FAIL, f"search index state unreadable: {exc}", {}
+        )
+    mode = summary.get("mode")
+    if mode is None:
+        return CheckResult(
+            "search_index",
+            WARN,
+            "search capability not provisioned yet (start the service once)",
+            summary,
+        )
+    if mode == "SUBSTRING_FALLBACK":
+        return CheckResult(
+            "search_index",
+            WARN,
+            "SQLite FTS5 unavailable — substring search fallback active (01 §45: BM25/FTS is not claimed)",
+            summary,
+        )
+    return CheckResult(
+        "search_index",
+        PASS,
+        f"FTS5 active with {summary.get('indexed_jobs', 0)} indexed job(s)",
+        summary,
+    )
+
+
 def _check_resource_manifest() -> CheckResult:
     """Package resource manifest consistency (templates/static/vendor present)."""
     from jobscraper.service.app import _WEB_DIR
@@ -376,6 +433,7 @@ def run_doctor(config: AppConfig) -> list[CheckResult]:
         _check_browser_worker(),
         _check_free_disk(paths),
         _check_timezone(),
+        _check_search_index(paths),
         _check_resource_manifest(),
     ]
     return results

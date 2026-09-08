@@ -163,6 +163,7 @@ def refresh_canonical_presentation(
             remote_mode = ?, remote_worldwide = ?,
             employment_type = ?, experience_level = ?,
             location_rules_version = ?, provenance_selector_version = ?,
+            content_cleaning_version = ?,
             canonical_provenance_id = ?, updated_at = ?
         WHERE id = ?
         """,
@@ -189,6 +190,8 @@ def refresh_canonical_presentation(
             (winner_norm.experience_level if winner_norm else None) or job["experience_level"],
             LOCATION_RULES_VERSION,
             PROVENANCE_SELECTOR_VERSION,
+            (winner_norm.content_cleaning_version if winner_norm else None)
+            or job["content_cleaning_version"],
             winner["id"],
             now,
             job_id,
@@ -198,6 +201,12 @@ def refresh_canonical_presentation(
         project_job_locations(conn, job_id=job_id, records=winner_norm.location_records)
     for change_class in changes:
         record_change(conn, job_id, change_class, now)
+
+    # S2.3: keep the searchable snapshot in step with the canonical projection
+    # (host-owned, revision-checked inside the caller's fence).
+    from jobscraper.search.index import sync_search_doc
+
+    sync_search_doc(conn, job_id=job_id, now=now)
 
 
 def record_change(conn: sqlite3.Connection, job_id: str, change_class: str, now: str) -> None:

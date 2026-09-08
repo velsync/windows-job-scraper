@@ -383,6 +383,11 @@ def create_service_app(
 
     install_slice1_routes(app, state)
 
+    # ------------------------------------------------- Slice 2 surface (S2.3)
+    from jobscraper.service.s2_routes import install_slice2_routes
+
+    install_slice2_routes(app, state)
+
     return app, state
 
 
