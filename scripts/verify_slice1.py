@@ -52,6 +52,7 @@ def initialize_root(data_root: Path) -> None:
     """One real launcher run so the root has DB + secret (then stopped)."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
+    env["WJS_SUPPRESS_BROWSER_OPEN"] = "1"
     popen_kwargs: dict[str, object] = {}
     if os.name == "nt":
         # Windows has no cooperative SIGTERM via Popen. Create a dedicated
@@ -91,6 +92,9 @@ def initialize_root(data_root: Path) -> None:
 def main() -> int:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
+    # All subprocess-driven tests inherit this internal flag so real launcher
+    # flows are exercised without creating user-visible browser tabs.
+    env["WJS_SUPPRESS_BROWSER_OPEN"] = "1"
 
     results = {}
     results["contract"] = run_gate(
