@@ -34,6 +34,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from jobscraper.acquisition.atsendpoints import ATS_ENDPOINT_SPECS
 from jobscraper.ids import new_id
 from jobscraper.pipeline.normalize import normalize_company
 
@@ -53,16 +54,12 @@ _MATCH_PRIORITY = ("ATS_BOARD", "APP_HOST", "ORG_DOMAIN", "CAREERS_HOST")
 # Hosts that belong to the ATS platform rather than to the employer.  They may
 # remain visible in the observation/company-resolution evidence snapshot, but
 # they are neither a company domain nor a strong ``company_identifiers`` key:
-# many unrelated employers legitimately share each host.
+# many unrelated employers legitimately share each host.  Greenhouse/Lever/
+# Ashby hosts come from the single versioned ATS endpoint authority so regional
+# or newly reviewed provider hosts cannot drift out of sync here.
 _PLATFORM_HOSTS = frozenset(
     {
-        "boards.greenhouse.io",
-        "job-boards.greenhouse.io",
         "boards.greenhouse.eu",
-        "api.lever.co",
-        "jobs.lever.co",
-        "api.ashbyhq.com",
-        "jobs.ashbyhq.com",
         "careers.smartrecruiters.com",
         "workday.com",
         "myworkday.com",
@@ -71,6 +68,10 @@ _PLATFORM_HOSTS = frozenset(
         "wd3.myworkdayjobs.com",
         "recruiting.lever.co",
     }
+) | frozenset(
+    host.lower()
+    for spec in ATS_ENDPOINT_SPECS
+    for host in spec.hosts()
 )
 
 
