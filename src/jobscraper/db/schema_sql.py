@@ -16,10 +16,16 @@ Slice 1 appends the domain model (v3–v9) per RUN-17/RUN-18:
   v8 profile-relative state: disposition, inbox events, eligibility, scores
      (PROD-01/02, 01 §36/§41)
   v9 applications and documents (01 §43)
-  v12 S2.2 companies, location lookup and provenance quality (01 §33/§38/§39)
 
   v11 S2.1 richer acquisition evidence + origin resolution (02 §11.3/§32,
      ACQ-09, 03 §30 — append-only, no released step touched)
+
+  v12 S2.2 companies, location lookup and provenance quality (01 §33/§38/§39)
+
+  v13 S2.3 content-cleaning version + search documents/state/capability
+     (01 §34/§45; plain bookkeeping only — the FTS5 virtual table and its
+     triggers are provisioned by capability-gated idempotent code in
+     jobscraper.search, never by an unconditional migration step)
 
   v10 S1.1 corrective (architectural review 2026-09-08):
      - companies: normalized_name is a resolution signal, not identity
@@ -1198,6 +1204,74 @@ ALTER TABLE jobs ADD COLUMN provenance_selector_version TEXT;
 
 
 
+# ---------------------- v13 content-cleaning version + search bookkeeping
+# Slice 2 S2.3 (01 §34 deterministic cleaning versioning, §45 FTS5 search).
+# Plain bookkeeping only: the FTS5 virtual table + triggers are provisioned
+# by capability-gated idempotent code in ``jobscraper.search`` (never by an
+# unconditional migration step), so a host without FTS5 migrates cleanly and
+# records an honest SUBSTRING_FALLBACK capability.
+# ---------------------- v13 content-cleaning version + search bookkeeping
+# Slice 2 S2.3 (01 §34 deterministic cleaning versioning, §45 FTS5 search).
+# Plain bookkeeping only: the FTS5 virtual table + triggers are provisioned
+# by capability-gated idempotent code in ``jobscraper.search`` (never by an
+# unconditional migration step), so a host without FTS5 migrates cleanly and
+# records an honest SUBSTRING_FALLBACK capability.
+@_step(13, "s2_3_content_cleaning_and_search_docs")
+def _(sql: str = """
+-- The canonical row records which cleaner revision produced its description
+-- projection, so a later cleaner revision can never silently rewrite history
+-- (01 §34, RUN-21).  NULL until the row is (re-)projected under S2.3.
+ALTER TABLE jobs ADD COLUMN content_cleaning_version TEXT;
+
+-- Denormalized search document: a deterministic snapshot of the canonical
+-- fields that FTS indexes (title, company, description text, locations,
+-- available fact text).  The FTS5 virtual table (provisioned separately) is
+-- kept in sync by triggers owned by jobscraper.search; job_search_docs is
+-- the durable content source for the SUBSTRING_FALLBACK mode and for
+-- revision checks.  doc_id is the stable rowid the FTS rows mirror.
+-- Rows are never deleted in this slice (canonical jobs are never deleted).
+CREATE TABLE job_search_docs (
+    doc_id INTEGER PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+    title TEXT NOT NULL DEFAULT '',
+    company TEXT NOT NULL DEFAULT '',
+    description_text TEXT NOT NULL DEFAULT '',
+    locations_text TEXT NOT NULL DEFAULT '',
+    fact_text TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+-- Per-job index revision state: re-indexing is a no-op while the indexed
+-- content hash matches the current canonical content, so maintenance never
+-- duplicates or loses rows.  Rows are never deleted in this slice (canonical
+-- jobs are never deleted); plain FK references keep the integrity boundary
+-- tight and no trigger is bypassed by a cascading delete (SQLite fires no
+-- triggers for FK actions).
+CREATE TABLE job_search_state (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+    indexed_content_hash TEXT NOT NULL,
+    indexed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Capability honesty (01 §45): exactly one row records which search engine is
+-- active and why.  FTS5_ACTIVE is recorded only when the FTS5 objects were
+-- really provisioned; SUBSTRING_FALLBACK always carries the warning.
+CREATE TABLE search_capability (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    mode TEXT NOT NULL
+        CHECK (mode IN ('FTS5_ACTIVE', 'SUBSTRING_FALLBACK')),
+    fts5_detected INTEGER NOT NULL,
+    warning TEXT,
+    provisioned_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"""
+) -> None:
+    return sql
+
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1212,6 +1286,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 12, (
-    "Slice 1 ships versions 1-10 (v10 corrective); Slice 2 appends v11, v12"
+assert LATEST_SCHEMA_VERSION == 13, (
+    "Slice 1 ships versions 1-10 (v10 corrective); Slice 2 appends v11-v13"
 )

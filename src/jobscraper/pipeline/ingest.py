@@ -72,18 +72,6 @@ def observation_key(source_id: str, observation, page_cursor_json: str | None) -
     return hashlib.sha256(basis.encode()).hexdigest()
 
 
-def _resolution_event_stage(resolution) -> str:
-    """Map entity-resolution evidence to the truthful durable stage label."""
-    stage = (resolution.guard_evidence or {}).get("stage")
-    if stage == "origin_identity":
-        return "origin_identity_stage2"
-    if stage == "canonical_url":
-        return "canonical_url_stage3"
-    if resolution.guard_fired:
-        return "native_identity_reuse_guard"
-    return "native_identity_stage1"
-
-
 def ingest_observation(
     conn: sqlite3.Connection,
     *,
@@ -155,7 +143,7 @@ def ingest_observation(
             observation.page_cursor_json,
             observation.source_rank_or_order,
             json.dumps(dict(observation.fields or {}), sort_keys=True, default=str),
-            None,
+            None,  # parse_evidence_ref set below with the content hash
             observed_at,
             key,
             fetch_attempt_id,
@@ -177,6 +165,8 @@ def ingest_observation(
 
     normalized = normalize_observation(observation, observed_at=observed_at)
 
+    # 01 §33.1 company resolution runs on normalized evidence plus the §32
+    # origin result; a bare name is never a merge key.
     from jobscraper.pipeline.companies import resolve_company, signals_from
 
     company = resolve_company(
@@ -194,6 +184,36 @@ def ingest_observation(
         "UPDATE job_observations SET parse_evidence_ref = ? WHERE id = ?",
         (normalized.content_hash, observation_id),
     )
+    if normalized.content_cleaning_version is not None:
+        # S2.3 (01 §34): the deterministic cleaning outcome is durable,
+        # append-only evidence on the observation that produced it — version,
+        # shape summary and the hash of the stored text.  The raw text is
+        # never retained here (review can re-derive from the observation's
+        # own retained payload when present).
+        conn.execute(
+            "INSERT INTO acquisition_evidence (id, request_id, attempt_id,"
+            " observation_id, kind, ref, detail_json, content_hash,"
+            " observed_at, created_at) VALUES (?, ?, ?, ?, 'CONTENT_CLEANING',"
+            " ?, ?, ?, ?, ?)",
+            (
+                new_id("ev"),
+                request_id,
+                attempt_id,
+                observation_id,
+                normalized.content_cleaning_version,
+                bounded_json(
+                    {
+                        "description_text_chars": len(normalized.description_text or ""),
+                        "description_md_chars": len(normalized.description_md or ""),
+                        "language": normalized.description_lang,
+                        "description_hash": normalized.description_hash,
+                    }
+                ),
+                normalized.description_hash,
+                observed_at,
+                now,
+            ),
+        )
     for evidence in observation.field_evidence:
         stored_excerpt, excerpt_hash = excerpt_and_hash(evidence.excerpt)
         conn.execute(
@@ -216,6 +236,8 @@ def ingest_observation(
                 evidence.evidence_start,
                 evidence.evidence_end,
                 evidence.source_url,
+                # hashed over what is *stored*, so a reader can verify the
+                # excerpt in this row instead of chasing a dropped remainder
                 excerpt_hash,
             ),
         )
@@ -243,6 +265,8 @@ def ingest_observation(
     else:
         job_id = resolution.job_id
         if company.company_id:
+            # a company identified later (or a job created before company
+            # resolution existed) is filled in once, never re-pointed
             conn.execute(
                 "UPDATE jobs SET company_id = ?, updated_at = ?"
                 " WHERE id = ? AND company_id IS NULL",
@@ -257,7 +281,7 @@ def ingest_observation(
             new_id("ere"),
             observation_id,
             job_id,
-            _resolution_event_stage(resolution),
+            "native_identity_reuse_guard" if resolution.guard_fired else "native_identity_stage1",
             resolution.decision,
             None,
             resolution.reason_code or ("REUSE_GUARD" if resolution.guard_fired else None),
@@ -267,6 +291,9 @@ def ingest_observation(
     )
 
     if origin is not None:
+        # 02 §32: the resolution is durable evidence attached to the
+        # observation it was derived from; it never rewrites that
+        # observation's own recorded URLs.
         conn.execute(
             "INSERT INTO acquisition_evidence (id, request_id, attempt_id,"
             " observation_id, kind, ref, detail_json, content_hash,"
@@ -296,6 +323,9 @@ def ingest_observation(
         generation=resolution.generation,
         observed_at=observed_at,
         now=now,
+        # presence rows are per (job, source, native id): a cross-source
+        # URL match attaches a NEW presence row, never rewrites another
+        # source's presence
         existing=existing_presence if resolution.decision == "MATCHED" else None,
         origin=origin,
         content_kind=content_kind,
@@ -305,6 +335,8 @@ def ingest_observation(
     )
 
     if presence_updated:
+        # RUN-21: only forward-evidence observations re-project canonical
+        # state; a stale observation stays immutable history.
         refresh_canonical_presentation(
             conn,
             job_id,
@@ -313,6 +345,9 @@ def ingest_observation(
             fresh_presence_id=presence_id,
         )
 
+    # Atomic downstream obligations for the accepted observation (RUN-08:
+    # created in the same fenced transaction; they drain as host-native
+    # requests even after cancellation).
     for request_type in ("RECONCILE", "ELIGIBILITY", "SCORE"):
         enqueue_request(
             conn,
@@ -324,7 +359,7 @@ def ingest_observation(
             target_identity=observation_id,
             logical_key=normalized.content_hash,
             payload={"observation_id": observation_id, "job_id": job_id},
-            priority=-10,
+            priority=-10,  # host-native obligations drain after acquisition work
             commit=False,
         )
 
@@ -446,7 +481,7 @@ def _upsert_presence(
                 binding_id,
                 observation.source_job_id,
                 generation,
-                observation.raw_url,
+                observation.raw_url,  # discovery URL: never overwritten later
                 observation.raw_url,
                 observation.canonical_url_candidate,
                 observation.application_url_candidate,
@@ -465,6 +500,8 @@ def _upsert_presence(
         )
         return presence_id, updated
 
+    # RUN-21: an older observation processed late must not regress the
+    # presence projection.
     if observed_at < (existing["last_seen_at"] or ""):
         return existing["id"], False
 
@@ -532,6 +569,9 @@ def _quality_fields(
     """Presence-level §39 quality inputs, stored so selection is replayable."""
     from jobscraper.pipeline.provenance import classify_source_quality
 
+    # the host question is about the *posting link* versus the source's own
+    # host (01 §39 employer-vs-aggregator); the caller passes it explicitly,
+    # falling back to what the §32 resolver recorded
     same_host = (
         same_host_as_source
         if same_host_as_source is not None
@@ -544,6 +584,7 @@ def _quality_fields(
         content_kind=content_kind,
         same_host_as_source=bool(same_host),
         source_family=source_family,
+        # what §32 recorded: is the resolved origin on the source's own host?
         origin_on_source_host=(
             None if origin is None else getattr(origin, "same_host_as_source", None)
         ),
@@ -554,8 +595,17 @@ def _quality_fields(
 
 
 def _origin_fields(origin: OriginResolution | None, *, resolved_at: str) -> tuple:
-    """Presence-level origin columns (02 §32)."""
+    """Presence-level origin columns (02 §32).
+
+    An unresolved resolution writes NULLs: nothing is guessed, and an existing
+    resolved origin is never erased by a later unresolved sighting (COALESCE in
+    the UPDATE).  The resolved URL itself stays inside the evidence rows —
+    ``job_sources.origin_url`` remains reserved for canonical URL selection
+    (03 §39), so the resolver never overloads it.
+    """
     if origin is None or origin.status is not OriginStatus.RESOLVED:
+        # {} is honest here: an unresolved sighting has no resolution to
+        # record, and the column is NOT NULL by contract.
         return (None, None, None, None, "{}", None)
     return (
         origin.origin_provider,

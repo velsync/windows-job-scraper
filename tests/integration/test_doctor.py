@@ -56,9 +56,15 @@ def test_doctor_healthy_root(tmp_path):
         "browser_worker",
         "free_disk",
         "timezone",
+        # S2.3: search capability/index state (FTS5 active once the migrated
+        # database exists; WARN never FAIL when not provisioned yet)
+        "search_index",
         "resource_manifest",
     }
     assert set(by_name) == expected
+    # An initialized root provisions search with FTS5 on first launch, so the
+    # healthy Doctor run reports FTS5 active (never a FAIL, never silent).
+    assert by_name["search_index"].status in ("PASS", "WARN")
     # Healthy: no FAIL anywhere.
     failures = [r for r in results if r.status == "FAIL"]
     assert not failures, [(r.name, r.summary) for r in failures]
@@ -71,6 +77,26 @@ def test_doctor_healthy_root(tmp_path):
     # Browser runtime is either PASS (runtime present) or an *explained* WARN
     # (runtime not installed yet) — never an unexplained FAIL (asserted above).
     assert by_name["browser_worker"].status in ("PASS", "WARN")
+
+
+def test_doctor_search_index_is_an_honest_warn_on_older_schema(tmp_path):
+    """A pre-v13 database has no search tables yet — that is a WARN with an
+    actionable migration hint, never a cryptic FAIL."""
+    from jobscraper.db.connection import Database
+    from jobscraper.db.migrations import migrate_schema
+
+    root = tmp_path / "older-schema"
+    paths = build_app_paths(root)
+    ensure_app_directories(paths)
+    db = Database(paths.database_file)
+    try:
+        migrate_schema(db.conn, 12)  # accepted Slice-1/S2.2 schema, no v13
+    finally:
+        db.close()
+    results = run_doctor(AppConfig(data_root=root))
+    check = next(r for r in results if r.name == "search_index")
+    assert check.status == "WARN"
+    assert "migrates and provisions" in check.summary
 
 
 def test_doctor_broken_database_is_actionable(tmp_path):
