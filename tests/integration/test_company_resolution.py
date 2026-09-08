@@ -90,7 +90,6 @@ def test_same_ats_board_attaches_even_when_the_display_name_differs(db):
     assert second.decision == "ATTACHED"
     assert second.matched_on == "ATS_BOARD"
     assert second.name_conflict is True
-    # the recorded display name is never rewritten by a later sighting
     assert db.conn.execute(
         "SELECT name FROM companies WHERE id = ?", (first.company_id,)
     ).fetchone()["name"] == "Acme Data"
@@ -98,7 +97,6 @@ def test_same_ats_board_attaches_even_when_the_display_name_differs(db):
 
 def test_bare_normalized_name_alone_never_merges(db):
     first = _resolve(db.conn, ats_provider="GREENHOUSE", ats_board="acme")
-    # same normalized name, no board, an unrelated careers host
     second = _resolve(db.conn, application_host="other-careers.example")
     assert second.company_id != first.company_id
     assert second.decision == "NAME_ONLY_NEW_COMPANY"
@@ -152,7 +150,6 @@ def test_missing_company_fields_are_filled_in_non_destructively(db):
     ).fetchone()
     assert company["country"] == "DE"
     assert company["last_posting_at"] == NOW
-    # a later sighting without a country must not clear it
     _resolve(db.conn, ats_provider="GREENHOUSE", ats_board="acme", country=None)
     again = db.conn.execute(
         "SELECT country FROM companies WHERE id = ?", (first.company_id,)
@@ -170,33 +167,34 @@ def test_no_usable_signal_yields_no_company_and_records_the_reason(db):
 def test_every_decision_is_durable_evidence(db):
     """The refused merge is as durable as the accepted one.
 
-    The ``observation_id`` link itself is exercised end-to-end in
-    ``test_company_location_provenance.py`` (a real ingest creates the
-    observation), so this test pins the event content without hand-building
-    foreign-key parents.
+    All three calls deliberately use the same timestamp.  Generated evidence
+    IDs are identity, not sequence numbers, so this test must inspect decisions
+    by their semantic key rather than assuming lexicographic ID order equals
+    insertion order.
     """
     first = _resolve(db.conn, ats_provider="GREENHOUSE", ats_board="acme")
     _resolve(db.conn, name="Acme Analytics", ats_provider="GREENHOUSE", ats_board="acme")
-    # an unrelated employer that merely normalizes to the same name
     _resolve(db.conn, application_host="other-careers.example")
-    events = db.conn.execute(
-        "SELECT * FROM company_resolution_events ORDER BY created_at, id"
-    ).fetchall()
-    assert [e["decision"] for e in events] == [
-        "CREATED",
-        "ATTACHED",
-        "NAME_ONLY_NEW_COMPANY",
-    ]
-    assert events[0]["company_id"] == first.company_id
-    assert events[0]["observation_id"] is None
-    assert events[1]["matched_on"] == "ATS_BOARD"
-    assert events[1]["name_conflict"] == 1
-    assert events[1]["reason_code"] == "NAME_CONFLICT_REVIEW"
-    assert events[2]["reason_code"] == "WEAK_EVIDENCE_NO_MERGE"
-    assert events[2]["company_id"] != first.company_id
+
+    events = db.conn.execute("SELECT * FROM company_resolution_events").fetchall()
+    by_decision = {e["decision"]: e for e in events}
+    assert set(by_decision) == {"CREATED", "ATTACHED", "NAME_ONLY_NEW_COMPANY"}
+
+    created = by_decision["CREATED"]
+    attached = by_decision["ATTACHED"]
+    refused = by_decision["NAME_ONLY_NEW_COMPANY"]
+
+    assert created["company_id"] == first.company_id
+    assert created["observation_id"] is None
+    assert attached["matched_on"] == "ATS_BOARD"
+    assert attached["name_conflict"] == 1
+    assert attached["reason_code"] == "NAME_CONFLICT_REVIEW"
+    assert refused["reason_code"] == "WEAK_EVIDENCE_NO_MERGE"
+    assert refused["company_id"] != first.company_id
+
     import json
 
-    assert json.loads(events[1]["signals_json"])["ats_board"] == "acme"
+    assert json.loads(attached["signals_json"])["ats_board"] == "acme"
     assert all(e["resolution_version"] == COMPANY_RESOLUTION_VERSION for e in events)
 
 
@@ -221,12 +219,7 @@ def test_structured_organization_domains_are_honoured(db):
 
 
 def test_late_older_sighting_never_moves_last_posting_backwards(db):
-    """``last_posting_at`` is a *last* posting stamp, not a write stamp.
-
-    Sources are re-observed out of order (a low-priority page arriving late),
-    so an attach carrying an older observation must not walk the company's
-    recency backwards — a monotone ``MAX`` keeps the freshest evidence.
-    """
+    """``last_posting_at`` is a *last* posting stamp, not a write stamp."""
     fresh = resolve_company(
         db.conn,
         signals=_signals(careers_url="https://careers.acme.example/jobs"),
