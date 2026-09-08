@@ -26,23 +26,28 @@ PROMOTION PENDING.**
   until that run passes and its evidence is committed. No claim of promotion
   is made anywhere in this repository.
 
+Status update (2026-09-08, docs-only correction): the former "CI activation
+pending / workflow parked" statement below is stale. `.github/workflows/ci.yml`
+is now active in the repository, and GitHub Actions is green on both Ubuntu
+and Windows (Python 3.12) across the accepted Slice-0 foundation and the
+Slice-1 lineage (including the S1.1 v10 corrective at `a0caae6`). The
+remaining blocker is exclusively the packaged native-Windows
+`--target exe` acceptance run; Slice 0 is therefore **not** claimed as fully
+native-promoted.
+
 Outstanding for promotion (blockers):
 
-1. **CI activation**: the workflow is parked at `build/ci/ci.yml`; the current
-   automation token cannot push `.github/workflows/*` (GitHub App without
-   workflows permission). Activation is one manual `git mv` by a credentialed
-   operator — instructions in `build/ci/README.md`.
-2. **Native Windows execution**: on a Windows host (locally or via the
-   activated CI), build the onedir package with `build/jobscraper.spec` and
-   run `scripts/native_acceptance.py --target exe --evidence-dir <dir>`.
+1. **Native Windows packaged execution**: on a Windows host (locally or via
+   CI), build the onedir package with `build/jobscraper.spec` and run
+   `scripts/native_acceptance.py --target exe --evidence-dir <dir>`.
    W0-13/W0-17 and the packaged-launch checks (W0-01 etc. against the exe)
    can only fully run there. Commit the evidence JSON (it contains no secret
    material by construction; verify before committing).
-3. Dev-host constraints that forced NOT_RUN/local-only proof: PyInstaller
+2. Dev-host constraints that forced NOT_RUN/local-only proof: PyInstaller
    cannot build locally (system Python is statically linked, no shared
    libpython, distro mirrors blocked) and Chromium cannot be downloaded
    (Playwright CDN blocked). Both are environment limits, not implementation
-   gaps; both are covered by the parked Windows CI.
+   gaps; both are covered by the active Windows CI.
 
 ## 2. Corrective review findings and fixes (this session's review pass)
 
@@ -121,10 +126,11 @@ machinery, no scheduler, no scraping, no LLM, no browser beyond the inert
 protocol smoke. Facilities that later slices will reuse (SQLite foundation
 with backup-before-migration, event log, redaction, security shell, launcher
 lifecycle, browser-worker process isolation, Doctor) are all Slice-0 scope
-per the plan. The only forward-looking artifacts are the parked CI workflow
-(which also contains the Windows packaged-build verification job) and the
-native acceptance harness — both acceptance infrastructure, not product
-scope creep.
+per the plan. The only forward-looking artifacts are the CI workflow
+(activated after this review at `.github/workflows/ci.yml`; it also contains
+the Windows browser-runtime install and inert smoke) and the native
+acceptance harness — both acceptance infrastructure, not product scope
+creep.
 
 ## 6. Residual known limitations (explicit, not hidden)
 

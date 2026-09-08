@@ -95,7 +95,11 @@ forward-only migrations on top):
 - Applications: `applications`, `application_events`, `documents`.
 
 Rules: forward-only via existing migration machinery (backup-before-migrate,
-integrity/FK gates); `job_sources.job_id` nullable until entity resolution;
+integrity/FK gates); `job_sources.job_id` is `NOT NULL` — per normative
+RUN-11 ordering, canonical entity resolution establishes the canonical
+`job_id` first and the initial `job_sources` source-presence row is created
+afterwards, so a nullable `job_id` is not required (entity resolution and
+first source-presence creation should be atomic where practical);
 no application status in `jobs`; availability fields per RUN-11/RUN-13.
 Tests: migration up/down-integrity, RUN-18 uniqueness violations rejected,
 slice-boundary (no Slice 2 tables).
