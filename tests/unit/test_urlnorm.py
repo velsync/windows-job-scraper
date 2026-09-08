@@ -54,7 +54,7 @@ def test_html_and_json_escapes_decoded():
     a = url_identity("https://example.com/jobs?x=1&amp;y=2")
     b = url_identity("https://example.com/jobs?x=1&y=2")
     assert a == b
-    c = url_identity("https:\\/\\/example.com\/jobs?x=1")
+    c = url_identity(r"https:\/\/example.com\/jobs?x=1")
     assert c == "https://example.com/jobs?x=1"
 
 
