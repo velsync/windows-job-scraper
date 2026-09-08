@@ -20,6 +20,7 @@ old-port impersonation all fail validation and enter bounded recovery.
 from __future__ import annotations
 
 import json
+import os
 import secrets as _secrets
 import subprocess
 import sys
@@ -193,10 +194,17 @@ def request_bootstrap_ticket(
 
 
 def open_dashboard(port: int, ticket: str, *, host: str = "127.0.0.1") -> str:
-    """Build and open the one-time bootstrap URL. The ticket is a fragment,
-    never a query/path component, so it is not sent in HTTP request lines."""
+    """Build and normally open the one-time bootstrap URL.
+
+    The ticket is a fragment, never a query/path component, so it is not sent
+    in HTTP request lines. Automated gates/tests may set the internal
+    ``WJS_SUPPRESS_BROWSER_OPEN=1`` process environment flag to exercise the
+    real launcher flow without creating user-visible browser tabs. Normal
+    application launches do not set that flag and keep the required behavior.
+    """
     import webbrowser
 
     url = f"http://{host}:{int(port)}/#bootstrap={ticket}"
-    webbrowser.open(url)
+    if os.environ.get("WJS_SUPPRESS_BROWSER_OPEN") != "1":
+        webbrowser.open(url)
     return url
