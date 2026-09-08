@@ -111,6 +111,13 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/redirect-denied-feed"):
+            # redirect hop to a TEST-NET destination: policy-denied
+            # mid-chain (the initial loopback URL is granted)
+            self.send_response(302)
+            self.send_header("Location", "http://192.0.2.9/evil")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif self.path.startswith("/loginfeed"):
             body = b"<html><title>Sign in</title><input type='password'></html>"
             self.send_response(200)
@@ -402,3 +409,45 @@ def test_driver_lease_loss_stops_cleanly(db, server):
     assert all(r["status"] == "RETRY_WAIT" for r in req)
     assert db.conn.execute("SELECT COUNT(*) FROM job_observations").fetchone()[0] == 0
     assert db.conn.execute("SELECT COUNT(*) FROM fetch_attempts").fetchone()[0] == 0
+
+
+def test_driver_redirect_denied_is_partial_and_grants_no_absence_authority(db, server):
+    """§21/RUN-13 regression: a mid-chain policy denial carries the hop's
+    status code but no page.  The run must end PARTIAL with coverage
+    PARTIAL — never a terminal EMPTY that would grant absence authority
+    over jobs the run never actually enumerated."""
+    db.conn.execute(
+        "UPDATE source_adapter_binding_revisions SET config_json = ?"
+        " WHERE id = 'bndrev-1'",
+        (json.dumps({
+            "url_template": f"http://127.0.0.1:{server.server_address[1]}"
+            "/redirect-denied-feed?page={page}",
+            "items_path": "jobs",
+            "fields": {"source_job_id": {"path": "id", "required": True},
+                        "title": {"path": "title", "required": True}},
+        }),),
+    )
+    db.conn.commit()
+    run_id = _start_run(db)
+    status = execute_run(db.conn, run_id)
+    assert status == "PARTIAL"
+    req = db.conn.execute(
+        "SELECT status, page_class FROM scrape_requests WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    assert req["status"] == "SUCCEEDED"  # definitive answer, no retry storm
+    assert req["page_class"] == "UNKNOWN"
+    fa = db.conn.execute(
+        "SELECT failure_kind FROM fetch_attempts WHERE request_id ="
+        " (SELECT id FROM scrape_requests WHERE run_id = ?)",
+        (run_id,),
+    ).fetchone()
+    assert fa["failure_kind"] == "POLICY_REJECTED"
+    cov = db.conn.execute("SELECT * FROM enumeration_coverage").fetchone()
+    assert cov["completion_state"] == "PARTIAL"
+    assert cov["terminal_enumeration_proven"] == 0
+    assert db.conn.execute("SELECT COUNT(*) FROM job_observations").fetchone()[0] == 0
+    group = db.conn.execute(
+        "SELECT group_outcome FROM run_source_plans WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    assert group["group_outcome"] == "SATISFIED_PARTIAL"

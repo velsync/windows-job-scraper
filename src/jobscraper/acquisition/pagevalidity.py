@@ -114,6 +114,16 @@ def classify_page(
     if status == 410:
         return PageClassification(PageClass.JOB_CLOSED, evidence)
 
+    if result.failure is not None:
+        # A failed fetch never classifies as valid content or as an
+        # authoritative EMPTY page.  A mid-chain redirect denial (or any
+        # other typed failure that recorded a hop status) must not grant
+        # terminal-enumeration/absence authority (§21, RUN-13): only the
+        # explicit status-driven states above may classify a failed
+        # envelope; everything else is UNKNOWN with typed evidence.
+        evidence["failure_kind"] = result.failure.kind.value
+        return PageClassification(PageClass.UNKNOWN, evidence)
+
     if expect_host:
         from jobscraper.net.urlnorm import normalize_url
 

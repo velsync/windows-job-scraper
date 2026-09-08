@@ -78,6 +78,12 @@ class _FixtureHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(302)
             self.send_header("Location", "/redirect-loop")
             self.end_headers()
+        elif self.path == "/redirect-denied":
+            # redirect to a destination outside every policy (TEST-NET-1):
+            # the hop itself is policy-denied mid-chain
+            self.send_response(302)
+            self.send_header("Location", "http://192.0.2.9/feed")
+            self.end_headers()
         elif self.path == "/redirect-offpolicy":
             # redirect to a loopback port that is NOT running (still loopback:
             # policy would allow it via the grant; we point at a dead port to
@@ -275,6 +281,20 @@ def test_redirect_cap_enforced(server):
     result = execute_request(_envelope(server, "/redirect-loop"), _policy())
     assert result.failure is not None
     assert result.failure.kind == FailureKind.POLICY_REJECTED
+
+
+def test_policy_denied_redirect_is_not_an_authoritative_empty_page(server):
+    # §21/RUN-13: a mid-chain denial carries the hop's status code but no
+    # usable page; it must classify UNKNOWN with typed failure evidence —
+    # never EMPTY, which would grant terminal-enumeration/absence
+    # authority to a fetch that never reached the source.
+    result = execute_request(_envelope(server, "/redirect-denied"), _policy())
+    assert result.failure is not None
+    assert result.failure.kind == FailureKind.POLICY_REJECTED
+    assert result.status_code is not None  # the redirect hop's status
+    cls = classify_page(result, expect="LIST")
+    assert cls.state == PageClass.UNKNOWN
+    assert cls.evidence.get("failure_kind") == "POLICY_REJECTED"
 
 
 def test_redirect_to_denied_destination_rejected(server):
