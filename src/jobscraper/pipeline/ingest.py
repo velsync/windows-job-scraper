@@ -72,6 +72,18 @@ def observation_key(source_id: str, observation, page_cursor_json: str | None) -
     return hashlib.sha256(basis.encode()).hexdigest()
 
 
+def _resolution_event_stage(resolution) -> str:
+    """Map entity-resolution evidence to the truthful durable stage label."""
+    stage = (resolution.guard_evidence or {}).get("stage")
+    if stage == "origin_identity":
+        return "origin_identity_stage2"
+    if stage == "canonical_url":
+        return "canonical_url_stage3"
+    if resolution.guard_fired:
+        return "native_identity_reuse_guard"
+    return "native_identity_stage1"
+
+
 def ingest_observation(
     conn: sqlite3.Connection,
     *,
@@ -281,7 +293,7 @@ def ingest_observation(
             new_id("ere"),
             observation_id,
             job_id,
-            "native_identity_reuse_guard" if resolution.guard_fired else "native_identity_stage1",
+            _resolution_event_stage(resolution),
             resolution.decision,
             None,
             resolution.reason_code or ("REUSE_GUARD" if resolution.guard_fired else None),
