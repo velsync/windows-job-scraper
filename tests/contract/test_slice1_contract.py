@@ -152,8 +152,10 @@ def test_only_pipeline_writes_canonical_jobs():
     for path in SRC.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
         if re.search(r"INSERT INTO jobs\b", text):
-            writers.append(path.relative_to(REPO_ROOT))
-    assert all(str(w).startswith("src/jobscraper/pipeline/") for w in writers), writers
+            # as_posix(): the assertion must not depend on the host's
+            # path separator (windows-latest str() yields backslashes)
+            writers.append(path.relative_to(REPO_ROOT).as_posix())
+    assert all(w.startswith("src/jobscraper/pipeline/") for w in writers), writers
 
 
 def test_playwright_stays_in_the_browser_worker():
