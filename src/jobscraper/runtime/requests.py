@@ -101,6 +101,7 @@ def enqueue_request(
     logical_key: str | None = None,
     max_attempts: int = 3,
     now: str | None = None,
+    commit: bool = True,
 ) -> tuple[str, bool]:
     """Enqueue one durable request; idempotent per (run, unique key).
 
@@ -151,9 +152,11 @@ def enqueue_request(
             "SELECT id FROM scrape_requests WHERE run_id = ? AND request_unique_key = ?",
             (run_id, key),
         ).fetchone()
-        conn.commit()
+        if commit:
+            conn.commit()
         return existing["id"], False
-    conn.commit()
+    if commit:
+        conn.commit()
     return request_id, True
 
 
