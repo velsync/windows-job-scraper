@@ -52,6 +52,12 @@ def initialize_root(data_root: Path) -> None:
     """One real launcher run so the root has DB + secret (then stopped)."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(SRC) + os.pathsep + env.get("PYTHONPATH", "")
+    popen_kwargs: dict[str, object] = {}
+    if os.name == "nt":
+        # Windows has no cooperative SIGTERM via Popen. Create a dedicated
+        # process group so CTRL_BREAK_EVENT reaches the launcher, which can
+        # then stop its owned service and release the single-instance mutex.
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     launcher = subprocess.Popen(
         [sys.executable, "-m", "jobscraper", "--data-root", str(data_root), "--print-url"],
         cwd=str(REPO_ROOT),
@@ -59,6 +65,7 @@ def initialize_root(data_root: Path) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        **popen_kwargs,
     )
     try:
         deadline = time.time() + 90
@@ -70,7 +77,10 @@ def initialize_root(data_root: Path) -> None:
                 return
     finally:
         if launcher.poll() is None:
-            launcher.send_signal(signal.SIGTERM if os.name != "nt" else subprocess.SIGTERM)
+            if os.name == "nt":
+                launcher.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                launcher.terminate()
             try:
                 launcher.wait(timeout=30)
             except subprocess.TimeoutExpired:  # pragma: no cover
