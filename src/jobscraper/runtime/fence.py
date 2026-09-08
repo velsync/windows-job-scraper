@@ -24,6 +24,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 
 from jobscraper.runtime.claims import StaleOwnership, _add_seconds
+from jobscraper.runtime.requests import ACQUISITION_REQUEST_TYPES
 from jobscraper.runtime.clock import db_utc_now
 
 _TERMINAL_OUTCOMES = frozenset({"SUCCEEDED", "RETRY_WAIT"})
@@ -50,6 +51,21 @@ def fenced_commit(
     if outcome not in _TERMINAL_OUTCOMES:
         raise ValueError(f"fenced outcome must be one of {sorted(_TERMINAL_OUTCOMES)}")
     ts = now or db_utc_now(conn)
+    # §18: cancellation invalidates terminal commits for source-network
+    # acquisition work; host-native obligations keep draining locally (they
+    # never initiate source I/O).
+    request_type_row = conn.execute(
+        "SELECT request_type FROM scrape_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    request_type = request_type_row["request_type"] if request_type_row else ""
+    cancellation_guard = (
+        ""
+        if request_type not in ACQUISITION_REQUEST_TYPES
+        else """
+              AND NOT EXISTS (
+                  SELECT 1 FROM scrape_runs r WHERE r.id = scrape_requests.run_id
+                    AND r.cancel_requested_at IS NOT NULL)"""
+    )
     conn.execute("BEGIN IMMEDIATE")
     try:
         verified = conn.execute(
@@ -58,10 +74,7 @@ def fenced_commit(
             SET heartbeat_at = ?, updated_at = ?
             WHERE id = ? AND status = 'RUNNING' AND current_attempt_id = ?
               AND lease_until > ?
-              AND NOT EXISTS (
-                  SELECT 1 FROM scrape_runs r WHERE r.id = scrape_requests.run_id
-                    AND r.cancel_requested_at IS NOT NULL)
-            """,
+            """ + cancellation_guard,
             (ts, ts, request_id, attempt_id, ts),
         )
         if verified.rowcount != 1:

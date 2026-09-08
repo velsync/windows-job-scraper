@@ -81,12 +81,22 @@ def claim_next_request(
     *,
     now: str | None = None,
     lease_window_s: float = DEFAULT_LEASE_WINDOW_S,
+    types: frozenset[str] | None = None,
 ) -> Claim | None:
     """Atomically claim the next eligible request (single winner)."""
     ts = now or db_utc_now(conn)
     attempt_id = new_id("att")
     conn.execute("BEGIN IMMEDIATE")
     try:
+        type_filter = ""
+        params: list = []
+        if types:
+            type_filter = (
+                " AND req.request_type IN ("
+                + ", ".join("?" for _ in sorted(types))
+                + ")"
+            )
+            params.extend(sorted(types))
         candidates = conn.execute(
             """
             SELECT req.id, req.status, req.next_retry_at, req.request_type,
@@ -98,9 +108,11 @@ def claim_next_request(
             JOIN sources s ON s.id = req.source_id
             JOIN source_adapter_bindings b ON b.id = req.binding_id
             WHERE req.status IN ('PENDING', 'RETRY_WAIT')
+            """ + type_filter + """
             ORDER BY req.priority DESC, req.created_at ASC, req.id ASC
             LIMIT 100
-            """
+            """,
+            params,
         ).fetchall()
         chosen = next((row for row in candidates if _claimable(row, ts)), None)
         if chosen is None:
