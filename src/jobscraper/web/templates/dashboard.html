@@ -17,15 +17,45 @@
     </form>
   </header>
   <main>
-    <section class="card" id="status-card">
-      <h2>Service status</h2>
-      <p>Slice 0 foundation shell. Local service is running and authenticated.</p>
-      <ul class="meta-list">
-        <li>Application version: <code>{{ app_version }}</code></li>
-        <li>Schema version: <code>{{ schema_version }}</code></li>
-        <li>Service instance: <code>{{ service_instance_id }}</code></li>
-      </ul>
+    <section class="card" id="profiles-card">
+      <h2>Search profiles</h2>
+      <div id="profiles-list"><p class="hint">Loading profiles…</p></div>
+      <form id="profile-form">
+        <input name="name" placeholder="Profile name" required>
+        <input name="keywords" placeholder="keywords, comma separated">
+        <input name="eligible_countries" placeholder="countries, comma separated">
+        <button type="submit">Create profile</button>
+      </form>
     </section>
+
+    <section class="card" id="collect-card">
+      <h2>Collect</h2>
+      <form id="run-form">
+        <select id="run-profile" name="profile_id"><option value="">(no profile)</option></select>
+        <button type="submit">Collect now</button>
+      </form>
+      <div id="run-status"><p class="hint">No run yet.</p></div>
+    </section>
+
+    <section class="card" id="inbox-card">
+      <h2>Inbox</h2>
+      <p class="hint">j/k move · s shortlist · d dismiss · a archive · o open apply link</p>
+      <div id="inbox-profile-select">
+        <select id="inbox-profile"><option value="">Select a profile…</option></select>
+      </div>
+      <ul id="inbox-list" class="inbox-list"></ul>
+    </section>
+
+    <section class="card" id="jobs-card">
+      <h2>Jobs</h2>
+      <div id="job-detail"><p class="hint">Select an inbox item to inspect provenance.</p></div>
+    </section>
+
+    <section class="card" id="applications-card">
+      <h2>Applications</h2>
+      <div id="applications-list"><p class="hint">Select a profile to list applications.</p></div>
+    </section>
+
     <section class="card">
       <h2>Recent events</h2>
       <div hx-get="/api/events" hx-trigger="every 5s" hx-swap="innerHTML">

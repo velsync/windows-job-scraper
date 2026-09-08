@@ -78,6 +78,8 @@ def record_seen_identity(
     stable_source_identity: str,
     generation: int = 1,
     evidence_ref: str | None = None,
+    *,
+    commit: bool = True,
 ) -> None:
     conn.execute(
         """
@@ -89,7 +91,8 @@ def record_seen_identity(
         """,
         (coverage_id, stable_source_identity, generation, evidence_ref),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def finalize_coverage(

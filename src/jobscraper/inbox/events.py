@@ -199,20 +199,27 @@ def expire_snoozes(conn: sqlite3.Connection, *, now: str) -> list[tuple[str, str
 
 
 def inbox_feed(conn: sqlite3.Connection, profile_id: str, *, limit: int = 100):
-    """Current inbox items for a profile: surfaced events joined with the
-    current score/eligibility/disposition, newest first."""
+    """Current inbox items for a profile: one row per job (its latest
+    surfaced event), joined with the current score/eligibility/disposition,
+    newest first."""
     return conn.execute(
         """
         SELECT e.id, e.job_id, e.event_kind, e.created_at, e.surfaced_at,
                j.title, j.listing_status,
                s.score, el.verdict,
                st.disposition, st.snoozed_until
-        FROM job_profile_inbox_events e
+        FROM (
+            SELECT id, job_id, event_kind, created_at, surfaced_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY job_id ORDER BY created_at DESC, id DESC) AS rn
+            FROM job_profile_inbox_events
+            WHERE profile_id = ?
+        ) e
         JOIN jobs j ON j.id = e.job_id
-        LEFT JOIN job_scores s ON s.job_id = e.job_id AND s.profile_id = e.profile_id
-        LEFT JOIN job_eligibility el ON el.job_id = e.job_id AND el.profile_id = e.profile_id
-        LEFT JOIN job_profile_state st ON st.job_id = e.job_id AND st.profile_id = e.profile_id
-        WHERE e.profile_id = ?
+        LEFT JOIN job_scores s ON s.job_id = e.job_id AND s.profile_id = ?
+        LEFT JOIN job_eligibility el ON el.job_id = e.job_id AND el.profile_id = ?
+        LEFT JOIN job_profile_state st ON st.job_id = e.job_id AND st.profile_id = ?
+        WHERE e.rn = 1
           AND COALESCE(st.disposition, 'NONE') NOT IN ('DISMISSED', 'ARCHIVED')
           AND (COALESCE(st.disposition, 'NONE') != 'SNOOZED'
                OR st.snoozed_until IS NULL OR st.snoozed_until <= ?
@@ -220,7 +227,7 @@ def inbox_feed(conn: sqlite3.Connection, profile_id: str, *, limit: int = 100):
         ORDER BY e.created_at DESC, e.id DESC
         LIMIT ?
         """,
-        (profile_id, now_utc(conn), int(limit)),
+        (profile_id, profile_id, profile_id, profile_id, now_utc(conn), int(limit)),
     ).fetchall()
 
 

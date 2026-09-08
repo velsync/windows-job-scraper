@@ -82,6 +82,7 @@ def claim_next_request(
     now: str | None = None,
     lease_window_s: float = DEFAULT_LEASE_WINDOW_S,
     types: frozenset[str] | None = None,
+    run_source_plan_id: str | None = None,
 ) -> Claim | None:
     """Atomically claim the next eligible request (single winner)."""
     ts = now or db_utc_now(conn)
@@ -97,6 +98,9 @@ def claim_next_request(
                 + ")"
             )
             params.extend(sorted(types))
+        if run_source_plan_id:
+            type_filter += " AND req.run_source_plan_id = ?"
+            params.append(run_source_plan_id)
         candidates = conn.execute(
             """
             SELECT req.id, req.status, req.next_retry_at, req.request_type,

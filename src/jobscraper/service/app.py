@@ -375,6 +375,14 @@ def create_service_app(
     async def events_stream(session=Depends(require_session)):
         return sse_response(state.db)
 
+    # ------------------------------------------------- Slice 1 surface (S1.10)
+    from jobscraper.net.safelinks import safe_external_url
+
+    state.templates.env.filters["safelink"] = lambda value: safe_external_url(value) or ""
+    from jobscraper.service.s1_routes import install_slice1_routes
+
+    install_slice1_routes(app, state)
+
     return app, state
 
 
