@@ -144,13 +144,17 @@ class Harness:
 
     def _spawn_env(self) -> dict:
         """W0-17: the app must run without development help (no PYTHONPATH,
-        no venv) — especially for the packaged target."""
+        no venv) — especially for the packaged target. Automated acceptance
+        suppresses the real default-browser side effect while exercising the
+        same launcher/bootstrap flow."""
         if self.target == "exe":
             env = os.environ.copy()
             env.pop("PYTHONPATH", None)
             env.pop("VIRTUAL_ENV", None)
-            return env
-        return getattr(self, "_dev_env", dict(os.environ))
+        else:
+            env = dict(getattr(self, "_dev_env", dict(os.environ)))
+        env["WJS_SUPPRESS_BROWSER_OPEN"] = "1"
+        return env
 
     def record(self, check_id: str, status: str, summary: str, **details) -> None:
         self.results[check_id] = {
@@ -167,12 +171,16 @@ class Harness:
 
     # ------------------------------------------------------------ utilities
     def run_app(self, *args: str, timeout: float = 120) -> subprocess.Popen:
+        popen_kwargs: dict[str, int] = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         return subprocess.Popen(
             self.app_command(*args),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             env=self._spawn_env(),
+            **popen_kwargs,
         )
 
     def launch_and_get_url(self, data_root: Path, timeout: float = 120) -> tuple[subprocess.Popen, str]:
@@ -189,7 +197,10 @@ class Harness:
 
     def stop_launcher(self, launcher: subprocess.Popen) -> None:
         if launcher.poll() is None:
-            launcher.send_signal(signal.SIGTERM if os.name != "nt" else subprocess.SIGTERM)
+            if os.name == "nt":
+                launcher.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                launcher.terminate()
             try:
                 launcher.wait(timeout=30)
             except subprocess.TimeoutExpired:  # pragma: no cover
