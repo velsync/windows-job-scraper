@@ -9,19 +9,24 @@ This repository is the authoritative implementation workspace for Windows Job Sc
 3. Slice 0 execution/acceptance authority:
    - `docs/plans/slice-0-worker-implementation-plan-v0313.md`
    - `docs/plans/slice-0-windows-acceptance-strategy-v0313.md`
-   - `docs/reviews/slice-0-corrective-review-and-status-2026-09-07.md`
+   - `docs/reviews/slice-0-corrective-review-and-status-2026-09-07.md` (historical corrective/pre-promotion record)
 4. Slice 1 execution/status authority:
    - `docs/plans/slice-1-worker-implementation-plan-v0313.md`
-   - `docs/reviews/slice-1-status-report-2026-09-08.md`
+   - `docs/reviews/slice-1-status-report-2026-09-08.md` (historical implementation/corrective/pre-promotion record)
+5. Final Slice 0/1 packaged/native promotion authority:
+   - `docs/reviews/slice-0-1-native-promotion-closure-2026-09-08.md`
+
+Later authority controls where an earlier status record says native promotion is still pending.
 
 Do not redesign the architecture unless a genuine contradiction or implementation blocker is proven and explicitly adjudicated by the architecture reviewer.
 
 ## Current execution state
 
-- Slice 0 implementation and automated verification are complete; packaged native Windows promotion is still pending.
-- Slice 1 implementation and automated acceptance are complete; packaged native Windows promotion is still pending.
-- The current allowed work is bounded corrective, packaging, native Windows acceptance, evidence capture, and authority/governance reconciliation for the accepted Slice 0/1 lineage.
-- **Do not begin Slice 2 implementation** until the remaining native promotion gate is closed and the architecture reviewer explicitly authorizes Slice 2 work.
+- Slice 0 is **PROMOTED**: implementation, automated gate, packaged Windows verification, and W0-01…W0-18 native acceptance are complete.
+- Slice 1 is **ACCEPTED**: implementation, automated acceptance, and W1-01…W1-07 packaged native Windows acceptance are complete.
+- Accepted package build: `onewise-0883c62196a1a4bf`; evidence is committed under `artifacts/slice0/onewise-0883c62196a1a4bf/`.
+- Slice 2 has not started on the accepted lineage. It is no longer blocked by Slice 0/1 native promotion, but work must begin only when explicitly authorized as a bounded v0.3.1.3 package/plan.
+- Do not import, cherry-pick, or count divergent experimental-branch future-slice code as accepted Slice 2 work unless it is explicitly reviewed and reconciled.
 
 ## Worker boundary
 
@@ -34,7 +39,16 @@ Do not redesign the architecture unless a genuine contradiction or implementatio
 - If a normative ambiguity affects implementation, STOP and report it rather than guessing.
 - Never weaken a security/recovery invariant to make a test pass.
 - Never claim PASS without exact command/test evidence.
-- Do not claim native promotion from development-mode or ordinary CI tests alone; packaged Windows W0/W1 acceptance evidence is required.
+- Do not infer a new promotion from ordinary CI alone. Any later behavior-bearing or packaging change must receive the automated/package/native revalidation required by its owning authority before a new promotion claim.
+
+## Accepted Slice 0/1 identifiers
+
+- Packaged source commit: `2bb4f8319a2dfd312db21a19010cb0720359063e`
+- Acceptance-harness commit: `92995d990c224715a3dea18cbf5e7d59f0126053`
+- Native evidence commit: `7def768f75214b692d98efaa0f559e3a22f4f7af`
+- Build ID: `onewise-0883c62196a1a4bf`
+- Build SHA-256: `0883c62196a1a4bf39b3092a1a5068d0cf50a143159823daf3a312e7f54f4dff`
+- Native acceptance: W0 18/18 PASS; W1 7/7 PASS; zero FAIL; zero NOT_RUN
 
 ## Branch/review discipline
 
