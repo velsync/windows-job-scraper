@@ -37,6 +37,7 @@ acceptance strategy. No secret material is ever written to evidence.
 from __future__ import annotations
 
 import argparse
+import csv
 import http.server
 import json
 import os
@@ -118,6 +119,31 @@ class _W1FeedHandler(http.server.BaseHTTPRequestHandler):
 
 def log(message: str) -> None:
     print(f"[native-acceptance] {message}", flush=True)
+
+
+def _process_identity(line: str) -> tuple[str, int] | None:
+    """Return stable (image/command, PID) identity from tasklist/ps output.
+
+    Windows ``tasklist /FO CSV`` includes a volatile memory-usage field, so
+    raw-line comparisons can falsely report an existing Chrome process as a
+    new orphan when only its memory counter changes.  W0-14 compares only
+    stable image/PID identity instead.
+    """
+    text = line.strip()
+    if not text:
+        return None
+    if text.startswith('"'):
+        try:
+            row = next(csv.reader([text]))
+        except (csv.Error, StopIteration):
+            return None
+        if len(row) < 2 or not row[1].isdigit():
+            return None
+        return row[0].lower(), int(row[1])
+    parts = text.split(None, 2)
+    if len(parts) < 2 or not parts[0].isdigit():
+        return None
+    return parts[1].lower(), int(parts[0])
 
 
 class Harness:
@@ -699,8 +725,11 @@ class Harness:
             self.record("W0-13", NOT_RUN, f"browser check could not execute: {exc}")
 
     def w14_browser_cleanup(self) -> str:
-        before = self.chrome_like_processes()
+        before_lines = self.chrome_like_processes()
         try:
+            before = {_process_identity(line) for line in before_lines}
+            if None in before:
+                raise RuntimeError("could not parse pre-smoke process identity")
             from jobscraper.browser_worker.supervisor import BrowserWorkerSupervisor
 
             supervisor = BrowserWorkerSupervisor()
@@ -710,14 +739,19 @@ class Harness:
             finally:
                 supervisor.stop(timeout_s=15)
             time.sleep(2)
-            after = self.chrome_like_processes()
-            # No NEW chrome-like processes may remain.
-            residual = [p for p in after if p not in before]
+            after_lines = self.chrome_like_processes()
+            after = {_process_identity(line) for line in after_lines}
+            if None in after:
+                raise RuntimeError("could not parse post-smoke process identity")
+            # No NEW chrome-like process identity may remain. Memory/session
+            # counters in tasklist output are deliberately ignored.
+            residual = sorted(after - before)
             self.record(
                 "W0-14",
                 PASS if not residual else FAIL,
                 "no orphan browser/worker processes after clean shutdown",
                 residual_count=len(residual),
+                residual_processes=[{"image": image, "pid": pid} for image, pid in residual],
             )
         except Exception as exc:  # noqa: BLE001
             self.record("W0-14", NOT_RUN, f"cleanup check could not execute: {exc}")
