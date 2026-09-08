@@ -238,8 +238,12 @@ def _origin_identity_match(
                 else "ORIGIN_IDENTITY_REVIEW"
             ),
         )
+    # The matched row belongs to a *different source*.  Its generation is the
+    # reuse history of that source/native identity and must never leak into the
+    # newly attached source presence (RUN-15).  Cross-source attachment starts
+    # the new source/native identity at generation 1.
     return EntityResolution(
-        row["job_id"], "MATCHED_ORIGIN", int(row["source_identity_generation"]), False, evidence
+        row["job_id"], "MATCHED_ORIGIN", 1, False, evidence
     )
 
 
