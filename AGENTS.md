@@ -15,8 +15,11 @@ This repository is the authoritative implementation workspace for Windows Job Sc
    - `docs/reviews/slice-1-status-report-2026-09-08.md` (historical implementation/corrective/pre-promotion record)
 5. Final Slice 0/1 packaged/native promotion authority:
    - `docs/reviews/slice-0-1-native-promotion-closure-2026-09-08.md`
+6. Slice 2 execution/corrective authority on the active Slice-2 implementation lineage:
+   - `docs/plans/slice-2-worker-implementation-plan-v0313.md`
+   - `docs/reviews/slice-2-s2.2-corrective-review-2026-09-08.md` (later authority for corrected S2.2 company/origin-resolution behavior)
 
-Later authority controls where an earlier status record says native promotion is still pending.
+Later authority controls where an earlier plan/status note conflicts with an explicit corrective or promotion record.
 
 Do not redesign the architecture unless a genuine contradiction or implementation blocker is proven and explicitly adjudicated by the architecture reviewer.
 
@@ -25,13 +28,14 @@ Do not redesign the architecture unless a genuine contradiction or implementatio
 - Slice 0 is **PROMOTED**: implementation, automated gate, packaged Windows verification, and W0-01…W0-18 native acceptance are complete.
 - Slice 1 is **ACCEPTED**: implementation, automated acceptance, and W1-01…W1-07 packaged native Windows acceptance are complete.
 - Accepted package build: `onewise-0883c62196a1a4bf`; evidence is committed under `artifacts/slice0/onewise-0883c62196a1a4bf/`.
-- Slice 2 has not started on the accepted lineage. It is no longer blocked by Slice 0/1 native promotion, but work must begin only when explicitly authorized as a bounded v0.3.1.3 package/plan.
+- On the active Slice-2 implementation lineage, S2.0–S2.2 are implemented and S2.2 has received the corrective review above. S2.3 is the next bounded package; S2.4+ must not start before S2.3 is implemented and reviewed.
+- Slice 2 is not yet promoted as a whole. Ordinary CI or an intermediate package correction does not constitute Slice-2 promotion.
 - Do not import, cherry-pick, or count divergent experimental-branch future-slice code as accepted Slice 2 work unless it is explicitly reviewed and reconciled.
 
 ## Worker boundary
 
 - Implement or correct one explicitly approved bounded work package at a time.
-- Read the owning v0.3.1.3 normative module(s) and the applicable slice plan/status record before editing.
+- Read the owning v0.3.1.3 normative module(s) and the applicable slice plan/status/corrective record before editing.
 - Use tests first for behavior-bearing code.
 - Do not begin the next package without review.
 - Do not make unrelated cleanup/refactors.
@@ -54,7 +58,7 @@ Do not redesign the architecture unless a genuine contradiction or implementatio
 
 Use a dedicated branch/worktree for each approved package or corrective. Keep commits small enough to review. The architecture reviewer compares the actual diff/tests to the worker report before promotion.
 
-Work only from the accepted Slice 0/1 implementation lineage. Do not treat divergent experimental branches as implementation authority unless they are explicitly reconciled and promoted.
+Work only from the accepted Slice 0/1 implementation lineage plus explicitly reviewed Slice-2 implementation commits. Do not treat divergent experimental branches as implementation authority unless they are explicitly reconciled and promoted.
 
 ## Non-goals
 
