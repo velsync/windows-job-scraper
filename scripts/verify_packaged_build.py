@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -113,17 +114,43 @@ def run_doctor(exe: Path, data_root: Path) -> dict:
     return report
 
 
+def _launcher_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["WJS_SUPPRESS_BROWSER_OPEN"] = "1"
+    return env
+
+
+def _launcher_popen_kwargs() -> dict[str, int]:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {}
+
+
+def _stop_launcher(launcher: subprocess.Popen) -> None:
+    if launcher.poll() is not None:
+        return
+    if os.name == "nt":
+        launcher.send_signal(signal.CTRL_BREAK_EVENT)
+    else:
+        launcher.terminate()
+    try:
+        launcher.wait(timeout=30)
+    except subprocess.TimeoutExpired:  # pragma: no cover
+        launcher.kill()
+        launcher.wait()
+
+
 def initialize_root(exe: Path, data_root: Path) -> None:
     """Run the packaged launcher once so the root is initialized (DB, secret),
     then stop it. Doctor on a virgin root correctly reports 'not initialized';
     the packaged acceptance exercises the initialized state."""
-    import signal
-
     launcher = subprocess.Popen(
         [str(exe), "--data-root", str(data_root), "--print-url"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        env=_launcher_env(),
+        **_launcher_popen_kwargs(),
     )
     try:
         deadline = time.time() + 90
@@ -138,24 +165,18 @@ def initialize_root(exe: Path, data_root: Path) -> None:
         if not url:
             raise SystemExit("packaged launcher never produced a dashboard URL")
     finally:
-        if launcher.poll() is None:
-            launcher.send_signal(signal.SIGTERM if os.name != "nt" else subprocess.SIGTERM)
-            try:
-                launcher.wait(timeout=30)
-            except subprocess.TimeoutExpired:  # pragma: no cover
-                launcher.kill()
-                launcher.wait()
+        _stop_launcher(launcher)
 
 
 def verify_packaged_bootstrap(exe: Path, data_root: Path) -> dict:
     """Full packaged launcher→service→dashboard chain proof."""
-    import signal
-
     launcher = subprocess.Popen(
         [str(exe), "--data-root", str(data_root), "--print-url"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
+        env=_launcher_env(),
+        **_launcher_popen_kwargs(),
     )
     evidence: dict = {}
     try:
@@ -201,13 +222,7 @@ def verify_packaged_bootstrap(exe: Path, data_root: Path) -> dict:
         except urllib.error.HTTPError as exc:
             evidence["private_route_denied_without_session"] = exc.code == 401
     finally:
-        if launcher.poll() is None:
-            launcher.send_signal(signal.SIGTERM if os.name != "nt" else subprocess.SIGTERM)
-            try:
-                launcher.wait(timeout=30)
-            except subprocess.TimeoutExpired:  # pragma: no cover
-                launcher.kill()
-                launcher.wait()
+        _stop_launcher(launcher)
     return evidence
 
 
