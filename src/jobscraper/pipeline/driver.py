@@ -57,7 +57,11 @@ from jobscraper.pipeline.coverage import (
 )
 from jobscraper.pipeline.ingest import ingest_observation
 from jobscraper.pipeline.obligations import drain_all_obligations
-from jobscraper.runtime.claims import claim_next_request
+from jobscraper.runtime.cancellation import (
+    abandon_request_for_cancellation,
+    run_is_cancelled,
+)
+from jobscraper.runtime.claims import StaleOwnership, claim_next_request, reclaim_expired
 from jobscraper.runtime.fence import fenced_commit
 from jobscraper.runtime.requests import (
     ACQUISITION_REQUEST_TYPES,
@@ -250,6 +254,10 @@ def _execute_plan(
     pages = 0
     outcome = None
     while pages < MAX_PAGES_PER_RUN:
+        if run_is_cancelled(conn, run_id):
+            # §18: no new acquisition driving once cancellation is durable
+            outcome = "CANCELLED"
+            break
         claim = claim_next_request(
             conn, worker_id, now=db_utc_now(conn), types=ACQUISITION_REQUEST_TYPES,
             run_source_plan_id=plan_row["id"],
@@ -365,10 +373,27 @@ def _execute_plan(
                 return
             signal["value"] = "INVALID"
 
-        with fenced_commit(
-            conn, claim.request_id, claim.attempt_id, now=ts, mutate=mutate
-        ):
-            pass
+        try:
+            with fenced_commit(
+                conn, claim.request_id, claim.attempt_id, now=ts, mutate=mutate
+            ):
+                pass
+        except StaleOwnership:
+            if run_is_cancelled(conn, run_id):
+                # §18: the fence refused a late acquisition commit; this
+                # page's outputs were rolled back, the worker cooperatively
+                # abandons the request, and the plan ends CANCELLED.
+                abandon_request_for_cancellation(
+                    conn, claim.request_id, now=db_utc_now(conn)
+                )
+                outcome = "CANCELLED"
+                break
+            # Ownership lost without cancellation (expired lease): an
+            # expired lease is already lost ownership (RUN-07), so the
+            # expired request is reclaimed for retry and the driver stops
+            # claiming this plan rather than reviving the dead lease.
+            reclaim_expired(conn)
+            break
 
         pages += 1
         if signal.get("value") == "EMPTY":
@@ -382,12 +407,19 @@ def _execute_plan(
     if outcome is None:
         outcome = "SATISFIED_PARTIAL" if pages else "FAILED"
 
+    stop_reason = (
+        "terminal cursor"
+        if terminal
+        else "cancelled"
+        if outcome == "CANCELLED"
+        else "driver stop"
+    )
     try:
         finalize_coverage(
             conn,
             coverage_id,
             completion_state="COMPLETE" if terminal else "PARTIAL",
-            stop_reason="terminal cursor" if terminal else "driver stop",
+            stop_reason=stop_reason,
             terminal_enumeration_proven=terminal,
             pages_completed=pages,
             now=db_utc_now(conn),

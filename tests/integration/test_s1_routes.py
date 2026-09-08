@@ -227,9 +227,65 @@ def test_run_cancel(service):
     client = _client(service)
     profile = client.post("/api/profiles", json={"name": "P", "min_score_inbox": 0}).json()
     run = client.post("/api/runs", json={"profile_id": profile["id"]}).json()
+    # the run already finished synchronously: cancelling it must not
+    # rewrite the durable outcome — the response is the honest status
     cancelled = client.post(f"/api/runs/{run['run_id']}/cancel")
     assert cancelled.status_code == 200
-    assert cancelled.json()["status"] == "CANCELLED"
+    assert cancelled.json()["status"] == run["status"]
+    # a second cancel is idempotent, and unknown runs 404
+    again = client.post(f"/api/runs/{run['run_id']}/cancel")
+    assert again.json()["status"] == run["status"]
+    assert client.post("/api/runs/does-not-exist/cancel").status_code == 404
+
+
+def test_run_cancel_finalizes_interrupted_run(service):
+    """§18 through the API: a run interrupted by a crash (claim held by a
+    dead worker) reaches terminal CANCELLED through the cancel route."""
+    client = _client(service)
+    from jobscraper.runtime.claims import claim_next_request
+    from jobscraper.runtime.requests import enqueue_request
+    from jobscraper.runtime.runs import create_run
+
+    db = service["db"]
+    conn = db.conn
+    plan = dict(
+        source_id="src-1", source_plan_group_id="grp-1", fallback_rank=0,
+        binding_id="bnd-1", binding_revision_id="bndrev-1",
+        adapter_id="json_api_feed", adapter_version="1.0.0", adapter_api_version="1",
+        strategy="FEED_OR_PUBLIC_STRUCTURED_ENDPOINT", execution_class="HTTP",
+        permission_profile_id="perm-1", permission_profile_revision=1,
+    )
+    run_id, plan_ids = create_run(conn, profile_id=None, plans=[plan], now=NOW)
+    enqueue_request(
+        conn, run_id=run_id, run_source_plan_id=plan_ids[0], source_id="src-1",
+        binding_id="bnd-1", request_type="LIST_FETCH",
+        target_identity=f"http://127.0.0.1:{service['port']}/jobs?page=1",
+        logical_key='{"page": 1}',
+    )
+    # simulate the crash: the claim's worker dies mid-request
+    claim = claim_next_request(conn, "dead-worker", now=NOW)
+    assert claim is not None
+
+    response = client.post(f"/api/runs/{run_id}/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "RUNNING"  # in-flight lease not abandoned by the canceller
+
+    # restart recovery reclaims the orphaned claim; cancelling then
+    # finalizes the run to its terminal CANCELLED state
+    from jobscraper.runtime.recovery import recover_interrupted_requests
+
+    recover_interrupted_requests(conn, now=NOW)
+    response = client.post(f"/api/runs/{run_id}/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "CANCELLED"
+    run = conn.execute(
+        "SELECT status FROM scrape_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    assert run["status"] == "CANCELLED"
+    requests = conn.execute(
+        "SELECT status FROM scrape_requests WHERE run_id = ?", (run_id,)
+    ).fetchall()
+    assert all(r["status"] == "CANCELLED" for r in requests)
 
 
 # ---------------------------------------------------------- inbox + jobs

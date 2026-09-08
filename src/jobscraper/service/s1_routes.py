@@ -38,7 +38,7 @@ from jobscraper.profiles.core import (
 from jobscraper.runtime.clock import db_utc_now
 from jobscraper.runtime.cancellation import request_run_cancellation
 from jobscraper.runtime.requests import enqueue_request
-from jobscraper.runtime.runs import create_run
+from jobscraper.runtime.runs import aggregate_run, create_run
 from jobscraper.version import APP_VERSION
 
 _PROFILE_FIELDS = {
@@ -214,13 +214,20 @@ def install_slice1_routes(app, state) -> None:
 
     @app.post("/api/runs/{run_id}/cancel")
     async def runs_cancel(run_id: str, session=Depends(require_mutation)):
-        exists = conn().execute(
-            "SELECT id FROM scrape_runs WHERE id = ?", (run_id,)
+        row = conn().execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (run_id,)
         ).fetchone()
-        if exists is None:
+        if row is None:
             raise HTTPException(status_code=404, detail="run not found")
+        if row["status"] in ("SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED"):
+            # cancelling a finished run must not rewrite its durable outcome
+            return {"status": row["status"]}
         request_run_cancellation(conn(), run_id, now=db_utc_now(conn()))
-        return {"status": "CANCELLED"}
+        # finalize now when every group is closed (e.g. an interrupted run
+        # after restart recovery); a run with live in-flight work reports
+        # honestly that it is still running.
+        status = aggregate_run(conn(), run_id, now=db_utc_now(conn()))
+        return {"status": status or "RUNNING"}
 
     # -------------------------------------------------------------- inbox
     @app.get("/api/inbox")

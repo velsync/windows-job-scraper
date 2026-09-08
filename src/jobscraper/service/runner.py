@@ -104,6 +104,39 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
     lifespan = ServiceLifespan(config, db, secret)
     app.state.lifespan = lifespan
 
+    # Restart recovery (03 RUN-07/RUN-09, §18): a fresh service epoch
+    # orphans every RUNNING request; reclaim them and finalize any
+    # cancellation the crash interrupted. Runs before the listener serves.
+    from jobscraper.runtime.recovery import recover_interrupted_requests
+
+    try:
+        recovered = recover_interrupted_requests(db.conn)
+        if recovered["reclaimed"] or recovered["finalized_cancelled_runs"]:
+            append_event(
+                db.conn,
+                event(
+                    "INFO",
+                    "SERVICE_RECOVERY",
+                    "restart recovery reclaimed orphaned requests",
+                    data={
+                        "reclaimed_requests": len(recovered["reclaimed"]),
+                        "finalized_cancelled_runs": len(
+                            recovered["finalized_cancelled_runs"]
+                        ),
+                    },
+                ),
+            )
+    except Exception as exc:  # pragma: no cover - defensive: never block boot
+        append_event(
+            db.conn,
+            event(
+                "ERROR",
+                "SERVICE_RECOVERY_FAILED",
+                f"restart recovery failed: {exc}",
+                data={"error_type": type(exc).__name__},
+            ),
+        )
+
     config_uv = uvicorn.Config(
         app,
         log_level="warning",

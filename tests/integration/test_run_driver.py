@@ -11,17 +11,24 @@ from __future__ import annotations
 import http.server
 import json
 import threading
+import time
+from pathlib import Path
 
 import pytest
 
-from jobscraper.db.connection import Database
+from jobscraper.db.connection import Database, connect_db
 from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
 from jobscraper.pipeline.driver import execute_run
 from jobscraper.profiles.core import create_profile
+from jobscraper.runtime.cancellation import request_run_cancellation
 from jobscraper.runtime.requests import enqueue_request
 from jobscraper.runtime.runs import create_run
 
 NOW = "2026-09-08T09:00:00.000000Z"
+
+# cross-thread state for the fixture feed handler (db path for the
+# lease-expiring endpoint)
+_HANDLER_STATE: dict = {}
 
 
 class _FeedHandler(http.server.BaseHTTPRequestHandler):
@@ -48,6 +55,57 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path.startswith("/jobs?page=2") or self.path.startswith("/empty"):
             body = json.dumps({"jobs": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/slowpage2"):
+            # page 1 answers immediately with jobs; page 2 hangs long
+            # enough for a concurrent durable cancellation to land while
+            # its fetch is in flight
+            if "page=1" in self.path or "page=1&" in self.path or self.path.endswith("/slowpage2"):
+                body = json.dumps(
+                    {"jobs": [
+                        {"id": "fx-1", "title": "Backend Engineer",
+                         "company": "Fixture Corp",
+                         "url": "https://jobs.example.test/jobs/fx-1"},
+                        {"id": "fx-2", "title": "Platform Engineer",
+                         "company": "Fixture Corp",
+                         "url": "https://jobs.example.test/jobs/fx-2"},
+                    ]}
+                ).encode()
+            else:
+                time.sleep(4.0)
+                body = json.dumps({"jobs": []}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/expiring"):
+            # page 1 that expires the caller's lease mid-fetch: the
+            # fenced commit must then lose ownership (RUN-07)
+            from jobscraper.db.connection import connect_db
+
+            db_path = _HANDLER_STATE.get("db_path")
+            if db_path:
+                other = connect_db(Path(db_path))
+                try:
+                    other.execute(
+                        "UPDATE scrape_requests SET lease_until = '2020-01-01T00:00:00Z'"
+                        " WHERE status = 'RUNNING'"
+                    )
+                    other.commit()
+                finally:
+                    other.close()
+            body = json.dumps(
+                {"jobs": [
+                    {"id": "fx-1", "title": "Backend Engineer",
+                     "company": "Fixture Corp",
+                     "url": "https://jobs.example.test/jobs/fx-1"},
+                ]}
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -82,6 +140,7 @@ def server():
 
 @pytest.fixture()
 def db(tmp_path, server):
+    _HANDLER_STATE["db_path"] = str(tmp_path / "driver.db")
     port = server.server_address[1]
     feed_config = json.dumps(
         {
@@ -221,3 +280,125 @@ def test_driver_invalid_content_is_partial_not_failure(db, server):
     assert req["page_class"] == "LOGIN_REQUIRED"  # typed, not parser-failure
     cov = db.conn.execute("SELECT completion_state FROM enumeration_coverage").fetchone()
     assert cov["completion_state"] == "PARTIAL"  # no absence authority
+
+
+def _slow_binding(server):
+    return json.dumps(
+        {
+            "url_template": f"http://127.0.0.1:{server.server_address[1]}/slowpage2?page={{page}}",
+            "items_path": "jobs",
+            "fields": {
+                "source_job_id": {"path": "id", "required": True},
+                "title": {"path": "title", "required": True},
+                "company": {"path": "company"},
+                "job_url": {"path": "url"},
+            },
+        }
+    )
+
+
+def test_driver_mid_run_cancellation_no_late_commits(db, server):
+    """§18 mid-run: durable cancellation while page 2 is in flight.
+
+    The service executes runs synchronously, so a concurrent API request
+    cannot be served while the run handler holds the loop; the durable
+    cancellation here is written through a second DB connection — the
+    same durable primitive the cancel route applies.  The driver must:
+
+    * lose commit authority at the fence for the in-flight acquisition
+      page (no post-cancellation data commits, evidence rolled back),
+    * cooperatively abandon the request,
+    * aggregate the run to CANCELLED,
+    * keep the already accepted page-1 work and drain its obligations.
+    """
+    db.conn.execute(
+        "UPDATE source_adapter_binding_revisions SET config_json = ? WHERE id = 'bndrev-1'",
+        (_slow_binding(server),),
+    )
+    db.conn.commit()
+    profile_id, _ = create_profile(
+        db.conn,
+        snapshot={"name": "P", "keywords": ["engineer"], "eligible_countries": ["DE"],
+                  "remote_rules": {"remote_ok": True}, "min_score_inbox": 0},
+        now=NOW,
+    )
+    run_id = _start_run(db)
+
+    result = {}
+
+    def _drive():
+        result["status"] = execute_run(db.conn, run_id)
+
+    worker = threading.Thread(target=_drive)
+    worker.start()
+    try:
+        # wait until page 1 committed (its request reached SUCCEEDED)
+        other = connect_db(Path(_HANDLER_STATE["db_path"]))
+        deadline = time.time() + 30
+        page1 = None
+        while time.time() < deadline:
+            page1 = other.execute(
+                "SELECT id, status FROM scrape_requests"
+                " WHERE run_id = ? AND status = 'SUCCEEDED' ORDER BY created_at",
+                (run_id,),
+            ).fetchall()
+            if page1:
+                break
+            time.sleep(0.05)
+        assert page1, "page 1 never committed before the cancellation window"
+        # page 2 fetch is now hanging (4s): cancel durably mid-run
+        request_run_cancellation(other, run_id)
+        other.close()
+    finally:
+        worker.join(timeout=60)
+
+    assert result.get("status") == "CANCELLED"
+    run = db.conn.execute("SELECT status FROM scrape_runs WHERE id = ?", (run_id,)).fetchone()
+    assert run["status"] == "CANCELLED"
+    group = db.conn.execute(
+        "SELECT group_outcome FROM run_source_plans WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    assert group["group_outcome"] == "CANCELLED"
+    requests = db.conn.execute(
+        "SELECT status FROM scrape_requests WHERE run_id = ? ORDER BY created_at", (run_id,)
+    ).fetchall()
+    # accepted page-1 work preserved; no request claims success after cancellation
+    assert any(r["status"] == "SUCCEEDED" for r in requests)
+    assert all(r["status"] in ("SUCCEEDED", "CANCELLED") for r in requests)
+    # only page 1 committed evidence; page 2's rolled back at the fence
+    assert db.conn.execute("SELECT COUNT(*) FROM fetch_attempts").fetchone()[0] == 1
+    assert db.conn.execute("SELECT COUNT(*) FROM job_observations").fetchone()[0] == 2
+    # coverage can not claim terminal enumeration after cancellation
+    cov = db.conn.execute("SELECT completion_state FROM enumeration_coverage").fetchone()
+    assert cov["completion_state"] == "PARTIAL"
+    # §18: host-native obligations for accepted work still drained
+    assert db.conn.execute("SELECT COUNT(*) FROM job_scores").fetchone()[0] == 2
+
+
+def test_driver_lease_loss_stops_cleanly(db, server):
+    """RUN-07 mid-run: an expired lease is already lost ownership.  The
+    driver's fenced commit is refused, nothing is committed for that
+    page, the expired request is reclaimed (RETRY_WAIT), and the run
+    aggregates without crashing."""
+    db.conn.execute(
+        "UPDATE source_adapter_binding_revisions SET config_json = ? WHERE id = 'bndrev-1'",
+        (json.dumps({
+            "url_template": f"http://127.0.0.1:{server.server_address[1]}/expiring?page={{page}}",
+            "items_path": "jobs",
+            "fields": {"source_job_id": {"path": "id", "required": True},
+                        "title": {"path": "title", "required": True}},
+        }),),
+    )
+    db.conn.commit()
+    run_id = _start_run(db)
+
+    status = execute_run(db.conn, run_id)
+
+    assert status == "FAILED"  # nothing committed (page budget consumed by loss)
+    req = db.conn.execute(
+        "SELECT status, last_failure_kind FROM scrape_requests WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+    assert all(r["status"] == "RETRY_WAIT" for r in req)
+    assert db.conn.execute("SELECT COUNT(*) FROM job_observations").fetchone()[0] == 0
+    assert db.conn.execute("SELECT COUNT(*) FROM fetch_attempts").fetchone()[0] == 0
