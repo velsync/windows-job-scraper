@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
-"""Slice 0 native Windows acceptance harness (S0.13).
+"""Native Windows acceptance harness (S0.13; Slice-1 extension S1.12).
 
 Authority: docs/plans/slice-0-windows-acceptance-strategy-v0313.md (native
-acceptance matrix W0-01..W0-18); plan S0.13.
+acceptance matrix W0-01..W0-18); docs/plans/slice-1-worker-implementation-
+plan-v0313.md S1.12 (W1 checks).
 
 Single-purpose, machine-verifiable harness. Run on the Windows target:
 
-    python scripts/native_acceptance.py --target exe --exe <path-to-JobScraper.exe-dir>
+    python scripts/native_acceptance.py --target exe --exe <path-to-JobScraper.exe-dir> --slice 0
+    python scripts/native_acceptance.py --target exe --exe <path-to-JobScraper.exe-dir> --slice 1
+    python scripts/native_acceptance.py --target exe --exe <path-to-JobScraper.exe-dir> --slice all
 
 or, to validate the harness logic itself on a development host (Linux/CI):
 
-    python scripts/native_acceptance.py --target dev
+    python scripts/native_acceptance.py --target dev --slice 1
+
+Slice-1 checks (W1-01..W1-07) drive the *packaged* application through its
+public HTTP surface with a harness-hosted loopback fixture feed:
+
+    W1-01 packaged E2E vertical slice (profile → run → canonical jobs →
+          scores/eligibility → inbox events → dispositions → application)
+    W1-02 restart persistence (PROD-08: every piece of state survives)
+    W1-03 idempotent resume + inbox dedupe across restart
+    W1-04 SSRF negative: private/test destination denied (fail closed,
+          typed POLICY_REJECTED, no fetch)
+    W1-05 SSRF negative: redirect to unauthorized destination denied per hop
+    W1-06 unsafe source links (javascript:/data:) never surfaced clickable
+    W1-07 doctor healthy after the Slice-1 workload
 
 The harness never fabricates results: checks that cannot execute in the
 current environment are recorded as NOT_RUN with the reason. Results are
@@ -21,6 +37,7 @@ acceptance strategy. No secret material is ever written to evidence.
 from __future__ import annotations
 
 import argparse
+import http.server
 import json
 import os
 import signal
@@ -41,6 +58,63 @@ if str(SRC) not in sys.path:
 
 PASS, FAIL, NOT_RUN = "PASS", "FAIL", "NOT_RUN"
 
+_NOW = "2026-09-08T09:00:00.000000Z"
+
+# Fixture jobs for the W1 vertical slice (same shape as the pytest E2E
+# acceptance suite).
+_W1_JOBS_PAGE_1 = [
+    {
+        "id": "fx-1", "title": "Backend Engineer", "company": "Fixture Corp",
+        "description": "<p>Python services</p>",
+        "url": "https://jobs.example.test/jobs/fx-1",
+        "apply_url": "https://jobs.example.test/jobs/fx-1/apply",
+        "locations": ["Berlin"], "created_at": _NOW,
+    },
+    {
+        "id": "fx-2", "title": "Platform Engineer", "company": "Fixture Corp",
+        "description": "<p>Go infrastructure</p>",
+        "url": "https://jobs.example.test/jobs/fx-2",
+        "apply_url": "https://jobs.example.test/jobs/fx-2/apply",
+        "locations": ["Remote"], "created_at": _NOW,
+    },
+]
+
+
+class _W1FeedHandler(http.server.BaseHTTPRequestHandler):
+    """Loopback fixture feed hosted by the harness (S1.12 W1 checks)."""
+
+    def _send(self, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path
+        if path.startswith("/redirect-jobs"):
+            # SSRF negative: redirect hop to an unauthorized TEST-NET target
+            self.send_response(302)
+            self.send_header("Location", "http://192.0.2.2/evil")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif path.startswith("/jobs-unsafe"):
+            # PROD-05 negative: malicious non-http source links
+            self._send({"jobs": [{
+                "id": "bad-1", "title": "Malicious Listing",
+                "company": "Evil Corp",
+                "url": "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+                "apply_url": "javascript:alert(1)",
+            }]})
+        elif path.startswith("/jobs?page=1") or path == "/jobs":
+            self._send({"jobs": _W1_JOBS_PAGE_1})
+        else:
+            self._send({"jobs": []})
+
+    def log_message(self, *args):
+        pass
+
 
 def log(message: str) -> None:
     print(f"[native-acceptance] {message}", flush=True)
@@ -52,6 +126,7 @@ class Harness:
         self.exe = exe
         self.evidence = evidence
         self.results: dict[str, dict] = {}
+        self._w1_state: dict = {}
         evidence.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------- plumbing
@@ -766,46 +841,567 @@ class Harness:
         finally:
             self.stop_launcher(launcher)
 
+    # ------------------------------------------------------------- W1 checks
+    # Slice-1 native acceptance (S1.12).  All checks drive the target
+    # (packaged exe or dev) through its public HTTP surface; the harness
+    # hosts the loopback fixture feed and seeds operator-style source
+    # rows directly in the database (Slice 1 has no source-management
+    # API), exactly like the pytest E2E acceptance suite.
+    def _db_connect(self, data_root: Path):
+        from jobscraper.db.connection import connect_db
+        from jobscraper.paths import build_app_paths
+
+        return connect_db(build_app_paths(data_root).database_file)
+
+    def _w1_wait_db(self, data_root: Path, timeout: float = 60.0):
+        deadline = time.time() + timeout
+        last_error = None
+        while time.time() < deadline:
+            try:
+                conn = self._db_connect(data_root)
+                conn.execute("SELECT COUNT(*) FROM sources").fetchone()
+                return conn
+            except Exception as exc:  # DB not created/migrated yet
+                last_error = exc
+                time.sleep(0.2)
+        raise RuntimeError(f"service database never became ready: {last_error}")
+
+    def _w1_seed_source(self, db, feed_port: int, *, source_id: str,
+                        binding_id: str, revision_id: str, path: str) -> None:
+        """Operator-style seeding of one feed source + binding (the only
+        way sources exist in Slice 1)."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        config = json.dumps(
+            {
+                "url_template": f"http://127.0.0.1:{feed_port}{path}?page={{page}}",
+                "items_path": "jobs",
+                "fields": {
+                    "source_job_id": {"path": "id", "required": True},
+                    "title": {"path": "title", "required": True},
+                    "company": {"path": "company"},
+                    "description": {"path": "description"},
+                    "job_url": {"path": "url"},
+                    "apply_url": {"path": "apply_url"},
+                    "locations": {"path": "locations", "many": True},
+                    "posted_at": {"path": "created_at"},
+                },
+            }
+        )
+        db.executescript(
+            f"""
+            INSERT INTO sources (id, display_name, source_family, entry_url, created_at, updated_at)
+            VALUES ('{source_id}','Fixture Feed','PUBLIC_FEED',
+                    'http://127.0.0.1:{feed_port}/jobs','{now}','{now}');
+            INSERT OR IGNORE INTO adapter_definitions (adapter_id, adapter_version, adapter_api_version, manifest_json, created_at)
+            VALUES ('json_api_feed','1.0.0','1','{{}}','{now}');
+            INSERT OR IGNORE INTO adapter_permission_profiles (id, display_name, created_at) VALUES ('perm-1','d','{now}');
+            INSERT OR IGNORE INTO adapter_permission_profile_revisions (id, permission_profile_id, revision, policy_json, created_at)
+            VALUES ('permrev-1','perm-1',1,'{{}}','{now}');
+            INSERT INTO source_adapter_bindings (id, source_id, display_name, current_revision_id, created_at)
+            VALUES ('{binding_id}','{source_id}','api','{revision_id}','{now}');
+            INSERT INTO source_adapter_binding_revisions (id, binding_id, revision, adapter_id, adapter_version,
+                strategy, execution_class, permission_profile_id, permission_profile_revision, config_json, created_at)
+            VALUES ('{revision_id}','{binding_id}',1,'json_api_feed','1.0.0',
+                'FEED_OR_PUBLIC_STRUCTURED_ENDPOINT','HTTP','perm-1',1,'{config}','{now}');
+            """
+        )
+        db.commit()
+
+    def _w1_repoint_binding(self, db, revision_id: str, feed_port: int, path: str) -> None:
+        config = json.dumps(
+            {
+                "url_template": f"http://127.0.0.1:{feed_port}{path}?page={{page}}",
+                "items_path": "jobs",
+                "fields": {
+                    "source_job_id": {"path": "id", "required": True},
+                    "title": {"path": "title", "required": True},
+                    "company": {"path": "company"},
+                    "job_url": {"path": "url"},
+                    "apply_url": {"path": "apply_url"},
+                },
+            }
+        )
+        db.execute(
+            "UPDATE source_adapter_binding_revisions SET config_json = ? WHERE id = ?",
+            (config, revision_id),
+        )
+        db.commit()
+
+    def _w1_bootstrap(self, url: str) -> dict:
+        base, ticket = url.split("#bootstrap=", 1)
+        host_port = base.split("//", 1)[1].rstrip("/")
+        status, headers, body = self.http(
+            "POST",
+            f"http://{host_port}/api/bootstrap",
+            headers={
+                "Host": host_port,
+                "Origin": f"http://{host_port}",
+                "Content-Type": "application/json",
+            },
+            body=json.dumps({"ticket": ticket}).encode(),
+        )
+        if status != 200:
+            raise RuntimeError(f"bootstrap exchange failed: {status} {body[:200]!r}")
+        csrf = json.loads(body)["csrf_token"]
+        session_id = None
+        for part in ", ".join(headers.get_all("Set-Cookie", [])).split(","):
+            if part.strip().startswith("wjs_session="):
+                session_id = part.strip().split("=", 1)[1].split(";", 1)[0]
+        if not session_id:
+            raise RuntimeError("no session cookie after bootstrap")
+        return {"host_port": host_port, "session": session_id, "csrf": csrf}
+
+    def _w1_api(self, auth: dict, method: str, path: str, *, json_body=None):
+        headers = {
+            "Host": auth["host_port"],
+            "Origin": f"http://{auth['host_port']}",
+            "Cookie": f"wjs_session={auth['session']}; wjs_csrf={auth['csrf']}",
+            "X-CSRF-Token": auth["csrf"],
+        }
+        body = None
+        if json_body is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(json_body).encode()
+        status, _, out = self.http(
+            method, f"http://{auth['host_port']}{path}", headers=headers, body=body
+        )
+        return status, (json.loads(out) if out else None)
+
+    def run_slice1(self) -> int:
+        """W1-01..W1-07 on one isolated root with a harness-hosted feed."""
+        import threading
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _W1FeedHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        feed_port = server.server_address[1]
+        try:
+            with tempfile.TemporaryDirectory(prefix="wjs-w1-") as root_name:
+                data_root = Path(root_name) / "W1"
+                (data_root / "auth").mkdir(parents=True, exist_ok=True)
+                (data_root / "runtime").mkdir(parents=True, exist_ok=True)
+                db = None
+                try:
+                    self._w1_01_vertical_slice(data_root, feed_port)
+                    self._w1_02_restart_persistence(data_root, feed_port)
+                    self._w1_03_inbox_dedupe_across_restart(data_root, feed_port)
+                    db = self._db_connect(data_root)
+                    self._w1_04_private_destination_denied(data_root, feed_port, db)
+                    self._w1_05_redirect_hop_denied(data_root, feed_port, db)
+                    self._w1_06_unsafe_links_not_clickable(data_root, feed_port, db)
+                    self._w1_07_doctor_after_workload(data_root)
+                finally:
+                    if db is not None:
+                        db.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+        return 0
+
+    def _w1_01_vertical_slice(self, data_root: Path, feed_port: int) -> None:
+        launcher, url = self.launch_and_get_url(data_root)
+        auth = None
+        profile = job_id = application = None
+        try:
+            db = self._w1_wait_db(data_root)
+            try:
+                self._w1_seed_source(
+                    db, feed_port, source_id="src-1", binding_id="bnd-1",
+                    revision_id="bndrev-1", path="/jobs",
+                )
+            finally:
+                db.close()
+            auth = self._w1_bootstrap(url)
+            status, profile = self._w1_api(
+                auth, "POST", "/api/profiles",
+                json_body={
+                    "name": "Native", "keywords": ["engineer"],
+                    "eligible_countries": ["DE"],
+                    "remote_rules": {"remote_ok": True}, "min_score_inbox": 0,
+                },
+            )
+            ok_profile = status == 200 and profile.get("id")
+            status, run = self._w1_api(
+                auth, "POST", "/api/runs", json_body={"profile_id": profile["id"]}
+            )
+            ok_run = (
+                status == 200 and run.get("status") == "SUCCEEDED"
+                and run.get("jobs_saved") == 2
+            )
+            status, inbox = self._w1_api(
+                auth, "GET", f"/api/inbox?profile_id={profile['id']}"
+            )
+            items = inbox.get("inbox", []) if inbox else []
+            ok_inbox = (
+                status == 200 and len(items) == 2
+                and {i["event_kind"] for i in items} == {"NEW_ELIGIBLE_APPEARANCE"}
+                and all(i["score"] >= 0 and i["breakdown"] for i in items)
+            )
+            job_id = next((i["job_id"] for i in items if i["title"] == "Backend Engineer"), None)
+            status, detail = self._w1_api(auth, "GET", f"/api/jobs/{job_id}")
+            presence = (detail.get("sources") or [{}])[0] if detail else {}
+            ok_detail = (
+                status == 200
+                and detail["job"]["listing_status"] == "ACTIVE"
+                and presence.get("source_job_id") == "fx-1"
+                and presence.get("canonical_job_url")
+                == "https://jobs.example.test/jobs/fx-1"
+                and detail.get("apply_url") == "https://jobs.example.test/jobs/fx-1/apply"
+            )
+            status, out = self._w1_api(
+                auth, "POST",
+                f"/api/profiles/{profile['id']}/jobs/{job_id}/disposition",
+                json_body={"disposition": "SHORTLISTED"},
+            )
+            ok_disposition = status == 200 and out.get("disposition") == "SHORTLISTED"
+            status, application = self._w1_api(
+                auth, "POST", "/api/applications",
+                json_body={"job_id": job_id, "profile_id": profile["id"]},
+            )
+            ok_application = status == 200 and application.get("status") == "PREPARING"
+            ok = all([ok_profile, ok_run, ok_inbox, ok_detail, ok_disposition, ok_application])
+            self.record(
+                "W1-01",
+                PASS if ok else FAIL,
+                "packaged E2E vertical slice: profile → run → jobs → scores → "
+                "inbox → disposition → application",
+                profile=ok_profile, run=ok_run, inbox=ok_inbox, job_detail=ok_detail,
+                disposition=ok_disposition, application=ok_application,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.record("W1-01", FAIL, f"vertical slice failed: {exc}")
+        finally:
+            self.stop_launcher(launcher)
+            self._w1_state["auth"] = auth
+            self._w1_state["profile_id"] = (
+                profile.get("id") if isinstance(profile, dict) else None
+            )
+            self._w1_state["job_id"] = (
+                job_id if isinstance(job_id, str) else None
+            )
+            self._w1_state["application_id"] = (
+                application.get("id") if isinstance(application, dict) else None
+            )
+
+    def _w1_02_restart_persistence(self, data_root: Path, feed_port: int) -> None:
+        try:
+            launcher, url = self.launch_and_get_url(data_root)
+            try:
+                auth = self._w1_bootstrap(url)
+                profile_id = self._w1_state.get("profile_id")
+                job_id = self._w1_state.get("job_id")
+                status, profiles = self._w1_api(auth, "GET", "/api/profiles")
+                ok_profiles = (
+                    status == 200
+                    and len(profiles["profiles"]) == 1
+                    and profiles["profiles"][0]["snapshot"]["name"] == "Native"
+                )
+                status, inbox = self._w1_api(
+                    auth, "GET", f"/api/inbox?profile_id={profile_id}"
+                )
+                items = inbox.get("inbox", []) if inbox else []
+                by_title = {i["title"]: i for i in items}
+                ok_inbox = (
+                    status == 200
+                    and len(items) == 2
+                    and by_title["Backend Engineer"]["disposition"] == "SHORTLISTED"
+                    and by_title["Platform Engineer"]["disposition"] == "NONE"
+                )
+                status, detail = self._w1_api(auth, "GET", f"/api/jobs/{job_id}")
+                ok_job = status == 200 and detail["job"]["title"] == "Backend Engineer"
+                status, applications = self._w1_api(
+                    auth, "GET", f"/api/applications?profile_id={profile_id}"
+                )
+                ok_application = (
+                    status == 200
+                    and len(applications["applications"]) == 1
+                    and applications["applications"][0]["status"] == "PREPARING"
+                )
+                ok = all([ok_profiles, ok_inbox, ok_job, ok_application])
+                self.record(
+                    "W1-02",
+                    PASS if ok else FAIL,
+                    "restart persistence: profile/inbox/job/application survive (PROD-08)",
+                    profiles=ok_profiles, inbox=ok_inbox, job=ok_job,
+                    application=ok_application,
+                )
+            finally:
+                self.stop_launcher(launcher)
+        except Exception as exc:  # noqa: BLE001
+            self.record("W1-02", FAIL, f"restart persistence check failed: {exc}")
+
+    def _w1_03_inbox_dedupe_across_restart(self, data_root: Path, feed_port: int) -> None:
+        try:
+            db = self._db_connect(data_root)
+            try:
+                before_events = db.execute(
+                    "SELECT COUNT(*) FROM job_profile_inbox_events"
+                ).fetchone()[0]
+                before_jobs = db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+                before_observations = db.execute(
+                    "SELECT COUNT(*) FROM job_observations"
+                ).fetchone()[0]
+            finally:
+                db.close()
+            launcher, url = self.launch_and_get_url(data_root)
+            try:
+                auth = self._w1_bootstrap(url)
+                status, run = self._w1_api(
+                    auth, "POST", "/api/runs",
+                    json_body={"profile_id": self._w1_state.get("profile_id")},
+                )
+                ok_run = (
+                    status == 200 and run.get("status") == "SUCCEEDED"
+                    and run.get("jobs_saved") == 0 and run.get("jobs_updated") == 0
+                )
+            finally:
+                self.stop_launcher(launcher)
+            db = self._db_connect(data_root)
+            try:
+                after_events = db.execute(
+                    "SELECT COUNT(*) FROM job_profile_inbox_events"
+                ).fetchone()[0]
+                after_jobs = db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+                after_observations = db.execute(
+                    "SELECT COUNT(*) FROM job_observations"
+                ).fetchone()[0]
+            finally:
+                db.close()
+            ok = (
+                ok_run
+                and after_events == before_events
+                and after_jobs == before_jobs
+                and after_observations == before_observations
+            )
+            self.record(
+                "W1-03",
+                PASS if ok else FAIL,
+                "idempotent resume after restart: no duplicate jobs, "
+                "observations, or inbox events",
+                run=ok_run, events=(before_events, after_events),
+                jobs=(before_jobs, after_jobs),
+                observations=(before_observations, after_observations),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.record("W1-03", FAIL, f"dedupe check failed: {exc}")
+
+    def _w1_04_private_destination_denied(self, data_root: Path, feed_port: int, db) -> None:
+        """SSRF negative: the granted entry host is the loopback fixture,
+        but the binding template targets a TEST-NET address.  The packaged
+        app must fail closed — typed POLICY_REJECTED, no fetch attempt."""
+        try:
+            self._w1_seed_source(
+                db, feed_port, source_id="src-2", binding_id="bnd-2",
+                revision_id="bndrev-2", path="/jobs",
+            )
+            # point the second binding's template at a TEST-NET-1 address
+            db.execute(
+                "UPDATE source_adapter_binding_revisions SET config_json = ?"
+                " WHERE id = 'bndrev-2'",
+                (json.dumps({
+                    "url_template": "http://192.0.2.1/jobs?page={page}",
+                    "items_path": "jobs",
+                    "fields": {"source_job_id": {"path": "id", "required": True},
+                                "title": {"path": "title", "required": True}},
+                }),),
+            )
+            db.commit()
+            launcher, url = self.launch_and_get_url(data_root)
+            try:
+                auth = self._w1_bootstrap(url)
+                status, run = self._w1_api(
+                    auth, "POST", "/api/runs",
+                    json_body={"profile_id": self._w1_state.get("profile_id")},
+                )
+                run_status = run.get("status") if run else None
+            finally:
+                self.stop_launcher(launcher)
+            row = db.execute(
+                """
+                SELECT req.status, req.page_class, fa.failure_kind AS fetch_kind,
+                       fa.failure_json
+                FROM scrape_requests req
+                JOIN fetch_attempts fa ON fa.request_id = req.id
+                WHERE req.source_id = 'src-2'
+                ORDER BY req.created_at DESC LIMIT 1
+                """
+            ).fetchone()
+            failure = (
+                json.loads(row["failure_json"]) if row and row["failure_json"] else {}
+            )
+            policy_denied = (
+                row is not None
+                and row["status"] == "SUCCEEDED"  # definitive answer, no retry storm
+                and row["fetch_kind"] == "POLICY_REJECTED"
+                and failure.get("kind") == "POLICY_REJECTED"
+                and bool(
+                    (failure.get("details_redacted") or {}).get("reason_code")
+                )
+            )
+            ok = (
+                status == 200
+                and run_status == "PARTIAL"
+                and policy_denied
+                and db.execute(
+                    "SELECT COUNT(*) FROM job_observations WHERE source_id = 'src-2'"
+                ).fetchone()[0] == 0
+            )
+            self.record(
+                "W1-04",
+                PASS if ok else FAIL,
+                "SSRF negative: private/test destination denied fail-closed "
+                "(typed POLICY_REJECTED, nothing fetched)",
+                run_status=run_status,
+                request=(dict(row) if row else None),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.record("W1-04", FAIL, f"SSRF destination check failed: {exc}")
+
+    def _w1_05_redirect_hop_denied(self, data_root: Path, feed_port: int, db) -> None:
+        """SSRF negative: the granted entry host serves a redirect to an
+        unauthorized TEST-NET destination; each hop is policy-checked."""
+        try:
+            self._w1_repoint_binding(db, "bndrev-2", feed_port, "/redirect-jobs")
+            launcher, url = self.launch_and_get_url(data_root)
+            try:
+                auth = self._w1_bootstrap(url)
+                status, run = self._w1_api(
+                    auth, "POST", "/api/runs",
+                    json_body={"profile_id": self._w1_state.get("profile_id")},
+                )
+                run_status = run.get("status") if run else None
+            finally:
+                self.stop_launcher(launcher)
+            row = db.execute(
+                """
+                SELECT req.status, req.page_class, fa.failure_kind, fa.failure_json
+                FROM scrape_requests req
+                JOIN fetch_attempts fa ON fa.request_id = req.id
+                WHERE req.source_id = 'src-2'
+                ORDER BY req.created_at DESC LIMIT 1
+                """
+            ).fetchone()
+            failure = json.loads(row["failure_json"]) if row and row["failure_json"] else {}
+            ok = (
+                status == 200
+                and run_status == "PARTIAL"
+                and row is not None
+                and row["status"] == "SUCCEEDED"
+                and row["failure_kind"] == "POLICY_REJECTED"
+                and failure.get("kind") == "POLICY_REJECTED"
+            )
+            self.record(
+                "W1-05",
+                PASS if ok else FAIL,
+                "SSRF negative: redirect to unauthorized destination denied per hop",
+                run_status=run_status,
+                failure_kind=failure.get("kind"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.record("W1-05", FAIL, f"redirect-hop check failed: {exc}")
+
+    def _w1_06_unsafe_links_not_clickable(self, data_root: Path, feed_port: int, db) -> None:
+        """PROD-05: javascript:/data: source links are stored for
+        provenance but never surfaced as clickable URLs."""
+        try:
+            self._w1_repoint_binding(db, "bndrev-2", feed_port, "/jobs-unsafe")
+            launcher, url = self.launch_and_get_url(data_root)
+            try:
+                auth = self._w1_bootstrap(url)
+                self._w1_api(
+                    auth, "POST", "/api/runs",
+                    json_body={"profile_id": self._w1_state.get("profile_id")},
+                )
+                row = db.execute(
+                    "SELECT job_id FROM job_sources WHERE source_job_id = 'bad-1'"
+                ).fetchone()
+                ok_job_created = row is not None
+                status, detail = (
+                    self._w1_api(auth, "GET", f"/api/jobs/{row['job_id']}")
+                    if row else (0, None)
+                )
+                sources = (detail or {}).get("sources") or [{}]
+                presence = sources[0]
+                ok = (
+                    ok_job_created
+                    and status == 200
+                    and presence.get("application_url") is None
+                    and presence.get("canonical_job_url") is None
+                    and (detail or {}).get("apply_url") is None
+                )
+                self.record(
+                    "W1-06",
+                    PASS if ok else FAIL,
+                    "unsafe source links (javascript:/data:) never surfaced clickable",
+                    job_created=ok_job_created,
+                    application_url=presence.get("application_url", "missing"),
+                    canonical_job_url=presence.get("canonical_job_url", "missing"),
+                    apply_url=(detail or {}).get("apply_url", "missing"),
+                )
+            finally:
+                self.stop_launcher(launcher)
+        except Exception as exc:  # noqa: BLE001
+            self.record("W1-06", FAIL, f"unsafe-link check failed: {exc}")
+
+    def _w1_07_doctor_after_workload(self, data_root: Path) -> None:
+        try:
+            report = self.doctor_json(data_root)
+            failed = [c["name"] for c in report.get("checks", []) if c.get("status") == "FAIL"]
+            ok = report.get("exit_code") == 0 and not failed
+            self.record(
+                "W1-07",
+                PASS if ok else FAIL,
+                "doctor healthy on the root after the Slice-1 workload",
+                exit_code=report.get("exit_code"),
+                failed_checks=failed,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.record("W1-07", FAIL, f"doctor check failed: {exc}")
+
     # ------------------------------------------------------------------ main
-    def run(self) -> int:
+    def run(self, slice_arg: str = "0") -> int:
         started = datetime.now(timezone.utc).isoformat()
         self.write_evidence(
             "process-inventory-before.txt", "\n".join(self.list_processes())
         )
-        with tempfile.TemporaryDirectory(prefix="wjs-w0-") as root_name:
-            root = Path(root_name)
-            data_root = root / "W0"
-            (data_root / "auth").mkdir(parents=True, exist_ok=True)
-            (data_root / "runtime").mkdir(parents=True, exist_ok=True)
-            # Initialize via one launch (all subsequent checks reuse it).
-            launcher, url = self.launch_and_get_url(data_root)
-            self.stop_launcher(launcher)
+        if slice_arg in ("0", "all"):
+            with tempfile.TemporaryDirectory(prefix="wjs-w0-") as root_name:
+                root = Path(root_name)
+                data_root = root / "W0"
+                (data_root / "auth").mkdir(parents=True, exist_ok=True)
+                (data_root / "runtime").mkdir(parents=True, exist_ok=True)
+                # Initialize via one launch (all subsequent checks reuse it).
+                launcher, url = self.launch_and_get_url(data_root)
+                self.stop_launcher(launcher)
 
-            self.w01_packaged_launch(data_root)
-            self.w02_loopback_only(data_root)
-            self.w03_collision_safe_port(data_root)
-            self.w04_single_instance(data_root)
-            self.w05_stale_descriptor_recovery(data_root)
-            self.w06_old_port_impersonation(data_root)
-            self.w07_protected_secret(data_root)
-            self.w08_bootstrap_and_private_boundary(data_root)
-            self.w09_ticket_not_leaked(data_root)
-            self.w10_sqlite_settings(data_root)
-            self.w11_backup_restore(data_root)
-            self.w12_timezone(data_root)
-            self.w13_browser_isolation()
-            self.w14_browser_cleanup()
-            self.w15_browser_crash_recovery(data_root)
-            self.w16_service_forced_kill_recovery(data_root)
-            self.w17_package_independence(data_root)
-            self.w18_resource_observation(data_root)
+                self.w01_packaged_launch(data_root)
+                self.w02_loopback_only(data_root)
+                self.w03_collision_safe_port(data_root)
+                self.w04_single_instance(data_root)
+                self.w05_stale_descriptor_recovery(data_root)
+                self.w06_old_port_impersonation(data_root)
+                self.w07_protected_secret(data_root)
+                self.w08_bootstrap_and_private_boundary(data_root)
+                self.w09_ticket_not_leaked(data_root)
+                self.w10_sqlite_settings(data_root)
+                self.w11_backup_restore(data_root)
+                self.w12_timezone(data_root)
+                self.w13_browser_isolation()
+                self.w14_browser_cleanup()
+                self.w15_browser_crash_recovery(data_root)
+                self.w16_service_forced_kill_recovery(data_root)
+                self.w17_package_independence(data_root)
+                self.w18_resource_observation(data_root)
+
+        if slice_arg in ("1", "all"):
+            self.run_slice1()
 
         self.write_evidence(
             "process-inventory-after.txt", "\n".join(self.list_processes())
         )
+        slices_run = {"0": ["0"], "1": ["1"], "all": ["0", "1"]}[slice_arg]
         record = {
             "schema_version": 1,
-            "slice": "0",
+            "slice": "+".join(slices_run),
             "spec_version": "0.3.1.3",
             "target": self.target,
             "started_at_utc": started,
@@ -825,7 +1421,9 @@ class Harness:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Slice 0 native acceptance harness")
+    parser = argparse.ArgumentParser(description="Native acceptance harness (slices 0 and 1)")
+    parser.add_argument("--slice", choices=["0", "1", "all"], default="0",
+                        help="which acceptance matrix to run (default 0: the documented Slice-0 invocation)")
     parser.add_argument("--target", choices=["exe", "dev"], default="exe")
     parser.add_argument("--exe", type=Path, default=None, help="package dir (dist/JobScraper)")
     parser.add_argument(
@@ -835,7 +1433,7 @@ def main() -> int:
     if args.target == "exe" and args.exe is None:
         parser.error("--target exe requires --exe <package-dir>")
     harness = Harness(args.target, args.exe, args.evidence_dir)
-    return harness.run()
+    return harness.run(slice_arg=args.slice)
 
 
 if __name__ == "__main__":
