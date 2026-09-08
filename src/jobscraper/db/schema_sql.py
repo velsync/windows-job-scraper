@@ -16,6 +16,8 @@ Slice 1 appends the domain model (v3–v9) per RUN-17/RUN-18:
   v8 profile-relative state: disposition, inbox events, eligibility, scores
      (PROD-01/02, 01 §36/§41)
   v9 applications and documents (01 §43)
+  v12 S2.2 companies, location lookup and provenance quality (01 §33/§38/§39)
+
   v11 S2.1 richer acquisition evidence + origin resolution (02 §11.3/§32,
      ACQ-09, 03 §30 — append-only, no released step touched)
 
@@ -1134,6 +1136,68 @@ CREATE INDEX idx_acquisition_evidence_observation
 
 
 
+# ---------------------- v12 companies, locations index, provenance quality
+# Slice 2 S2.2 (01 §33.1 companies, §33.2 locations, §38 stage 2, §39
+# canonical provenance selection).  Append-only.
+@_step(12, "s2_2_companies_locations_and_provenance_quality")
+def _(sql: str = """
+-- §39 source-quality class is durable per presence, together with the two
+-- inputs the classification consumed, so the decision stays inspectable and
+-- replayable after a rule change (never re-derived from mutable config).
+ALTER TABLE job_sources ADD COLUMN source_quality_class TEXT;
+ALTER TABLE job_sources ADD COLUMN content_kind TEXT;
+ALTER TABLE job_sources ADD COLUMN same_host_as_source INTEGER;
+
+-- Strong-signal company identity index (01 §33.1).  Only identifiers that can
+-- carry a merge are registered: a normalized name alone is never a key here.
+CREATE TABLE company_identifiers (
+    id TEXT PRIMARY KEY,
+    company_id TEXT NOT NULL REFERENCES companies(id),
+    kind TEXT NOT NULL
+        CHECK (kind IN ('ATS_BOARD', 'APP_HOST', 'ORG_DOMAIN', 'CAREERS_HOST')),
+    value TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (kind, value)
+);
+CREATE INDEX idx_company_identifiers_company ON company_identifiers(company_id);
+
+-- Every company-resolution decision is evidence, including the ones that
+-- refused to merge (RUN-15 direction: splits are recoverable, silent merges
+-- are not).
+CREATE TABLE company_resolution_events (
+    id TEXT PRIMARY KEY,
+    observation_id TEXT REFERENCES job_observations(id),
+    company_id TEXT REFERENCES companies(id),
+    decision TEXT NOT NULL
+        CHECK (decision IN ('CREATED', 'ATTACHED', 'NAME_ONLY_NEW_COMPANY',
+                            'NO_SIGNAL')),
+    matched_on TEXT,
+    name_conflict INTEGER NOT NULL DEFAULT 0,
+    reason_code TEXT,
+    signals_json TEXT NOT NULL DEFAULT '{}',
+    resolution_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_company_resolution_events_company
+    ON company_resolution_events(company_id, created_at);
+CREATE INDEX idx_company_resolution_events_observation
+    ON company_resolution_events(observation_id);
+
+-- §33.2 locations are read by country/city for filtering on a set of
+-- locations (no single location_text exists to index).
+CREATE INDEX idx_job_locations_lookup ON job_locations(country, city);
+
+-- Canonical projection records which location rule set produced it.
+ALTER TABLE jobs ADD COLUMN location_rules_version TEXT;
+ALTER TABLE jobs ADD COLUMN company_resolution_version TEXT;
+ALTER TABLE jobs ADD COLUMN provenance_selector_version TEXT;
+"""
+) -> None:
+    return sql
+
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1148,6 +1212,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 11, (
-    "Slice 1 ships versions 1-10 (v10 corrective); Slice 2 appends v11"
+assert LATEST_SCHEMA_VERSION == 12, (
+    "Slice 1 ships versions 1-10 (v10 corrective); Slice 2 appends v11, v12"
 )

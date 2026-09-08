@@ -249,6 +249,68 @@ As implemented (S2.1, deviations recorded deliberately):
   deliberately **not** added; `remote_mode`/`remote_worldwide`/
   `employment_type`/`experience_level` are projected from evidence).
 
+As implemented (S2.2, deviations recorded deliberately):
+
+* `pipeline/locations.py` owns `location-rules-v1` (strings, ATS dicts,
+  Greenhouse `applicantLocationRequirements`, Lever `jobLocationType`) and the
+  DB projection `project_job_locations`.  Unrecognized places are kept at
+  confidence 0.3, never dropped; no country is inferred from a bare city and
+  no UTC offset is recorded unless the evidence carried an IANA zone (offsets
+  are resolved against the recorded observation instant).  `remote_worldwide`
+  requires *explicit* worldwide wording — a bare `"Remote"` leaves
+  `remote_mode=REMOTE` with `remote_worldwide=0`, which is what keeps
+  eligibility's "no country proven" case honestly `LIKELY` (Slice-1 semantics
+  preserved deliberately, not silently redefined).
+* `pipeline/companies.py` owns `company-resolution-v1`: strong identifiers
+  only (`ATS_BOARD` = `PROVIDER/board`, `APP_HOST`, `ORG_DOMAIN`,
+  `CAREERS_HOST`), a company row's own `domain` is the **employer's** host
+  (ATS platform hosts are recorded as identifiers, never as the company
+  domain), a bare normalized name never attaches (it creates a new company
+  with reason `WEAK_EVIDENCE_NO_MERGE`), a strong attach with a differing
+  display name records `NAME_CONFLICT_REVIEW` instead of renaming anyone, and
+  missing company fields are filled with `COALESCE` only.  Every decision
+  lands in `company_resolution_events` + `company_identifiers`.
+  No public-suffix list is added (no new runtime dependency): the host key is
+  the full lowercased host minus a leading `www.`, so sibling subdomains do
+  *not* merge — the conservative direction, recorded as a deferral.
+* `pipeline/provenance.py` is now the single owner of §39 ordering
+  (`canonical-provenance-selector-v2`); `canonical.select_canonical_provenance`
+  delegates to it so the accepted Slice-1 import keeps working with one
+  implementation.  The class is computed once per presence from recorded
+  evidence (`content_kind`, employer-side host match, §32 origin status) and
+  stored on `job_sources`, so selection is durable and replayable rather than
+  re-derived.  `canonical.select_canonical_provenance` delegating alias keeps
+  the accepted Slice-1 import valid while `pipeline/provenance.py` stays the
+  single ordering implementation.
+* Employer-vs-aggregator is decided by: the operator's `source_family`
+  declaration (`EMPLOYER_CAREERS`, `EMPLOYER_SITE`, `EMPLOYER_API`,
+  `ATS_BOARD`, `ATS_PROVIDER_API` — the spec leaves the family vocabulary
+  open, so this set is the product's), or the posting link living on the
+  source's own host **and** §32 not locating the posting's real home
+  elsewhere.  A self-hosted board that mirrors an ATS posting is therefore an
+  aggregator with resolved origin, never employer quality.
+* §38 stage 2 (shared resolved origin identity across sources) attaches the
+  new source's presence to the existing canonical job when company/title/
+  location evidence is compatible, and refuses on a meaningful location
+  disagreement — recorded as `entity_resolution_events.reason_code =
+  LOCATION_DISAGREEMENT` with the guard evidence attached.  Cross-source
+  stages never merge two canonical jobs, so no merge ledger is required here;
+  the reversible merge/undo workflow (and its `job_merges` table) stays with
+  its own later slice.
+* Migration v12 stores the §39 quality inputs per presence, `company_
+  identifiers`, `company_resolution_events`, the `job_locations(country, city)`
+  lookup index, and three projection version columns on `jobs`
+  (`location_rules_version`, `company_resolution_version`,
+  `provenance_selector_version`).  `location_summary` was deliberately *not*
+  added: the canonical model keeps the set.
+* The location set and categorical fields are re-projected only when the fresh
+  presence owns the presentation (`winner.id == fresh_presence_id`), using the
+  existing `LOCATION_CHANGED` change class — a lower-quality or older arrival
+  cannot churn canonical state (RUN-21).
+* Slice-2's schema harness was strengthened: appended steps are now verified by
+  **digest**, not only by key presence (a stale pin had slipped past the
+  S2.0 harness when v12 gained a column).
+
 ### S2.3 — deterministic content cleaning + FTS5
 
 * `pipeline/contentclean.py` — `clean(raw) → (markdown, text, lang, hash)`

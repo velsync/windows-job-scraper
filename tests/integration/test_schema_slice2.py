@@ -50,6 +50,7 @@ SLICE1_RELEASED_STEP_SHA256 = {
 #: Slice-2 released steps (v11+).  Each Slice-2 package appends its own pin.
 RELEASED_STEP_SHA256: dict[int, str] = {
     11: "dc3a29389a35b1e24396ac9d662cd6c6dfd460341d95125a3171a504f65e8ddb",
+    12: "912888da60343657e561504d7458e9e45707029a3c8e67399f2157f1b9faef60",
 }
 
 
@@ -77,6 +78,18 @@ def test_every_slice2_step_is_pinned_exactly_once():
     # no Slice-1 step is re-pinned here with a different digest
     for version, pinned in SLICE1_RELEASED_STEP_SHA256.items():
         assert RELEASED_STEP_SHA256.get(version, pinned) == pinned
+
+
+def test_slice2_released_bytes_are_pinned_by_digest():
+    """Every appended Slice-2 step is digest-pinned, not just keyed.
+
+    Key presence alone would let a committed migration be edited in place
+    (03 §50 append-only).  A deliberate change to a step already committed in
+    this slice means updating its digest here *and* in the review record.
+    """
+    for version, pinned in RELEASED_STEP_SHA256.items():
+        sql = next(sql for v, _name, sql in MIGRATION_STEPS if v == version)
+        assert _digest(sql) == pinned, f"Slice-2 step {version} was edited"
 
 
 def test_schema_version_matches_the_latest_step():

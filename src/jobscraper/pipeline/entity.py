@@ -49,10 +49,11 @@ def _title_similarity(a: str, b: str) -> float:
 @dataclass(frozen=True)
 class EntityResolution:
     job_id: str | None
-    decision: str  # CREATED | MATCHED | SPLIT_REUSE
+    decision: str  # CREATED | MATCHED | MATCHED_ORIGIN | MATCHED_URL | SPLIT_REUSE
     generation: int
     guard_fired: bool
     guard_evidence: dict
+    reason_code: str | None = None
 
 
 def _is_job_specific_url(url: str | None) -> bool:
@@ -88,15 +89,33 @@ def resolve_entity(
     observed_at: str,
     existing: sqlite3.Row | None,
     canonical_url_candidate: str | None = None,
+    origin=None,
 ) -> EntityResolution:
     """Decide the canonical identity for one normalized observation.
 
     Stage 1: same (source_id, source_job_id) is strong identity unless the
-    reuse guard fires. Stage 3 (§38): a sufficiently job-specific canonical
-    URL shared with an existing presence attaches the new source's
-    presence to that canonical job — no two canonical jobs are ever merged
-    by this stage, so no merge-ledger entry is required."""
+    reuse guard fires.  Stage 2 (§38, Slice 2): the same resolved
+    ``(origin_provider, origin_board, origin_job_id)`` across a *different*
+    source is a strong merge candidate, honoured only when the same
+    temporal/entity/content reuse guard passes and there is no meaningful
+    location disagreement (§38 stage 5) — otherwise it is recorded for review
+    and the jobs stay separate.  Stage 3 (§38): a sufficiently job-specific
+    canonical URL shared with an existing presence attaches the new source's
+    presence to that canonical job.
+
+    Both cross-source stages *attach a presence*; they never merge two
+    canonical jobs, so no merge ledger is required (the reversible merge
+    workflow belongs to a later slice)."""
     if existing is None:
+        origin_match = _origin_identity_match(
+            conn,
+            source_id=source_id,
+            normalized=normalized,
+            observed_at=observed_at,
+            origin=origin,
+        )
+        if origin_match is not None:
+            return origin_match
         if _is_job_specific_url(canonical_url_candidate):
             from jobscraper.net.urlnorm import url_identity
 
@@ -156,7 +175,75 @@ def resolve_entity(
     return EntityResolution(existing["job_id"], "MATCHED", int(existing["source_identity_generation"]), False, guard_evidence)
 
 
-def existing_row_company(conn: sqlite3.Connection, presence: sqlite3.Row) -> str | None:
+def _origin_identity_match(
+    conn: sqlite3.Connection,
+    *,
+    source_id: str,
+    normalized: NormalizedContent,
+    observed_at: str,
+    origin,
+) -> EntityResolution | None:
+    """§38 stage 2: shared resolved origin identity, guard-checked."""
+    from jobscraper.acquisition.origin import OriginStatus
+
+    if origin is None or origin.status is not OriginStatus.RESOLVED:
+        return None
+    if not (origin.origin_provider and origin.origin_board and origin.origin_job_id):
+        return None
+    row = conn.execute(
+        "SELECT * FROM job_sources WHERE origin_provider = ? AND origin_board = ?"
+        " AND origin_job_id = ? AND source_id <> ?"
+        " ORDER BY last_seen_at DESC, id LIMIT 1",
+        (origin.origin_provider, origin.origin_board, origin.origin_job_id, source_id),
+    ).fetchone()
+    if row is None:
+        return None
+
+    other_company = existing_row_company(conn, row)
+    company_incompatible = bool(
+        normalized.normalized_company and other_company
+        and normalized.normalized_company != other_company
+    )
+    prev_title = existing_row_title(conn, row)
+    title_similar = _title_similarity(normalized.title or "", prev_title or "") >= 0.3
+
+    from jobscraper.pipeline.locations import location_sets_conflict
+
+    location_conflict = location_sets_conflict(
+        normalized.location_records,
+        conn.execute(
+            "SELECT city, country FROM job_locations WHERE job_id = ?",
+            (row["job_id"],),
+        ).fetchall(),
+    )
+
+    evidence = {
+        "stage": "origin_identity",
+        "origin": [origin.origin_provider, origin.origin_board, origin.origin_job_id],
+        "company_incompatible": company_incompatible,
+        "title_similar": title_similar,
+        "location_conflict": location_conflict,
+    }
+    if company_incompatible or not title_similar or location_conflict:
+        # strong identity candidate, incompatible evidence -> review, not merge
+        return EntityResolution(
+            None,
+            "CREATED",
+            1,
+            True,
+            evidence,
+            reason_code=(
+                "LOCATION_DISAGREEMENT"
+                if location_conflict
+                else "ORIGIN_IDENTITY_REVIEW"
+            ),
+        )
+    return EntityResolution(
+        row["job_id"], "MATCHED_ORIGIN", int(row["source_identity_generation"]), False, evidence
+    )
+
+
+def existing_row_company(conn: sqlite3.Connection, presence) -> str | None:
     row = conn.execute(
         "SELECT company_id FROM jobs WHERE id = ?", (presence["job_id"],)
     ).fetchone()

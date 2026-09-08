@@ -141,6 +141,20 @@ class ResultEnvelope:
     cache_representation_ref: str | None = None
     structured_payload: object | None = None
 
+    @property
+    def content_kind(self) -> str:
+        """Coarse content class the provenance quality ordering needs (§39).
+
+        Derived from the response's own declared type — never from what the
+        parser hoped to find.
+        """
+        ctype = (self.content_type or "").lower()
+        if "json" in ctype or "xml" in ctype or "x-ndjson" in ctype:
+            return "STRUCTURED"
+        if "html" in ctype or "xml" in ctype:
+            return "HTML"
+        return "UNKNOWN"
+
     @staticmethod
     def make_body_hash(body: bytes) -> str:
         return hashlib.sha256(body).hexdigest()

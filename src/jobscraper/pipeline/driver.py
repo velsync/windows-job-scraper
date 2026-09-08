@@ -419,6 +419,11 @@ def _execute_plan(
                         fetch_attempt_id=fetch_attempt_id,
                         parse_attempt_id=parse_attempt_id,
                         origin=origin,
+                        content_kind=result.content_kind,
+                        same_host_as_source=posting_host_matches_source(
+                            source, observation
+                        ),
+                        source_family=source["source_family"] if source else None,
                     )
                     if observation.source_job_id:
                         record_seen_identity(
@@ -512,6 +517,32 @@ def _execute_plan(
             now=db_utc_now(conn),
         )
     set_group_outcome(conn, plan_row["id"], outcome, now=db_utc_now(conn))
+
+
+def posting_host_matches_source(source_row, observation) -> bool:
+    """01 §39 employer-vs-aggregator input: is the posting link *on the host
+    this source is about*?  Derived from already-recorded URLs only — no new
+    request is made to find out."""
+    from urllib.parse import urlsplit
+
+    def host_of(value):
+        try:
+            return (urlsplit(value).hostname or "").lower()
+        except Exception:
+            return ""
+
+    entry = host_of(source_row["entry_url"] if source_row else "")
+    if not entry:
+        return False
+    # the *posting* links only: a feed item's raw_url is usually the page it
+    # was found on, which says nothing about where the posting lives
+    for candidate in (
+        getattr(observation, "canonical_url_candidate", None),
+        getattr(observation, "application_url_candidate", None),
+    ):
+        if candidate and host_of(candidate) == entry:
+            return True
+    return False
 
 
 def _record_evidence(
@@ -661,4 +692,4 @@ def _persist_parse_attempt(conn, envelope, outcome, validated, ts) -> str:
     return parse_attempt_id
 
 
-__all__ = ["execute_run", "source_policy"]
+__all__ = ["execute_run", "posting_host_matches_source", "source_policy"]

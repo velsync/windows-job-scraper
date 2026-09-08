@@ -157,6 +157,18 @@ class NormalizedContent:
     salary_period: str | None
     posted_at: str | None
     locations: tuple
+    # ---- Slice 2 S2.2 (01 §33.1/§33.2): structured location set + the two
+    # categorical fields the canonical projection presents.
+    location_records: tuple = ()
+    remote_mode: str = "UNSPECIFIED"
+    remote_worldwide: int = 0
+    employment_type: str | None = None
+    experience_level: str | None = None
+    # §33.1 company identity signals, surfaced by normalization so resolution
+    # reads normalized evidence rather than re-reading raw fields
+    careers_url: str | None = None
+    organization_domains: tuple[str, ...] = ()
+    company_country: str | None = None
 
     @property
     def content_hash(self) -> str:
@@ -193,7 +205,72 @@ def normalize_company(name: str) -> str:
     return re.sub(r"\s+", " ", lowered).strip()
 
 
-def normalize_observation(observation) -> NormalizedContent:
+#: Categorical employment types the product distinguishes (01 §33).  Anything
+#: the source words differently stays None: an unlisted value is never coerced
+#: into a listed one.
+EMPLOYMENT_TYPES = {
+    "full time": "FULL_TIME",
+    "full-time": "FULL_TIME",
+    "fulltime": "FULL_TIME",
+    "part time": "PART_TIME",
+    "part-time": "PART_TIME",
+    "contract": "CONTRACT",
+    "contractor": "CONTRACT",
+    "temporary": "TEMPORARY",
+    "temp": "TEMPORARY",
+    "internship": "INTERNSHIP",
+    "intern": "INTERNSHIP",
+    "trainee": "INTERNSHIP",
+    "volunteer": "VOLUNTEER",
+    "freelance": "FREELANCE",
+    "seasonal": "SEASONAL",
+    "apprenticeship": "APPRENTICESHIP",
+}
+
+#: Experience levels, from the source's own wording (01 §33).
+EXPERIENCE_LEVELS = {
+    "intern": "INTERN",
+    "entry": "ENTRY",
+    "entry level": "ENTRY",
+    "junior": "JUNIOR",
+    "mid": "MID",
+    "mid level": "MID",
+    "intermediate": "MID",
+    "senior": "SENIOR",
+    "staff": "STAFF",
+    "principal": "PRINCIPAL",
+    "lead": "LEAD",
+    "manager": "MANAGER",
+    "head": "HEAD",
+    "director": "DIRECTOR",
+    "vp": "VP",
+    "vice president": "VP",
+    "executive": "EXECUTIVE",
+    "c level": "EXECUTIVE",
+}
+
+
+def normalize_employment_type(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return EMPLOYMENT_TYPES.get(value.strip().lower())
+
+
+def normalize_experience_level(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if text in EXPERIENCE_LEVELS:
+        return EXPERIENCE_LEVELS[text]
+    # a sentence-level marker ("Senior Backend Engineer") is still the
+    # source's own word about level, so the leading token is consulted
+    first = text.split()[0] if text.split() else ""
+    return EXPERIENCE_LEVELS.get(first)
+
+
+def normalize_observation(
+    observation, *, observed_at: str | None = None
+) -> NormalizedContent:
     """Deterministic normalization of one observation's fields (01 §34)."""
     fields = dict(observation.fields or {})
     title = str(fields.get("title") or "").strip()
@@ -208,14 +285,34 @@ def normalize_observation(observation) -> NormalizedContent:
     s_min = s_max = s_cur = s_per = None
     if salary_text:
         s_min, s_max, s_cur, s_per = parse_salary(salary_text)
-    locations = fields.get("locations") or []
-    if isinstance(locations, str):
-        locations = [locations]
+    location_fields = fields.get("locations") or fields.get("location") or []
+    if isinstance(location_fields, str):
+        location_fields = [location_fields]
+    from jobscraper.pipeline.locations import (
+        normalize_locations,
+        remote_mode_of,
+        remote_worldwide,
+    )
+
+    location_records = normalize_locations(
+        location_fields,
+        job_location_type=fields.get("job_location_type"),
+        applicant_location_requirements=fields.get("applicant_location_requirements"),
+        reference_at=observed_at,
+    )
+    locations = tuple(record.raw_text for record in location_records)
     return NormalizedContent(
         title=title,
         normalized_title=normalize_title(title),
         company_name=company,
         normalized_company=normalize_company(company) if company else None,
+        careers_url=str(fields.get("careers_url") or "").strip() or None,
+        organization_domains=tuple(
+            str(v).strip()
+            for v in (fields.get("organization_domains") or [])
+            if str(v).strip()
+        ),
+        company_country=str(fields.get("company_country") or "").strip() or None,
         description_md=description_md,
         description_text=description_text,
         description_lang=detect_language(description_text or ""),
@@ -226,15 +323,24 @@ def normalize_observation(observation) -> NormalizedContent:
         salary_currency=s_cur,
         salary_period=s_per,
         posted_at=fields.get("posted_at"),
-        locations=tuple(str(loc) for loc in locations),
+        locations=locations,
+        location_records=location_records,
+        remote_mode=remote_mode_of(location_records),
+        remote_worldwide=1 if remote_worldwide(location_records) else 0,
+        employment_type=normalize_employment_type(fields.get("employment_type")),
+        experience_level=normalize_experience_level(fields.get("experience_level")),
     )
 
 
 __all__ = [
+    "EMPLOYMENT_TYPES",
+    "EXPERIENCE_LEVELS",
     "NORMALIZATION_VERSION",
     "NormalizedContent",
     "detect_language",
     "normalize_company",
+    "normalize_employment_type",
+    "normalize_experience_level",
     "normalize_observation",
     "normalize_title",
     "parse_salary",

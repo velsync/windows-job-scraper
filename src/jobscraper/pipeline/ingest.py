@@ -89,6 +89,9 @@ def ingest_observation(
     fetch_attempt_id: str | None = None,
     parse_attempt_id: str | None = None,
     origin: OriginResolution | None = None,
+    content_kind: str | None = None,
+    same_host_as_source: bool | None = None,
+    source_family: str | None = None,
 ) -> dict:
     """Ingest one observation proposal inside the caller's fence.
 
@@ -159,7 +162,23 @@ def ingest_observation(
             "idempotent": True,
         }
 
-    normalized = normalize_observation(observation)
+    normalized = normalize_observation(observation, observed_at=observed_at)
+
+    # 01 §33.1 company resolution runs on normalized evidence plus the §32
+    # origin result; a bare name is never a merge key.
+    from jobscraper.pipeline.companies import resolve_company, signals_from
+
+    company = resolve_company(
+        conn,
+        signals=signals_from(
+            normalized=normalized,
+            origin=origin,
+            application_url=observation.application_url_candidate or observation.raw_url,
+        ),
+        observation_id=observation_id,
+        observed_at=observed_at,
+        now=now,
+    )
     conn.execute(
         "UPDATE job_observations SET parse_evidence_ref = ? WHERE id = ?",
         (normalized.content_hash, observation_id),
@@ -200,18 +219,27 @@ def ingest_observation(
         observed_at=observed_at,
         existing=existing_presence,
         canonical_url_candidate=observation.canonical_url_candidate,
+        origin=origin,
     )
 
-    if resolution.decision == "CREATED":
+    if resolution.decision in ("CREATED", "SPLIT_REUSE"):
         job_id = _create_canonical_job(
-            conn, normalized=normalized, observed_at=observed_at, now=now
-        )
-    elif resolution.decision == "SPLIT_REUSE":
-        job_id = _create_canonical_job(
-            conn, normalized=normalized, observed_at=observed_at, now=now
+            conn,
+            normalized=normalized,
+            observed_at=observed_at,
+            now=now,
+            company_id=company.company_id,
         )
     else:
         job_id = resolution.job_id
+        if company.company_id:
+            # a company identified later (or a job created before company
+            # resolution existed) is filled in once, never re-pointed
+            conn.execute(
+                "UPDATE jobs SET company_id = ?, updated_at = ?"
+                " WHERE id = ? AND company_id IS NULL",
+                (company.company_id, now, job_id),
+            )
 
     conn.execute(
         "INSERT INTO entity_resolution_events (id, observation_id, job_id, stage,"
@@ -224,7 +252,7 @@ def ingest_observation(
             "native_identity_reuse_guard" if resolution.guard_fired else "native_identity_stage1",
             resolution.decision,
             None,
-            "REUSE_GUARD" if resolution.guard_fired else None,
+            resolution.reason_code or ("REUSE_GUARD" if resolution.guard_fired else None),
             json.dumps(resolution.guard_evidence, sort_keys=True, default=str),
             now,
         ),
@@ -268,6 +296,10 @@ def ingest_observation(
         # source's presence
         existing=existing_presence if resolution.decision == "MATCHED" else None,
         origin=origin,
+        content_kind=content_kind,
+        strategy=strategy,
+        same_host_as_source=same_host_as_source,
+        source_family=source_family,
     )
 
     if presence_updated:
@@ -308,45 +340,34 @@ def ingest_observation(
 
 
 def _create_canonical_job(
-    conn: sqlite3.Connection, *, normalized, observed_at: str, now: str
+    conn: sqlite3.Connection,
+    *,
+    normalized,
+    observed_at: str,
+    now: str,
+    company_id: str | None = None,
 ) -> str:
-    from jobscraper.pipeline.normalize import normalize_company
+    from jobscraper.pipeline.companies import COMPANY_RESOLUTION_VERSION
+    from jobscraper.pipeline.locations import (
+        LOCATION_RULES_VERSION,
+        project_job_locations,
+    )
+    from jobscraper.pipeline.provenance import PROVENANCE_SELECTOR_VERSION
 
-    company_id = None
-    if normalized.normalized_company:
-        existing = conn.execute(
-            "SELECT id FROM companies WHERE normalized_name = ?",
-            (normalized.normalized_company,),
-        ).fetchone()
-        if existing:
-            company_id = existing["id"]
-        else:
-            company_id = new_id("co")
-            conn.execute(
-                """
-                INSERT INTO companies (id, name, normalized_name, first_seen_at,
-                    created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    company_id,
-                    normalized.company_name,
-                    normalized.normalized_company,
-                    observed_at,
-                    now,
-                    now,
-                ),
-            )
     job_id = new_id("job")
     conn.execute(
         """
         INSERT INTO jobs (
             id, company_id, title, normalized_title, description_md,
             description_text, description_lang, description_hash,
+            employment_type, experience_level, remote_mode, remote_worldwide,
+            location_rules_version, company_resolution_version,
+            provenance_selector_version,
             salary_original_text, salary_min, salary_max, salary_currency,
             salary_period, posted_at, discovered_at, first_seen_at, last_seen_at,
             last_verified_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?, ?, ?)
         """,
         (
             job_id,
@@ -357,13 +378,20 @@ def _create_canonical_job(
             normalized.description_text,
             normalized.description_lang,
             normalized.description_hash,
+            normalized.employment_type,
+            normalized.experience_level,
+            normalized.remote_mode,
+            normalized.remote_worldwide,
+            LOCATION_RULES_VERSION,
+            COMPANY_RESOLUTION_VERSION,
+            PROVENANCE_SELECTOR_VERSION,
             normalized.salary_original_text,
             normalized.salary_min,
             normalized.salary_max,
             normalized.salary_currency,
             normalized.salary_period,
             normalized.posted_at,
-            now,
+            observed_at,
             observed_at,
             observed_at,
             observed_at,
@@ -371,17 +399,9 @@ def _create_canonical_job(
             now,
         ),
     )
-    if normalized.locations:
-        from jobscraper.ids import new_id as _new_id
-
-        for raw in normalized.locations:
-            conn.execute(
-                """
-                INSERT INTO job_locations (id, job_id, raw_text)
-                VALUES (?, ?, ?)
-                """,
-                (_new_id("jl"), job_id, raw),
-            )
+    project_job_locations(
+        conn, job_id=job_id, records=normalized.location_records
+    )
     return job_id
 
 
@@ -399,6 +419,10 @@ def _upsert_presence(
     now: str,
     existing: sqlite3.Row | None,
     origin: OriginResolution | None = None,
+    content_kind: str | None = None,
+    strategy: str | None = None,
+    same_host_as_source: bool | None = None,
+    source_family: str | None = None,
 ) -> str:
     if existing is None:
         presence_id = new_id("js")
@@ -412,10 +436,11 @@ def _upsert_presence(
                 last_seen_at, last_verified_at, presence_state, content_revision,
                 last_observation_id, origin_provider, origin_board, origin_job_id,
                 origin_resolution_confidence, origin_resolution_evidence_json,
-                origin_resolved_at, created_at, updated_at)
+                origin_resolved_at, source_quality_class, content_kind,
+                same_host_as_source, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     'ACTIVE', 1,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 presence_id,
@@ -434,6 +459,9 @@ def _upsert_presence(
                 observed_at,
                 observation_id,
                 *_origin_fields(origin, resolved_at=observed_at),
+                *_quality_fields(origin, content_kind=content_kind, strategy=strategy,
+                                 same_host_as_source=same_host_as_source,
+                                 source_family=source_family),
                 now,
                 now,
             ),
@@ -467,6 +495,9 @@ def _upsert_presence(
             origin_resolution_confidence = COALESCE(?, origin_resolution_confidence),
             origin_resolution_evidence_json = COALESCE(?, origin_resolution_evidence_json),
             origin_resolved_at = COALESCE(?, origin_resolved_at),
+            source_quality_class = COALESCE(?, source_quality_class),
+            content_kind = COALESCE(?, content_kind),
+            same_host_as_source = COALESCE(?, same_host_as_source),
             canonical_job_url = COALESCE(?, canonical_job_url),
             application_url = COALESCE(?, application_url),
             content_revision = CASE WHEN ? THEN content_revision + 1
@@ -481,6 +512,9 @@ def _upsert_presence(
             observed_at,
             observed_at,
             *_origin_fields(origin, resolved_at=observed_at),
+            *_quality_fields(origin, content_kind=content_kind, strategy=strategy,
+                             same_host_as_source=same_host_as_source,
+                             source_family=source_family),
             observation.canonical_url_candidate,
             observation.application_url_candidate,
             content_changed,
@@ -490,6 +524,42 @@ def _upsert_presence(
         ),
     )
     return existing["id"], True
+
+
+def _quality_fields(
+    origin,
+    *,
+    content_kind: str | None,
+    strategy: str | None = None,
+    same_host_as_source: bool | None = None,
+    source_family: str | None = None,
+) -> tuple:
+    """Presence-level §39 quality inputs, stored so selection is replayable."""
+    from jobscraper.pipeline.provenance import classify_source_quality
+
+    # the host question is about the *posting link* versus the source's own
+    # host (01 §39 employer-vs-aggregator); the caller passes it explicitly,
+    # falling back to what the §32 resolver recorded
+    same_host = (
+        same_host_as_source
+        if same_host_as_source is not None
+        else getattr(origin, "same_host_as_source", None) if origin else None
+    )
+    status = getattr(origin, "status", None)
+    quality = classify_source_quality(
+        strategy=strategy,
+        execution_class=None,
+        content_kind=content_kind,
+        same_host_as_source=bool(same_host),
+        source_family=source_family,
+        # what §32 recorded: is the resolved origin on the source's own host?
+        origin_on_source_host=(
+            None if origin is None else getattr(origin, "same_host_as_source", None)
+        ),
+        origin_status=status.value if status is not None else None,
+        origin_provider=getattr(origin, "origin_provider", None) if origin else None,
+    )
+    return (quality, content_kind, 1 if same_host else 0 if same_host is not None else None)
 
 
 def _origin_fields(origin: OriginResolution | None, *, resolved_at: str) -> tuple:
