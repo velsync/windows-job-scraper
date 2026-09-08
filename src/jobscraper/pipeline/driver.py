@@ -59,6 +59,7 @@ from jobscraper.pipeline.coverage import (
     open_coverage,
     record_seen_identity,
 )
+from jobscraper.pipeline.evidence import bounded_json
 from jobscraper.pipeline.ingest import ingest_observation
 from jobscraper.pipeline.normalize import NORMALIZATION_VERSION
 from jobscraper.pipeline.obligations import drain_all_obligations
@@ -526,12 +527,28 @@ def posting_host_matches_source(source_row, observation) -> bool:
     from urllib.parse import urlsplit
 
     def host_of(value):
+        if not value:
+            return ""
+        # ``canonical_host`` stores a bare host, while URLs carry a scheme;
+        # both spellings describe the same identity
+        text = value if "://" in value else f"//{value}"
         try:
-            return (urlsplit(value).hostname or "").lower()
+            return (urlsplit(text).hostname or "").lower()
         except Exception:
             return ""
 
-    entry = host_of(source_row["entry_url"] if source_row else "")
+    entry = ""
+    if source_row is not None:
+        keys = list(source_row.keys())
+        # an operator-recorded canonical host is the authoritative statement of
+        # what this source *is*; the entry URL is the fallback
+        if "canonical_host" in keys and source_row["canonical_host"]:
+            entry = host_of(source_row["canonical_host"])
+        # NOTE: nothing writes sources.canonical_host yet (v3 column, no
+        # registration field); it is preferred here so registration data, when
+        # it arrives, tightens the match instead of silently being ignored.
+        if not entry:
+            entry = host_of(source_row["entry_url"])
     if not entry:
         return False
     # the *posting* links only: a feed item's raw_url is usually the page it
@@ -578,7 +595,7 @@ def _record_evidence(
             observation_id,
             kind,
             ref,
-            json.dumps(detail, sort_keys=True, default=str)[:60000],
+            bounded_json(detail),
             content_hash,
             now,
             now,

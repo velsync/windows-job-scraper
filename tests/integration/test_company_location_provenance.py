@@ -508,3 +508,85 @@ def test_origin_resolution_status_is_durable_evidence_for_the_class(db):
         "SELECT detail_json FROM acquisition_evidence WHERE kind = 'ORIGIN_RESOLUTION'"
     ).fetchone()
     assert json.loads(evidence["detail_json"])["endpoint_rules_version"] == 1
+
+
+def test_a_late_lower_quality_presence_reasserts_the_winning_projection(db):
+    """§39/§38: canonical presentation is the *winner's*, restated every refresh.
+
+    When a weaker source arrives afterwards it does not own the presentation, so
+    the winner's retained observation payload is re-normalized and re-projected
+    (Slice-1 behavior).  The loser's *absence* of evidence must not erase the
+    employer's locations, and canonical drift is re-asserted rather than left to
+    rot until the winner is seen again.
+    """
+    employer_claim = _claim(db, source_id="src-employer", binding_id="bnd-employer")
+    _ingest(
+        db,
+        claim=employer_claim,
+        source_id="src-employer",
+        binding_id="bnd-employer",
+        observation=_employer_observation(),
+        content_kind="STRUCTURED",
+    )
+    agg_claim = _claim(db, source_id="src-agg", binding_id="bnd-agg")
+    _ingest(
+        db,
+        claim=agg_claim,
+        source_id="src-agg",
+        binding_id="bnd-agg",
+        observation=_aggregator_observation(locations=[]),
+        content_kind="STRUCTURED",
+        at=LATER,
+    )
+
+    # simulate canonical drift (e.g. a partial write from an earlier build)
+    db.conn.execute("UPDATE jobs SET title = 'DRIFTED'")
+    db.conn.execute("DELETE FROM job_locations")
+    db.conn.commit()
+
+    second_agg_claim = _claim(db, source_id="src-agg", binding_id="bnd-agg", now=LATER)
+    _ingest(
+        db,
+        claim=second_agg_claim,
+        source_id="src-agg",
+        binding_id="bnd-agg",
+        observation=_aggregator_observation(locations=[], title="Staff Backend Engineer @ Acme Data"),
+        content_kind="STRUCTURED",
+        at=LATER,
+    )
+
+    job = db.conn.execute("SELECT * FROM jobs").fetchone()
+    assert job["title"] == "Staff Backend Engineer"  # re-projected from the winner
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM job_locations WHERE job_id = ?", (job["id"],)
+    ).fetchone()[0] == 2  # the employer's Berlin + Paris, not the loser's emptiness
+    history = db.conn.execute(
+        "SELECT change_class FROM job_history WHERE job_id = ? ORDER BY rowid", (job["id"],)
+    ).fetchall()
+    assert [row[0] for row in history] == ["TITLE_CHANGED", "LOCATION_CHANGED"]
+    assert {
+        row[0] for row in db.conn.execute("SELECT source_id FROM job_sources")
+    } == {"src-employer", "src-agg"}
+
+
+def test_projection_is_left_alone_when_the_winner_has_no_retained_payload(db):
+    """No retained evidence means no re-projection — never an invention."""
+    from jobscraper.pipeline.canonical import _latest_observation_projection
+
+    employer_claim = _claim(db, source_id="src-employer", binding_id="bnd-employer")
+    _ingest(
+        db,
+        claim=employer_claim,
+        source_id="src-employer",
+        binding_id="bnd-employer",
+        observation=_employer_observation(),
+        content_kind="STRUCTURED",
+    )
+    presence = db.conn.execute("SELECT * FROM job_sources").fetchone()
+    assert _latest_observation_projection(db.conn, presence) is not None
+
+    db.conn.execute("UPDATE job_observations SET raw_payload_ref = NULL")
+    db.conn.execute("UPDATE job_observations SET raw_payload_ref = 'not json' ")
+    db.conn.commit()
+    presence = db.conn.execute("SELECT * FROM job_sources").fetchone()
+    assert _latest_observation_projection(db.conn, presence) is None

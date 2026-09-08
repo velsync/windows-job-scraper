@@ -129,42 +129,47 @@ def classify_source_quality(
     return AGGREGATOR_WITHOUT_RESOLVED_ORIGIN
 
 
-def class_for_presence(presence: Mapping) -> str:
+def _field(presence, name: str, default=None):
+    """Read a column from a ``sqlite3.Row`` or a plain dict, absence-tolerantly.
+
+    Selection is also used with projections that do not carry every column (and
+    pre-v12 rows have no quality class at all), so a missing key is a missing
+    signal — never a KeyError and never a fabricated value.
+    """
+    try:
+        keys = set(presence.keys())
+    except Exception:  # pragma: no cover - defensive for exotic mappers
+        keys = set()
+    if name not in keys:
+        return default
+    value = presence[name]
+    return default if value is None else value
+
+
+def class_for_presence(presence) -> str:
     """The presence's quality class, falling back for pre-v12 rows."""
-    stored = presence["source_quality_class"]
+    stored = _field(presence, "source_quality_class")
     if stored:
         return stored
-    strategy = presence["strategy_source"] if "strategy_source" in _keys(presence) else None
-    if strategy is None:
-        strategy = presence["strategy"] if "strategy" in _keys(presence) else None
+    strategy = _field(presence, "strategy_source") or _field(presence, "strategy")
     return _LEGACY_CLASS_BY_STRATEGY.get(strategy or "", AGGREGATOR_WITHOUT_RESOLVED_ORIGIN)
 
 
-def _keys(presence: Mapping) -> set:
-    try:
-        return set(presence.keys())
-    except Exception:  # pragma: no cover - defensive for exotic mappers
-        return set()
-
-
-def selection_key(presence: Mapping) -> tuple:
+def selection_key(presence) -> tuple:
     """Deterministic ordering key: §39 class, then strategy quality, then
     evidence recency.  The final stable-id tie-break is applied by the caller's
     iteration order, so a tie prefers the lexicographically smallest id."""
     from jobscraper.pipeline.canonical import STRATEGY_QUALITY
 
+    strategy = _field(presence, "strategy_source") or _field(presence, "strategy") or ""
     return (
         QUALITY_RANK.get(class_for_presence(presence), 0),
-        STRATEGY_QUALITY.get(
-            presence["strategy_source"] if "strategy_source" in _keys(presence)
-            else presence["strategy"] if "strategy" in _keys(presence) else "",
-            0,
-        ),
-        presence["last_seen_at"] or "",
+        STRATEGY_QUALITY.get(strategy, 0),
+        _field(presence, "last_seen_at", "") or "",
     )
 
 
-def select_canonical_provenance(presences: Sequence[Mapping]) -> Mapping:
+def select_canonical_provenance(presences: Sequence) -> list:
     """Pick the provenance whose content is presented on the canonical job.
 
     Ties resolve to the smallest ``id`` (stable across runs), so the projection
@@ -174,7 +179,7 @@ def select_canonical_provenance(presences: Sequence[Mapping]) -> Mapping:
         raise ValueError("cannot select canonical provenance from no presences")
     best = None
     best_key = None
-    for presence in sorted(presences, key=lambda p: p["id"]):
+    for presence in sorted(presences, key=lambda p: str(p["id"])):
         key = selection_key(presence)
         if best_key is None or key > best_key:
             best, best_key = presence, key
@@ -205,6 +210,7 @@ __all__ = [
     "PROVENANCE_SELECTOR_VERSION",
     "QUALITY_RANK",
     "SOURCE_QUALITY_CLASSES",
+    "_field",
     "class_for_presence",
     "classify_source_quality",
     "presences_for_job",

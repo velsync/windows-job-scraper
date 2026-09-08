@@ -216,3 +216,74 @@ def test_structured_organization_domains_are_honoured(db):
     second = _resolve(db.conn, name="Acme", organization_domains=("jobs.acme.example",))
     assert second.company_id == first.company_id
     assert second.matched_on == "ORG_DOMAIN"
+
+
+def test_late_older_sighting_never_moves_last_posting_backwards(db):
+    """``last_posting_at`` is a *last* posting stamp, not a write stamp.
+
+    Sources are re-observed out of order (a low-priority page arriving late),
+    so an attach carrying an older observation must not walk the company's
+    recency backwards — a monotone ``MAX`` keeps the freshest evidence.
+    """
+    fresh = resolve_company(
+        db.conn,
+        signals=_signals(careers_url="https://careers.acme.example/jobs"),
+        observation_id=None,
+        observed_at="2026-09-08T18:00:00.000000Z",
+        now="2026-09-08T18:00:00.000000Z",
+    )
+    assert fresh.decision == "CREATED"
+    later = resolve_company(
+        db.conn,
+        signals=_signals(careers_url="https://careers.acme.example/jobs"),
+        observation_id=None,
+        observed_at=NOW,  # *older* than the first sighting's timestamp
+        now="2026-09-08T19:00:00.000000Z",
+    )
+    assert later.decision == "ATTACHED"
+    row = db.conn.execute(
+        "SELECT last_posting_at FROM companies WHERE id = ?", (fresh.company_id,)
+    ).fetchone()
+    assert row["last_posting_at"] == "2026-09-08T18:00:00.000000Z"
+
+
+def test_an_unresolved_origin_never_mints_a_board_identity():
+    """02 §32: only a *resolved* origin identity may become an ``ATS_BOARD`` key.
+
+    The resolver reports partial matches (board seen, confidence too low) as
+    ``UNRESOLVED`` while still carrying the candidate values, and the substring
+    ``UNRESOLVED`` ends with ``RESOLVED`` — so the comparison must be explicit,
+    or a refused resolution would merge companies on evidence the resolver said
+    was insufficient.
+    """
+    from types import SimpleNamespace
+
+    from jobscraper.acquisition.origin import OriginResolution, OriginStatus
+    from jobscraper.pipeline.companies import signals_from
+
+    normalized = SimpleNamespace(
+        company_name="Acme Data",
+        company_country=None,
+        careers_url="https://careers.acme.example/jobs",
+        organization_domains=(),
+    )
+    partial = OriginResolution(
+        status=OriginStatus.UNRESOLVED,
+        confidence=0.4,
+        origin_provider="GREENHOUSE",
+        origin_board="acme",
+        origin_job_id="1234567",
+    )
+    signals = signals_from(normalized=normalized, origin=partial)
+    assert signals.ats_provider is None and signals.ats_board is None
+    assert ("ATS_BOARD", "GREENHOUSE/acme") not in signals.identifier_keys()
+
+    resolved = OriginResolution(
+        status=OriginStatus.RESOLVED,
+        confidence=0.95,
+        origin_provider="GREENHOUSE",
+        origin_board="acme",
+        origin_job_id="1234567",
+    )
+    strong = signals_from(normalized=normalized, origin=resolved)
+    assert strong.identifier_keys()[0] == ("ATS_BOARD", "GREENHOUSE/acme")

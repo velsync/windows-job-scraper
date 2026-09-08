@@ -19,6 +19,7 @@ ResultEnvelope → Observation → canonical pipeline``):
 
 from __future__ import annotations
 
+import hashlib
 import http.server
 import json
 import threading
@@ -28,6 +29,7 @@ import pytest
 from jobscraper.db.connection import Database
 from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
 from jobscraper.pipeline.driver import execute_run
+from jobscraper.pipeline.evidence import EVIDENCE_DETAIL_LIMIT
 from jobscraper.runtime.requests import enqueue_request
 from jobscraper.runtime.runs import create_run
 
@@ -349,3 +351,35 @@ def test_integrity_check_still_clean_after_evidence_writes(db):
     _run_once(db, "r1")
     assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_durable_evidence_blobs_are_parseable_and_within_the_bound(db):
+    """Truncation must never leave unreadable provenance behind (03 §30).
+
+    Review and export paths ``json.loads`` these columns.  Bounding the
+    serialized text with a slice would store invalid JSON, so the writer shrinks
+    the *document* and marks that it did.
+    """
+    _run_once(db, "bounded")
+    rows = db.conn.execute("SELECT id, kind, detail_json FROM acquisition_evidence").fetchall()
+    assert rows, "a completed run must leave durable evidence"
+    for row in rows:
+        payload = json.loads(row["detail_json"])  # must not raise
+        assert isinstance(payload, dict)
+        assert len(row["detail_json"]) <= EVIDENCE_DETAIL_LIMIT, (row["kind"], len(row["detail_json"]))
+
+
+def test_field_evidence_hash_matches_the_stored_excerpt(db):
+    """A hash a reader cannot reproduce is not evidence (03 §30)."""
+    _run_once(db, "hashes")
+    rows = db.conn.execute(
+        "SELECT field_name, excerpt, excerpt_hash FROM field_evidence"
+    ).fetchall()
+    assert rows, "the fixture feed must produce field evidence"
+    for row in rows:
+        if row["excerpt"]:
+            assert row["excerpt_hash"] == hashlib.sha256(row["excerpt"].encode()).hexdigest(), row[
+                "field_name"
+            ]
+        else:
+            assert row["excerpt_hash"] is None, row["field_name"]

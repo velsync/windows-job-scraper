@@ -190,12 +190,46 @@ def test_registry_has_no_dynamic_import_path():
     "table", ["jobs", "job_sources", "job_locations", "companies", "job_observations"]
 )
 def test_only_pipeline_writes_canonical_and_observation_state(table: str):
+    """Single writer for canonical/observation state — including deletion.
+
+    Slice 2's location projection rewrites ``job_locations`` rows, so the scan
+    covers ``DELETE FROM`` as well: a second place that can *erase* canonical
+    state is exactly as dangerous as a second place that can write it.
+    """
     writers = []
     for path in SRC.rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        if re.search(rf"INSERT INTO {table}\b", text) or re.search(rf"UPDATE {table}\b", text):
+        patterns = (
+            rf"INSERT INTO {table}\b",
+            rf"UPDATE {table}\b",
+            rf"DELETE FROM {table}\b",
+        )
+        if any(re.search(pattern, text) for pattern in patterns):
             writers.append(path.relative_to(REPO_ROOT).as_posix())
     assert all(w.startswith("src/jobscraper/pipeline/") for w in writers), (table, writers)
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "job_observations",
+        "field_evidence",
+        "fetch_attempts",
+        "parse_attempts",
+        "acquisition_evidence",
+    ],
+)
+def test_immutable_evidence_is_never_deleted(table: str):
+    """Provenance and evidence rows are append-only (03 §30, RUN-12/21).
+
+    Canonical *projections* may be rewritten (they are derived), but the
+    evidence they were derived from must survive: no DELETE path may exist for
+    an observation, its field evidence, or the fetch/parse/result-evidence
+    records behind it.
+    """
+    for path in SRC.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        assert not re.search(rf"DELETE FROM {table}\b", text), (path, table)
 
 
 def test_observation_ingest_only_ever_runs_inside_the_fence():

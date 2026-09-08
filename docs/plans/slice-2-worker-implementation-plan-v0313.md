@@ -449,3 +449,53 @@ content) still denied.
   ROAD-08; the FTS surface is extensible and the absence is reported.
 * User-facing merge/undo flow: Slice 2 adds only the normative origin-identity
   resolution stages; the merge ledger/undo UX is ROAD-05.
+
+## 5. Corrective review of S2.0–S2.2 (fixed, not merely reported)
+
+A line-by-line review of the committed Slice-2 work found five defects and one
+regression. All six are fixed here, each with a test that fails without the fix;
+none changed a migration byte, so schema v11/v12 digests stay valid.
+
+1. **Unresolved origin could mint a company identity.** `companies.signals_from`
+   tested `str(status).upper().endswith("RESOLVED")`, which is true for
+   `UNRESOLVED` — a resolution that said "insufficient evidence" would have
+   created an `ATS_BOARD` key and merged companies on it. Now an explicit
+   comparison against the resolver's own `RESOLVED` value.
+2. **`companies.last_posting_at` could move backwards.** It was overwritten with
+   every attach, so a late arrival carrying older evidence made a company look
+   stale. Now `MAX(COALESCE(last_posting_at, ?), ?)`.
+3. **Durable evidence JSON could be stored unparseable.** Both the driver's
+   `_record_evidence` and ingest's `ORIGIN_RESOLUTION` detail bounded size by
+   slicing `json.dumps(...)` at 60 000 characters, which truncates mid-token:
+   the row then fails `json.loads` for every reader (review UI, export, and the
+   per-presence origin projection). `pipeline/evidence.bounded_json` is now the
+   single owner of the bound: it shrinks the *document*, preserves the shape,
+   and adds an explicit `_truncated` marker plus the original length.
+4. **Field-evidence hash did not describe the stored row.** The full excerpt was
+   hashed while `excerpt[:500]` was persisted, so the hash could not be
+   reproduced by a reader. `excerpt_and_hash` derives both from the same bytes.
+5. **`sources.canonical_host` was declared but never read.** The employer-vs-
+   aggregator input derived the source's host from `entry_url` only. A source
+   registered with a canonical host would have been classified from the wrong
+   identity, so the recorded host is now preferred (bare-host and URL spellings
+   both accepted) with the entry URL as fallback. Nothing writes that column yet;
+   the read is forward-compatible, and it is noted as such at the call site.
+6. **Regression: the winning presence's re-projection had been dropped.** S2.2
+   narrowed `refresh_canonical_presentation` to normalize only the freshest
+   presence and to set the winner's projection to `None` otherwise, which
+   deleted the accepted Slice-1 behavior of re-normalizing the winner's retained
+   observation payload. `job_observations.raw_payload_ref` *does* hold the
+   observation fields, so the path was live, not dead weight: it is restored as
+   `_latest_observation_projection`, re-normalizing with the observation's own
+   `observed_at` (so timezone offsets still derive from the evidence time, not
+   the wall clock) and leaving the projection untouched when no payload is
+   retained. Locations are rewritten only when the projected set genuinely
+   disagrees, so a weaker presence's *silence* never erases the employer's set.
+   This amends the S2.2 note "re-projected only when the fresh presence owns the
+   presentation" in §2.
+7. **Contract harness blind spot (test-only).** The single-writer scan for
+   `jobs`/`job_sources`/`job_locations`/`companies`/`job_observations` matched
+   `INSERT INTO`/`UPDATE` only, so a second *delete* path would have passed; it
+   now matches `DELETE FROM` too, and a new test forbids any `DELETE FROM` for
+   the immutable evidence tables (`job_observations`, `field_evidence`,
+   `fetch_attempts`, `parse_attempts`, `acquisition_evidence`).

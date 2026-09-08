@@ -56,19 +56,39 @@ def presences_for_job(conn: sqlite3.Connection, job_id: str) -> list[sqlite3.Row
     return _presences(conn, job_id)
 
 
-def _latest_observation_fields(conn: sqlite3.Connection, presence: sqlite3.Row) -> dict:
-    obs_id = presence["last_observation_id"]
-    if not obs_id:
-        return {}
+def _latest_observation_projection(conn: sqlite3.Connection, presence: sqlite3.Row):
+    """Re-normalize the winning presence's retained payload (Slice-1 behavior).
+
+    A presence that is not the freshest one still owns the canonical
+    presentation when its quality class wins, so its content — text, salary,
+    categorical fields and the derived location set — is re-projected from the
+    payload retained on its own observation.  No new fetch is performed and
+    nothing is invented: no retained payload means no re-projection.
+    """
+    observation_id = presence["last_observation_id"]
+    if not observation_id:
+        return None
     row = conn.execute(
-        "SELECT raw_payload_ref FROM job_observations WHERE id = ?", (obs_id,)
+        "SELECT raw_payload_ref, observed_at FROM job_observations WHERE id = ?",
+        (observation_id,),
     ).fetchone()
     if row is None or not row["raw_payload_ref"]:
-        return {}
+        return None
     try:
-        return json.loads(row["raw_payload_ref"])
+        fields = json.loads(row["raw_payload_ref"])
     except ValueError:
-        return {}
+        return None
+    if not isinstance(fields, dict):
+        return None
+
+    class _RetainedObservation:
+        """The minimal shape ``normalize_observation`` reads from a proposal."""
+
+    shim = _RetainedObservation()
+    shim.fields = fields
+    from jobscraper.pipeline.normalize import normalize_observation
+
+    return normalize_observation(shim, observed_at=row["observed_at"])
 
 
 def refresh_canonical_presentation(
@@ -99,26 +119,27 @@ def refresh_canonical_presentation(
 
     presences = presences_for_job(conn, job_id)
     winner = select_canonical_provenance(presences)
-    winner_norm = normalized if winner["id"] == fresh_presence_id else None
+    # the freshest presence is already normalized by the caller; a non-fresh
+    # winner is re-projected from its own retained payload
+    winner_norm = (
+        normalized
+        if winner["id"] == fresh_presence_id
+        else _latest_observation_projection(conn, winner)
+    )
 
     job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     changes: list[str] = []
 
-    if winner["id"] == fresh_presence_id:
-        new_title = winner_norm.title or job["title"]
-        if new_title != job["title"]:
-            changes.append("TITLE_CHANGED")
-        new_desc_hash = winner_norm.description_hash or job["description_hash"]
-        if new_desc_hash != job["description_hash"]:
-            changes.append("CONTENT_CHANGED")
-    else:
-        # Another presence still owns the presentation (a lower-quality or
-        # older arrival cannot displace it, and this slice re-normalizes only
-        # the fresh evidence, so the current projection stands unchanged).
-        new_title = job["title"]
-        new_desc_hash = job["description_hash"]
-        winner_norm = None
+    new_title = (winner_norm.title if winner_norm else None) or job["title"]
+    if new_title != job["title"]:
+        changes.append("TITLE_CHANGED")
+    new_desc_hash = (
+        winner_norm.description_hash if winner_norm else None
+    ) or job["description_hash"]
+    if new_desc_hash != job["description_hash"]:
+        changes.append("CONTENT_CHANGED")
 
+    location_changed = False
     if winner_norm is not None:
         location_changed = not location_rows_equal(
             conn.execute(
@@ -130,8 +151,6 @@ def refresh_canonical_presentation(
         )
         if location_changed:
             changes.append("LOCATION_CHANGED")
-    else:
-        location_changed = False
 
     conn.execute(
         """
@@ -175,7 +194,7 @@ def refresh_canonical_presentation(
             job_id,
         ),
     )
-    if winner_norm is not None:
+    if winner_norm is not None and location_changed:
         project_job_locations(conn, job_id=job_id, records=winner_norm.location_records)
     for change_class in changes:
         record_change(conn, job_id, change_class, now)

@@ -197,10 +197,15 @@ def signals_from(*, normalized, origin=None, application_url: str | None = None)
     """Build the resolution signals from normalized evidence + origin result.
 
     The ATS identity only counts when §32 actually resolved it: an unresolved
-    origin contributes name/host signals, never a board key.
+    origin contributes name/host signals, never a board key (02 §32).
     """
     provider = board = None
-    resolved = origin is not None and str(getattr(origin, "status", "")).upper().endswith("RESOLVED")
+    # explicit equality on the resolver's own status value: a substring test
+    # would read UNRESOLVED as "…RESOLVED" and mint a board identity from a
+    # resolution that said the opposite
+    status = getattr(origin, "status", None)
+    status_value = getattr(status, "value", status)
+    resolved = origin is not None and str(status_value).upper() == "RESOLVED"
     if resolved:
         provider = getattr(origin, "origin_provider", None)
         board = getattr(origin, "origin_board", None)
@@ -289,7 +294,7 @@ def resolve_company(
                 ats_provider = COALESCE(ats_provider, ?),
                 ats_board = COALESCE(ats_board, ?),
                 country = COALESCE(country, ?),
-                last_posting_at = ?,
+                last_posting_at = MAX(COALESCE(last_posting_at, ?), ?),
                 updated_at = ?
             WHERE id = ?
             """,
@@ -299,6 +304,7 @@ def resolve_company(
                 signals.ats_provider,
                 signals.ats_board,
                 signals.country,
+                observed_at,
                 observed_at,
                 now,
                 company_id,

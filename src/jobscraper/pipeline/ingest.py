@@ -32,6 +32,7 @@ from jobscraper.pipeline.canonical import (
     record_change,
     refresh_canonical_presentation,
 )
+from jobscraper.pipeline.evidence import bounded_json, excerpt_and_hash
 from jobscraper.pipeline.entity import (
     find_current_presence,
     resolve_entity,
@@ -184,6 +185,7 @@ def ingest_observation(
         (normalized.content_hash, observation_id),
     )
     for evidence in observation.field_evidence:
+        stored_excerpt, excerpt_hash = excerpt_and_hash(evidence.excerpt)
         conn.execute(
             """
             INSERT INTO field_evidence (
@@ -199,14 +201,14 @@ def ingest_observation(
                 evidence.locator_kind,
                 evidence.locator_value,
                 evidence.value_hash,
-                evidence.excerpt[:500],
+                stored_excerpt,
                 now,
                 evidence.evidence_start,
                 evidence.evidence_end,
                 evidence.source_url,
-                hashlib.sha256(evidence.excerpt.encode()).hexdigest()
-                if evidence.excerpt
-                else None,
+                # hashed over what is *stored*, so a reader can verify the
+                # excerpt in this row instead of chasing a dropped remainder
+                excerpt_hash,
             ),
         )
 
@@ -273,7 +275,7 @@ def ingest_observation(
                 attempt_id,
                 observation_id,
                 origin.origin_url,
-                json.dumps(origin.as_dict(), sort_keys=True, default=str)[:60000],
+                bounded_json(origin.as_dict()),
                 None,
                 observed_at,
                 now,
