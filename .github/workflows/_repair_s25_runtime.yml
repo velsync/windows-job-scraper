@@ -1,8 +1,6 @@
 name: Apply S2.5 runtime corrective
-# Replay marker: evidence RED tests are now part of the branch lineage.
-# Sequential replay: stage the already-tested tree on a fresh ref so the
-# host-owned repair ref can be fast-forwarded through the GitHub API.
-# Retry marker: staging ref pre-created by corrective authority.
+# Materialize the exact focused-green corrective as an orphan Git object.
+# Branch movement is intentionally delegated to the authenticated GitHub connector.
 
 on:
   push:
@@ -37,10 +35,57 @@ jobs:
           .repair-venv/bin/python -m pip install -r requirements/dev.lock.txt
           .repair-venv/bin/python -m pip install --no-deps .
           .repair-venv/bin/python -m pytest tests/integration/test_s2_5_runtime_correctives.py tests/unit/test_s2_5_greenhouse_contract_correctives.py tests/unit/test_contentclean.py -q
-      - name: Commit corrected production code
+      - name: Materialize tested tree as Git object
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "velsync"
-          git config user.email "velsync@gmail.com"
-          git add -A
-          git commit -m "fix(s2.5): separate listing coverage from detail completion"
-          git push origin HEAD:refs/heads/stage/s2.5-runtime-corrective-20260909
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import urllib.request
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          parent = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          base_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+          paths = [p for p in subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines() if p]
+          if not paths:
+              raise SystemExit("no corrective changes to materialize")
+
+          def post(endpoint, payload):
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/{endpoint}",
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req) as response:
+                  return json.load(response)
+
+          entries = []
+          for path in paths:
+              raw = open(path, "rb").read()
+              blob = post("git/blobs", {
+                  "content": base64.b64encode(raw).decode("ascii"),
+                  "encoding": "base64",
+              })["sha"]
+              mode_line = subprocess.check_output(["git", "ls-files", "-s", "--", path], text=True).strip()
+              mode = mode_line.split()[0] if mode_line else "100644"
+              entries.append({"path": path, "mode": mode, "type": "blob", "sha": blob})
+
+          tree = post("git/trees", {"base_tree": base_tree, "tree": entries})["sha"]
+          commit = post("git/commits", {
+              "message": "fix(s2.5): separate listing coverage from detail completion",
+              "tree": tree,
+              "parents": [parent],
+          })["sha"]
+          print(f"CORRECTIVE_COMMIT_SHA={commit}")
+          print("CORRECTIVE_PATHS=" + ",".join(paths))
+          PY
