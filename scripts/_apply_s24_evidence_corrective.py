@@ -39,7 +39,7 @@ assert ts.count(fixture_anchor) == 1
 if seed_helper not in ts:
     ts = ts.replace(fixture_anchor, seed_helper + fixture_anchor, 1)
 
-replacements = [
+seed_replacements = [
     (
         '''    def test_record_fingerprint_inserts_row(self, populated_db):\n        conn = populated_db.conn\n        fp = AtsFingerprint(\n''',
         '''    def test_record_fingerprint_inserts_row(self, populated_db):\n        conn = populated_db.conn\n        _seed_source(conn, "src-test")\n        fp = AtsFingerprint(\n''',
@@ -57,20 +57,19 @@ replacements = [
         '''    def test_record_route_decision_inserts_row(self, populated_db):\n        conn = populated_db.conn\n        _seed_source(conn, "src-test")\n        fp = AtsFingerprint(\n''',
     ),
     (
-        '''        decision = RouteDecision(\n            outcome=RouteOutcome.SPECIALIZED,\n''',
-        '''        record_fingerprint(\n            conn, source_id="src-test", url="https://boards.greenhouse.io/acme",\n            fingerprint=fp, now="2026-09-08T00:00:00.500000Z",\n        )\n        decision = RouteDecision(\n            outcome=RouteOutcome.SPECIALIZED,\n''',
-    ),
-    (
         '''    def test_record_route_decision_is_append_only(self, populated_db):\n        conn = populated_db.conn\n        fp = AtsFingerprint(\n''',
         '''    def test_record_route_decision_is_append_only(self, populated_db):\n        conn = populated_db.conn\n        _seed_source(conn, "src-1")\n        fp = AtsFingerprint(\n''',
     ),
 ]
-for old_text, new_text in replacements:
+for old_text, new_text in seed_replacements:
     assert ts.count(old_text) == 1, old_text
     ts = ts.replace(old_text, new_text, 1)
 
-# The second route test has the same RouteDecision spelling, so insert its
-# persisted fingerprint at the unique boundary immediately before r1.
+old = '''        row_id = record_route_decision(\n            conn,\n            source_id="src-test",\n            fingerprint=fp,\n'''
+new = '''        record_fingerprint(\n            conn, source_id="src-test", url="https://boards.greenhouse.io/acme",\n            fingerprint=fp, now="2026-09-08T00:00:00.500000Z",\n        )\n        row_id = record_route_decision(\n            conn,\n            source_id="src-test",\n            fingerprint=fp,\n'''
+assert ts.count(old) == 1
+ts = ts.replace(old, new, 1)
+
 old = '''        r1 = record_route_decision(\n            conn, source_id="src-1", fingerprint=fp,\n'''
 new = '''        record_fingerprint(\n            conn, source_id="src-1", url="https://boards.greenhouse.io/acme",\n            fingerprint=fp, now="2026-09-08T00:00:00.500000Z",\n        )\n        r1 = record_route_decision(\n            conn, source_id="src-1", fingerprint=fp,\n'''
 assert ts.count(old) == 1
