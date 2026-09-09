@@ -1,0 +1,111 @@
+name: Final S2.4-S2.5 corrective acceptance
+
+on:
+  push:
+    branches:
+      - repair/s2.4-s2.5-correctives-20260909
+    paths:
+      - .github/workflows/_corrective_acceptance_gate.yml
+
+permissions:
+  contents: write
+
+jobs:
+  acceptance:
+    name: Exact corrective gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: repair/s2.4-s2.5-correctives-20260909
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create venv (Ubuntu)
+        if: runner.os != 'Windows'
+        run: python -m venv .venv
+      - name: Create venv (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python -m venv .venv
+      - name: Install exact dev lock and package (Ubuntu)
+        if: runner.os != 'Windows'
+        run: |
+          .venv/bin/python -m pip install -r requirements/dev.lock.txt
+          .venv/bin/python -m pip install --no-deps .
+      - name: Install exact dev lock and package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .venv/Scripts/python -m pip install -r requirements/dev.lock.txt
+          .venv/Scripts/python -m pip install --no-deps .
+      - name: Run exact corrective gate (Ubuntu)
+        if: runner.os != 'Windows'
+        run: |
+          .venv/bin/python -m pytest -q
+          .venv/bin/python scripts/verify_slice0.py
+          .venv/bin/python scripts/verify_slice1.py
+          .venv/bin/python scripts/verify_slice2.py
+      - name: Run exact corrective gate (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .venv/Scripts/python -m pytest -q
+          .venv/Scripts/python scripts/verify_slice0.py
+          .venv/Scripts/python scripts/verify_slice1.py
+          .venv/Scripts/python scripts/verify_slice2.py
+
+  materialize:
+    name: Materialize clean accepted tree
+    needs: acceptance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: repair/s2.4-s2.5-correctives-20260909
+          fetch-depth: 0
+      - name: Create clean commit object without temporary gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess, urllib.request
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          parent = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          base_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+          def post(endpoint, payload):
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/{endpoint}",
+                  data=json.dumps(payload).encode(),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req) as response:
+                  return json.load(response)
+          tree = post("git/trees", {
+              "base_tree": base_tree,
+              "tree": [{
+                  "path": ".github/workflows/_corrective_acceptance_gate.yml",
+                  "mode": "100644",
+                  "type": "blob",
+                  "sha": None,
+              }],
+          })["sha"]
+          commit = post("git/commits", {
+              "message": "chore(repair): seal accepted S2.4-S2.5 corrective tree",
+              "tree": tree,
+              "parents": [parent],
+          })["sha"]
+          print(f"ACCEPTED_CLEAN_COMMIT_SHA={commit}")
+          PY
