@@ -1,0 +1,36 @@
+name: Apply S2.5 Greenhouse corrective
+
+on:
+  push:
+    branches:
+      - repair/s2.4-s2.5-correctives-20260909
+    paths:
+      - scripts/_apply_s25_greenhouse_corrective.py
+      - .github/workflows/_repair_s25_greenhouse.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out corrective branch
+        uses: actions/checkout@v4
+        with:
+          ref: repair/s2.4-s2.5-correctives-20260909
+          fetch-depth: 0
+      - name: Apply exact corrective replacements
+        run: python scripts/_apply_s25_greenhouse_corrective.py
+      - name: Validate patch shape
+        run: |
+          git diff --check
+          git status --short
+      - name: Commit corrected production code
+        run: |
+          git config user.name "velsync"
+          git config user.email "velsync@gmail.com"
+          git add -A
+          git commit -m "fix(s2.5): align Greenhouse authority and public contract"
+          git push origin HEAD:repair/s2.4-s2.5-correctives-20260909
