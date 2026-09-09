@@ -13,7 +13,7 @@ S2.7 (Ashby) has not begun.**
 - Branch: `arena/01a08691-windows-job-scraper`
 - **Base SHA:** `40cfe710ebf1a75765730d75d13577209ee357ec` (S2.6 corrective
   acceptance; CI `34383135549` SUCCESS Ubuntu + Windows / 3.12)
-- **Final SHA:** see "Seal" below
+- **Final SHA:** `ab1e58f3e2198ea9fd77de0d2e48735d9c2d002f` (corrective commit; this seal note is the only follow-up commit)
 - Scope: exactly the two findings carried forward by
   `docs/reviews/slice-2-s2.6-corrective-review-2026-09-09.md` §"Carried
   forward". No S2.7, no general S2.9, no adapter-API/queue/coverage
@@ -203,7 +203,9 @@ migration; the durable mechanism is the pre-existing
 
 ## CI
 
-Recorded in the "Seal" section after push.
+Run **`34386835053`** on `ab1e58f3…` — **SUCCESS**:
+`Automated test gate (Python 3.12, ubuntu-latest): success`,
+`Automated test gate (Python 3.12, windows-latest): success`.
 
 ## Intentionally deferred (recorded, not expanded into)
 
@@ -222,5 +224,7 @@ Recorded in the "Seal" section after push.
 
 ## Seal
 
-- Final commit SHA: _filled in the push step below_
-- CI run: _filled in after CI completes_
+- Corrective commit: `ab1e58f3e2198ea9fd77de0d2e48735d9c2d002f`
+- CI run `34386835053`: SUCCESS (ubuntu-latest + windows-latest, Python 3.12)
+- Sealed by this documentation-only commit; no production or test file
+  differs from `ab1e58f3…`.
