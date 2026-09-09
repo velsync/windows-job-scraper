@@ -453,6 +453,7 @@ class TestListParse:
             "declared_total": 3,
             "observed": 3,
             "detail_tasks": 2,
+            "rejected_members": 0,
         }
         assert any(
             item.get("reason") == "DETAIL_BUDGET_REACHED" for item in outcome.review_evidence
@@ -494,6 +495,7 @@ class TestListParse:
             "declared_total": 5,
             "observed": 2,
             "detail_tasks": 2,
+            "rejected_members": 0,
         }
 
     def test_changed_template_is_parse_marker_missing_not_success_empty(self):

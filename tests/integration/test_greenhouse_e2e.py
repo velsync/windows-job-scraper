@@ -1114,9 +1114,9 @@ def test_restart_recovery_drains_the_same_run_without_duplicates(db, server):
     The interrupted pass accepted three detail children and stopped on a host
     budget; the resumed pass drains exactly those, re-fetches nothing that
     already completed, and duplicates no observation, job, presence or company.
-    It also claims no terminal enumeration of its own: absence authority stays
-    with the generation that proved membership (RUN-13), so an interrupted run
-    can never expire postings.
+    Listing membership is already durable and complete after the first pass;
+    accepted detail work keeps the run partial only until that work is drained.
+    Restart must reuse that same coverage generation and never refetch listing truth.
     """
     from jobscraper.pipeline import driver as driver_module
 
@@ -1137,7 +1137,7 @@ def test_restart_recovery_drains_the_same_run_without_duplicates(db, server):
     assert len(jobs) == 3
 
     # restart: the same run, driven again from durable state only
-    assert execute_run(db.conn, run_id) == "PARTIAL"
+    assert execute_run(db.conn, run_id) == "SUCCEEDED"
 
     requests = _requests(db, run_id)
     assert [r["status"] for r in requests] == ["SUCCEEDED"] * 4
@@ -1152,11 +1152,11 @@ def test_restart_recovery_drains_the_same_run_without_duplicates(db, server):
     assert db.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == companies
 
     generations = _coverage(db)
-    assert len(generations) == 2
-    assert generations[0]["completion_state"] == "BUDGET_EXHAUSTED"
-    assert generations[1]["completion_state"] == "PARTIAL"
-    assert generations[1]["terminal_enumeration_proven"] == 0
-    # nothing was aged toward expiry by the interrupted or resumed generation
+    assert len(generations) == 1
+    assert generations[0]["completion_state"] == "COMPLETE"
+    assert generations[0]["terminal_enumeration_proven"] == 1
+    assert generations[0]["pages_completed"] == 1
+    # nothing was aged toward expiry while accepted detail work was pending
     assert db.conn.execute(
         "SELECT COUNT(*) FROM job_sources WHERE presence_state != 'ACTIVE'"
     ).fetchone()[0] == 0
