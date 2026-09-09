@@ -71,13 +71,16 @@ jobs:
 
           entries = []
           for path in paths:
+              mode_line = subprocess.check_output(["git", "ls-files", "-s", "--", path], text=True).strip()
+              mode = mode_line.split()[0] if mode_line else "100644"
+              if not os.path.exists(path):
+                  entries.append({"path": path, "mode": mode, "type": "blob", "sha": None})
+                  continue
               raw = open(path, "rb").read()
               blob = post("git/blobs", {
                   "content": base64.b64encode(raw).decode("ascii"),
                   "encoding": "base64",
               })["sha"]
-              mode_line = subprocess.check_output(["git", "ls-files", "-s", "--", path], text=True).strip()
-              mode = mode_line.split()[0] if mode_line else "100644"
               entries.append({"path": path, "mode": mode, "type": "blob", "sha": blob})
 
           tree = post("git/trees", {"base_tree": base_tree, "tree": entries})["sha"]
