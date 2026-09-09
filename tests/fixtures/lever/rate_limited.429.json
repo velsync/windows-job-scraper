@@ -1,0 +1,5 @@
+{
+  "ok": false,
+  "error": "Too many requests",
+  "retryAfter": 30
+}

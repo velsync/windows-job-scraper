@@ -1,0 +1,27 @@
+{
+  "id": "1a2b3c4d-0000-4000-8000-000000004003",
+  "text": "Senior Data Engineer",
+  "categories": {
+    "commitment": "Full-time",
+    "location": "Remote",
+    "team": "Data",
+    "allLocations": [
+      "Remote"
+    ]
+  },
+  "country": null,
+  "createdAt": 1788242400000,
+  "workplaceType": "remote",
+  "hostedUrl": "javascript:alert(document.cookie)",
+  "applyUrl": "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+  "descriptionPlain": "",
+  "description": "<div><p>Fully remote. You will own normalization and deduplication evidence.</p><script>document.write('inline script residue')</script><p><a href=\"javascript:alert(1)\">Click for salary</a> and a safe link <a href=\"https://acme.example/data?utm_campaign=hire\">team page</a>.</p><p>Also see <a href=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">encoded payload</a>.</p></div>",
+  "lists": [
+    {
+      "text": "Requirements",
+      "content": "<li>Python</li><li><a href=\"javascript:alert(2)\">hidden</a></li>"
+    }
+  ],
+  "additional": "",
+  "additionalPlain": ""
+}

@@ -35,7 +35,7 @@ SRC = REPO_ROOT / "src" / "jobscraper"
 # Slice-2 adapter package appends to this set consciously; nothing else may
 # register an adapter.  S2.5 graduates the first provider-native adapter
 # (02 §12.3); S2.6/S2.7 append Lever and Ashby only after `continue`.
-EXPECTED_BUILTIN_ADAPTERS = {"json_api_feed", "greenhouse"}
+EXPECTED_BUILTIN_ADAPTERS = {"json_api_feed", "greenhouse", "lever"}
 
 # Slice 2 supports the HTTP execution class only (02 §14; ROAD-07 defers
 # browser acquisition).  The router must report a browser-class candidate as

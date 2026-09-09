@@ -31,12 +31,12 @@ def test_conflicting_provider_signals_do_not_cross_subsidize_confidence():
 
 
 def test_unimplemented_provider_never_becomes_a_runnable_candidate():
-    """S2.5 has no Lever adapter yet, so routing must be capability-honest."""
+    """S2.6 has no Ashby adapter yet, so routing must be capability-honest."""
     fp = AtsFingerprint(
-        family="LEVER",
+        family="ASHBY",
         confidence=0.95,
         evidence=(),
-        recommended_adapter_id="lever",
+        recommended_adapter_id="ashby",
     )
 
     decision = plan_routes(

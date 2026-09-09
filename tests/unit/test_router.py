@@ -68,9 +68,25 @@ class TestStrategyPreferenceAndAvailability:
             ("PROVIDER_NATIVE", "greenhouse")
         ]
 
-    @pytest.mark.parametrize(
-        "family,adapter_id", [("LEVER", "lever"), ("ASHBY", "ashby")]
-    )
+    def test_lever_routes_to_the_implemented_provider_native_strategy(self):
+        """S2.6 graduated Lever: PROVIDER_NATIVE only, exactly like Greenhouse."""
+        decision = plan_routes(
+            fingerprint=_fp("LEVER", adapter="lever"),
+            supported_execution_classes=frozenset({"HTTP", "BROWSER"}),
+        )
+        assert decision.outcome is RouteOutcome.SPECIALIZED
+        assert [(c.strategy, c.adapter_id) for c in decision.candidates] == [
+            ("PROVIDER_NATIVE", "lever")
+        ]
+        # every other strategy stays an honest non-runnable hypothesis
+        assert {c.reason for c in decision.unsupported_candidates} == {
+            "STRATEGY_NOT_IMPLEMENTED", "MANUAL_UNSUPPORTED"
+        }
+        assert "ADAPTER_NOT_REGISTERED" not in {
+            c.reason for c in decision.unsupported_candidates
+        }
+
+    @pytest.mark.parametrize("family,adapter_id", [("ASHBY", "ashby")])
     def test_future_provider_is_not_advertised_as_runnable(self, family, adapter_id):
         assert adapter_id not in BUILTIN_ADAPTERS
         decision = plan_routes(

@@ -1,0 +1,55 @@
+[
+  {
+    "id": "1a2b3c4d-0000-4000-8000-000000004001",
+    "text": "Backend Engineer",
+    "categories": {
+      "commitment": "Full-time",
+      "location": "Berlin, Germany",
+      "team": "Engineering",
+      "allLocations": [
+        "Berlin, Germany"
+      ]
+    },
+    "country": "DE",
+    "createdAt": 1787032800000,
+    "workplaceType": "on-site",
+    "hostedUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004001",
+    "applyUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004001/apply"
+  },
+  {
+    "id": "1a2b3c4d-0000-4000-8000-000000004002",
+    "text": "Platform Engineer",
+    "categories": {
+      "commitment": "Full-time",
+      "location": "Berlin, Germany",
+      "team": "Infrastructure",
+      "allLocations": [
+        "Berlin, Germany",
+        "Paris, France"
+      ],
+      "department": "Technology"
+    },
+    "country": "DE",
+    "createdAt": 1788264000000,
+    "workplaceType": "hybrid",
+    "hostedUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004002",
+    "applyUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004002/apply"
+  },
+  {
+    "id": "1a2b3c4d-0000-4000-8000-000000004003",
+    "text": "Senior Data Engineer",
+    "categories": {
+      "commitment": "Full-time",
+      "location": "Remote",
+      "team": "Data",
+      "allLocations": [
+        "Remote"
+      ]
+    },
+    "country": null,
+    "createdAt": 1788242400000,
+    "workplaceType": "remote",
+    "hostedUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004003",
+    "applyUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004003/apply"
+  }
+]

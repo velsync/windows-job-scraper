@@ -100,6 +100,15 @@ _DETAIL_REQUEST_TYPES = frozenset({"DETAIL_FETCH"})
 _CLOSURE_CLASSES = frozenset({PageClass.NOT_FOUND, PageClass.JOB_CLOSED})
 _OPEN_REQUEST_STATUSES = ("PENDING", "RUNNING", "RETRY_WAIT")
 
+#: Provider-native built-ins whose Source entry host may be widened to the
+#: provider's reviewed API hosts (04 §5.1).  Host-owned reviewed data: a
+#: provider is listed here only once its adapter has graduated into the
+#: registry, and the hosts themselves come from the versioned endpoint table.
+_PROVIDER_NATIVE_ADAPTERS: dict[str, str] = {
+    "greenhouse": "GREENHOUSE",
+    "lever": "LEVER",
+}
+
 
 def source_policy(
     source_row: sqlite3.Row | dict, *, adapter_id: str | None = None
@@ -118,8 +127,9 @@ def source_policy(
         host = ""
 
     allowed_hosts: set[str] = {host} if host else set()
-    if adapter_id == "greenhouse" and host:
-        spec = spec_for_provider("GREENHOUSE")
+    provider = _PROVIDER_NATIVE_ADAPTERS.get(adapter_id or "")
+    if provider is not None and host:
+        spec = spec_for_provider(provider)
         if host in {*spec.hosted_hosts, *spec.api_hosts}:
             allowed_hosts.update(spec.api_hosts)
 

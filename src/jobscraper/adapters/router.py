@@ -54,6 +54,7 @@ _FAMILY_CANDIDATES: dict[str, tuple[tuple[str, str], ...]] = {
 # is attached to it.
 _IMPLEMENTED_STRATEGIES: dict[str, frozenset[str]] = {
     "greenhouse": frozenset({"PROVIDER_NATIVE"}),
+    "lever": frozenset({"PROVIDER_NATIVE"}),
     "json_api_feed": frozenset({"FEED_OR_PUBLIC_STRUCTURED_ENDPOINT"}),
 }
 

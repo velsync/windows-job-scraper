@@ -1,0 +1,30 @@
+[
+  {
+    "text": "Role without a source-native id",
+    "categories": {
+      "location": "Berlin, Germany",
+      "commitment": "Full-time"
+    },
+    "createdAt": 1786698000000,
+    "hostedUrl": "https://jobs.lever.co/missingfields/nope"
+  },
+  {
+    "id": "../../etc/passwd",
+    "text": "",
+    "categories": {
+      "location": "Berlin, Germany"
+    },
+    "createdAt": "not-a-timestamp",
+    "hostedUrl": "javascript:alert(1)",
+    "applyUrl": "javascript:alert(1)"
+  },
+  {
+    "id": "6b6c6d6e-0000-4000-8000-000000006103",
+    "text": null,
+    "categories": {
+      "location": "Berlin, Germany"
+    },
+    "createdAt": 1786870800000,
+    "hostedUrl": "https://jobs.lever.co/missingfields/6b6c6d6e-0000-4000-8000-000000006103"
+  }
+]

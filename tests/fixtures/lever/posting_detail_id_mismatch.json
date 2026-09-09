@@ -1,0 +1,22 @@
+{
+  "id": "9e9f9a9b-0000-4000-8000-000000009999",
+  "text": "Some Other Role",
+  "categories": {
+    "commitment": "Full-time",
+    "location": "Lisbon, Portugal",
+    "team": "Sales",
+    "allLocations": [
+      "Lisbon, Portugal"
+    ]
+  },
+  "country": null,
+  "createdAt": 1786957200000,
+  "workplaceType": "on-site",
+  "hostedUrl": "https://jobs.lever.co/idmismatch/9e9f9a9b-0000-4000-8000-000000009999",
+  "applyUrl": "https://jobs.lever.co/idmismatch/9e9f9a9b-0000-4000-8000-000000009999/apply",
+  "descriptionPlain": "",
+  "description": "<p>A different posting entirely.</p>",
+  "lists": [],
+  "additional": "",
+  "additionalPlain": ""
+}
