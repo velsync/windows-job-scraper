@@ -1,0 +1,39 @@
+{
+  "jobs": [
+    {
+      "id": "5a1b2c3d-0000-4000-8000-000000005001",
+      "title": "Backend Engineer",
+      "department": "Engineering",
+      "team": "Infrastructure",
+      "employmentType": "FullTime",
+      "location": "Berlin, Germany",
+      "secondaryLocations": [],
+      "publishedAt": "2026-06-01T09:30:00.000000+00:00",
+      "isListed": true,
+      "isRemote": false,
+      "workplaceType": "OnSite",
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005001",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005001/application",
+      "descriptionHtml": "<div><p>Own the ingestion pipeline for our local-first product.</p></div>",
+      "descriptionPlain": "Own the ingestion pipeline for our local-first product."
+    },
+    {
+      "id": "5a1b2c3d-0000-4000-8000-000000005009",
+      "title": "Stealth Role",
+      "department": "Engineering",
+      "team": "Infrastructure",
+      "employmentType": "FullTime",
+      "location": "Berlin, Germany",
+      "secondaryLocations": [],
+      "publishedAt": "2026-06-02T10:00:00.000000+00:00",
+      "isListed": false,
+      "isRemote": false,
+      "workplaceType": "OnSite",
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005009",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005009/application",
+      "descriptionHtml": "<div><p>This posting exists by direct link only.</p></div>",
+      "descriptionPlain": "This posting exists by direct link only."
+    }
+  ],
+  "apiVersion": "1"
+}

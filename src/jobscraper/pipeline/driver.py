@@ -109,6 +109,7 @@ _OPEN_REQUEST_STATUSES = ("PENDING", "RUNNING", "RETRY_WAIT")
 _PROVIDER_NATIVE_ADAPTERS: dict[str, str] = {
     "greenhouse": "GREENHOUSE",
     "lever": "LEVER",
+    "ashby": "ASHBY",
 }
 
 

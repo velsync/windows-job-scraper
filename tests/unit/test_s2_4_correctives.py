@@ -31,12 +31,13 @@ def test_conflicting_provider_signals_do_not_cross_subsidize_confidence():
 
 
 def test_unimplemented_provider_never_becomes_a_runnable_candidate():
-    """S2.6 has no Ashby adapter yet, so routing must be capability-honest."""
+    """An ATS family with no graduated adapter (§12.3 candidates beyond
+    Ashby) must never be advertised as runnable work."""
     fp = AtsFingerprint(
-        family="ASHBY",
+        family="WORKDAY",
         confidence=0.95,
         evidence=(),
-        recommended_adapter_id="ashby",
+        recommended_adapter_id="workday",
     )
 
     decision = plan_routes(

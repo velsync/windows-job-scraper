@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from jobscraper.adapters.ashby import AshbyAdapter
 from jobscraper.adapters.feed_api import FeedApiAdapter
 from jobscraper.adapters.greenhouse import GreenhouseAdapter
 from jobscraper.adapters.lever import LeverAdapter
@@ -22,6 +23,7 @@ BUILTIN_ADAPTERS = {
     "json_api_feed": FeedApiAdapter,
     "greenhouse": GreenhouseAdapter,
     "lever": LeverAdapter,
+    "ashby": AshbyAdapter,
 }
 
 

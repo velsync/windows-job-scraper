@@ -86,8 +86,29 @@ class TestStrategyPreferenceAndAvailability:
             c.reason for c in decision.unsupported_candidates
         }
 
-    @pytest.mark.parametrize("family,adapter_id", [("ASHBY", "ashby")])
+    def test_ashby_routes_to_the_implemented_provider_native_strategy(self):
+        """S2.7 graduated Ashby: PROVIDER_NATIVE only, exactly like Greenhouse
+        and Lever."""
+        decision = plan_routes(
+            fingerprint=_fp("ASHBY", adapter="ashby"),
+            supported_execution_classes=frozenset({"HTTP", "BROWSER"}),
+        )
+        assert decision.outcome is RouteOutcome.SPECIALIZED
+        assert [(c.strategy, c.adapter_id) for c in decision.candidates] == [
+            ("PROVIDER_NATIVE", "ashby")
+        ]
+        # every other strategy stays an honest non-runnable hypothesis
+        assert {c.reason for c in decision.unsupported_candidates} == {
+            "STRATEGY_NOT_IMPLEMENTED", "MANUAL_UNSUPPORTED"
+        }
+        assert "ADAPTER_NOT_REGISTERED" not in {
+            c.reason for c in decision.unsupported_candidates
+        }
+
+    @pytest.mark.parametrize("family,adapter_id", [("WORKDAY", "workday")])
     def test_future_provider_is_not_advertised_as_runnable(self, family, adapter_id):
+        """All three §12.3 providers are graduated; a family with no router
+        candidates still falls back honestly."""
         assert adapter_id not in BUILTIN_ADAPTERS
         decision = plan_routes(
             fingerprint=_fp(family, adapter=adapter_id),
@@ -95,7 +116,6 @@ class TestStrategyPreferenceAndAvailability:
         )
         assert decision.outcome is RouteOutcome.GENERIC_DISCOVERY_FALLBACK
         assert decision.candidates == ()
-        assert any(item.reason == "ADAPTER_NOT_REGISTERED" for item in decision.unsupported_candidates)
 
     def test_candidates_remain_in_authoritative_preference_order(self):
         decision = plan_routes(

@@ -166,6 +166,7 @@ EMPLOYMENT_TYPES = {
     "fulltime": "FULL_TIME",
     "part time": "PART_TIME",
     "part-time": "PART_TIME",
+    "parttime": "PART_TIME",
     "contract": "CONTRACT",
     "contractor": "CONTRACT",
     "temporary": "TEMPORARY",

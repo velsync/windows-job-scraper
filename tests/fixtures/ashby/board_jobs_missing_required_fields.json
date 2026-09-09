@@ -1,0 +1,18 @@
+{
+  "jobs": [
+    {
+      "title": "No Identifier Role",
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005077"
+    },
+    {
+      "id": "../../etc/passwd",
+      "title": "Traversal Identifier Role",
+      "jobUrl": "javascript:alert(1)"
+    },
+    {
+      "id": "5a1b2c3d-0000-4000-8000-000000005078",
+      "title": null
+    }
+  ],
+  "apiVersion": "1"
+}

@@ -1,0 +1,134 @@
+{
+  "jobs": [
+    {
+      "id": "5a1b2c3d-0000-4000-8000-000000005001",
+      "title": "Backend Engineer",
+      "department": "Engineering",
+      "team": "Infrastructure",
+      "employmentType": "FullTime",
+      "location": "Berlin, Germany",
+      "shouldDisplayCompensationOnJobPostings": true,
+      "secondaryLocations": [],
+      "publishedAt": "2026-06-01T09:30:00.000000+00:00",
+      "isListed": true,
+      "isRemote": false,
+      "workplaceType": "OnSite",
+      "address": {
+        "postalAddress": {
+          "postalCode": "",
+          "addressRegion": "Berlin",
+          "addressCountry": "Germany",
+          "addressLocality": "Berlin"
+        }
+      },
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005001",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005001/application",
+      "descriptionHtml": "<div><p>Own the ingestion pipeline for our local-first product.</p><p>Salary band is shared transparently with every candidate.</p></div>",
+      "descriptionPlain": "Own the ingestion pipeline for our local-first product.\nSalary band is shared transparently with every candidate.",
+      "compensation": {
+        "compensationTierSummary": "$150K – $210K • Offers Equity",
+        "scrapeableCompensationSalarySummary": "$150K - $210K",
+        "compensationTiers": [
+          {
+            "id": "0f1e2d3c-1111-4000-8000-000000000101",
+            "tierSummary": "$150K – $210K • Offers Equity",
+            "title": "Germany",
+            "additionalInformation": null,
+            "components": [
+              {
+                "id": "0f1e2d3c-1111-4000-8000-000000000102",
+                "summary": "$150K – $210K",
+                "compensationType": "Salary",
+                "interval": "1 YEAR",
+                "currencyCode": "USD",
+                "minValue": 150000,
+                "maxValue": 210000
+              }
+            ]
+          }
+        ],
+        "summaryComponents": [
+          {
+            "compensationType": "Salary",
+            "interval": "1 YEAR",
+            "currencyCode": "USD",
+            "minValue": 150000,
+            "maxValue": 210000
+          }
+        ]
+      }
+    },
+    {
+      "id": "5a1b2c3d-0000-4000-8000-000000005002",
+      "title": "Platform Engineer",
+      "department": "Engineering",
+      "team": "Platform",
+      "employmentType": "PartTime",
+      "location": "Berlin, Germany",
+      "secondaryLocations": [
+        {
+          "location": "Paris, France",
+          "address": {
+            "postalAddress": {
+              "addressRegion": "Île-de-France",
+              "addressCountry": "France",
+              "addressLocality": "Paris"
+            }
+          }
+        },
+        {
+          "location": "Lisbon, Portugal",
+          "address": {
+            "postalAddress": {
+              "addressRegion": "",
+              "addressCountry": "Portugal",
+              "addressLocality": "Lisbon"
+            }
+          }
+        }
+      ],
+      "publishedAt": "2026-06-03T14:05:00.000000+00:00",
+      "isListed": true,
+      "isRemote": false,
+      "workplaceType": "Hybrid",
+      "address": {
+        "postalAddress": {
+          "postalCode": "10115",
+          "addressRegion": "Berlin",
+          "addressCountry": "Germany",
+          "addressLocality": "Berlin"
+        }
+      },
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005002",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005002/application",
+      "descriptionHtml": "<div><p>Hybrid across our EU hubs. You will keep the platform boring.</p></div>",
+      "descriptionPlain": "Hybrid across our EU hubs. You will keep the platform boring."
+    },
+    {
+      "id": "5a1b2c3d-0000-4000-8000-000000005003",
+      "title": "Senior Data Engineer",
+      "department": "Data",
+      "team": "Data",
+      "employmentType": "FullTime",
+      "location": "Remote - European Union",
+      "secondaryLocations": [],
+      "publishedAt": "2026-06-05T16:45:00.000000+00:00",
+      "isListed": true,
+      "isRemote": true,
+      "workplaceType": "Remote",
+      "address": {
+        "postalAddress": {
+          "postalCode": "",
+          "addressRegion": "",
+          "addressCountry": "European Union",
+          "addressLocality": ""
+        }
+      },
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005003",
+      "applyUrl": "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+      "descriptionHtml": "<div><p>Fully remote. You will own normalization and deduplication evidence.</p><script>document.write('inline script residue')</script><p><a href=\"javascript:alert(1)\">Click for salary</a> and a safe link <a href=\"https://acme.example/data?utm_campaign=hire\">team page</a>.</p><p>Also see <a href=\"data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==\">encoded payload</a>.</p></div>",
+      "descriptionPlain": "Fully remote. You will own normalization and deduplication evidence."
+    }
+  ],
+  "apiVersion": "1"
+}

@@ -1,0 +1,44 @@
+{
+  "jobs": [
+    {
+      "id": "5a1b2c3d-0000-4000-8000-000000005001",
+      "title": "Backend Engineer",
+      "department": "Engineering",
+      "team": "Infrastructure",
+      "employmentType": "FullTime",
+      "location": "Berlin, Germany",
+      "secondaryLocations": [],
+      "publishedAt": "2026-06-01T09:30:00.000000+00:00",
+      "isListed": true,
+      "isRemote": false,
+      "workplaceType": "OnSite",
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005001",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005001/application",
+      "descriptionHtml": "<div><p>Own the ingestion pipeline for our local-first product.</p></div>",
+      "descriptionPlain": "Own the ingestion pipeline for our local-first product."
+    },
+    {
+      "title": "Listed But Unreadable Member",
+      "location": "Berlin, Germany",
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005088"
+    },
+    {
+      "id": "5a1b2c3d-0000-4000-8000-000000005002",
+      "title": "Platform Engineer",
+      "department": "Engineering",
+      "team": "Platform",
+      "employmentType": "PartTime",
+      "location": "Berlin, Germany",
+      "secondaryLocations": [],
+      "publishedAt": "2026-06-03T14:05:00.000000+00:00",
+      "isListed": true,
+      "isRemote": false,
+      "workplaceType": "Hybrid",
+      "jobUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005002",
+      "applyUrl": "https://jobs.ashbyhq.com/acme/5a1b2c3d-0000-4000-8000-000000005002/application",
+      "descriptionHtml": "<div><p>Hybrid across our EU hubs.</p></div>",
+      "descriptionPlain": "Hybrid across our EU hubs."
+    }
+  ],
+  "apiVersion": "1"
+}

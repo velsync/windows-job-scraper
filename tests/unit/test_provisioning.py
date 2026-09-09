@@ -681,7 +681,7 @@ class TestEnsureBuiltinAdapterDefinition:
     def test_ensure_refuses_an_adapter_the_registry_does_not_define(self, db):
         conn = db.conn
         with pytest.raises(ProvisioningError):
-            ensure_builtin_adapter_definition(conn, "ashby")
+            ensure_builtin_adapter_definition(conn, "workday")
         assert conn.execute("SELECT COUNT(*) FROM adapter_definitions").fetchone()[0] == 0
 
     def test_ensure_pins_the_requested_version_when_given(self, db):
