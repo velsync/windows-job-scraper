@@ -239,8 +239,12 @@ def record_route_decision(
     """Insert append-only route-decision evidence with durable causal authority."""
     _require_existing_source(conn, source_id)
     _validate_fingerprint_decision(fingerprint, decision)
+    # ``IS ?`` is the NULL-safe equality: a family-less (generic) fingerprint
+    # stores family NULL, and ``family = NULL`` would match no row — the
+    # honest GENERIC_DISCOVERY_FALLBACK decision would be unrecordable
+    # (S2.8 acceptance finding F1).
     prior = conn.execute(
-        "SELECT 1 FROM ats_fingerprints WHERE source_id = ? AND family = ? AND confidence = ? LIMIT 1",
+        "SELECT 1 FROM ats_fingerprints WHERE source_id = ? AND family IS ? AND confidence = ? LIMIT 1",
         (source_id, fingerprint.family, fingerprint.confidence),
     ).fetchone()
     if prior is None:

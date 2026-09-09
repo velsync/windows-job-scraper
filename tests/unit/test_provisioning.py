@@ -16,7 +16,12 @@ import pytest
 
 from jobscraper.adapters.contract import validate_manifest
 from jobscraper.adapters.fingerprint import AtsFingerprint
-from jobscraper.adapters.router import RouteCandidate, RouteDecision, RouteOutcome
+from jobscraper.adapters.router import (
+    RouteCandidate,
+    RouteDecision,
+    RouteOutcome,
+    plan_routes,
+)
 from jobscraper.runtime.provisioning import (
     ProvisioningError,
     ensure_builtin_adapter_definition,
@@ -259,6 +264,42 @@ class TestRecordRouteDecision:
             "SELECT COUNT(*) FROM source_route_decisions"
         ).fetchone()[0]
         assert count == 2
+
+    def test_a_family_less_fallback_decision_can_be_recorded(self, populated_db):
+        """S2.8 acceptance finding F1 (red-first).
+
+        A generic careers page classifies to ``family=None``; the router's
+        honest answer is ``GENERIC_DISCOVERY_FALLBACK`` with no runnable
+        candidate.  That decision is exactly the durable evidence 02 §12.1
+        requires for the fallback — but the prior-fingerprint lookup compared
+        ``family = ?``, and ``family = NULL`` matches no row in SQL, so
+        recording the fallback crashed with ``ProvisioningError`` instead of
+        recording it.  The no-family case must be recordable like any other.
+        """
+        conn = populated_db.conn
+        _seed_source(conn, "src-none")
+        fp = AtsFingerprint(
+            family=None, confidence=0.0, evidence=(), recommended_adapter_id=None,
+        )
+        decision = plan_routes(
+            fingerprint=fp,
+            supported_execution_classes=frozenset({"HTTP"}),
+        )
+        assert decision.outcome is RouteOutcome.GENERIC_DISCOVERY_FALLBACK
+
+        record_fingerprint(
+            conn, source_id="src-none", url="https://careers.acme.example/jobs",
+            fingerprint=fp, now="2026-09-10T00:00:00.500000Z",
+        )
+        row_id = record_route_decision(
+            conn, source_id="src-none", fingerprint=fp,
+            decision=decision, now="2026-09-10T00:00:01.000000Z",
+        )
+        row = conn.execute(
+            "SELECT * FROM source_route_decisions WHERE id = ?", (row_id,)
+        ).fetchone()
+        assert row["outcome"] == "GENERIC_DISCOVERY_FALLBACK"
+        assert row["fingerprint_family"] is None
 
 
 # ---------------------------------------------------------------------------
