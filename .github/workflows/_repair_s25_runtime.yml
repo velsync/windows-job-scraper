@@ -1,0 +1,42 @@
+name: Apply S2.5 runtime corrective
+
+on:
+  push:
+    branches:
+      - repair/s2.4-s2.5-correctives-20260909
+    paths:
+      - scripts/_apply_s25_runtime_corrective.py
+      - .github/workflows/_repair_s25_runtime.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out corrective branch
+        uses: actions/checkout@v4
+        with:
+          ref: repair/s2.4-s2.5-correctives-20260909
+          fetch-depth: 0
+      - name: Apply exact corrective replacements
+        run: python scripts/_apply_s25_runtime_corrective.py
+      - name: Validate patch shape
+        run: |
+          git diff --check
+          git status --short
+      - name: Run focused corrective tests
+        run: |
+          python -m venv .repair-venv
+          .repair-venv/bin/python -m pip install -r requirements/dev.lock.txt
+          .repair-venv/bin/python -m pip install --no-deps .
+          .repair-venv/bin/python -m pytest tests/integration/test_s2_5_runtime_correctives.py tests/unit/test_s2_5_greenhouse_contract_correctives.py tests/unit/test_contentclean.py -q
+      - name: Commit corrected production code
+        run: |
+          git config user.name "velsync"
+          git config user.email "velsync@gmail.com"
+          git add -A
+          git commit -m "fix(s2.5): separate listing coverage from detail completion"
+          git push origin HEAD:repair/s2.4-s2.5-correctives-20260909
