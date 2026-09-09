@@ -6,6 +6,7 @@ on:
       - repair/s2.4-s2.5-correctives-20260909
     paths:
       - .github/workflows/_corrective_acceptance_gate.yml
+      - scripts/_apply_full_suite_expectation_reconciliation.py
 
 permissions:
   contents: write
@@ -26,6 +27,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Apply stale-expectation reconciliation
+        run: python scripts/_apply_full_suite_expectation_reconciliation.py
+      - name: Validate patch shape
+        run: git diff --check
       - name: Create venv (Ubuntu)
         if: runner.os != 'Windows'
         run: python -m venv .venv
@@ -69,20 +74,35 @@ jobs:
         with:
           ref: repair/s2.4-s2.5-correctives-20260909
           fetch-depth: 0
-      - name: Create clean commit object without temporary gate
+      - name: Apply accepted expectation reconciliation
+        run: python scripts/_apply_full_suite_expectation_reconciliation.py
+      - name: Remove temporary repair machinery
+        run: rm .github/workflows/_corrective_acceptance_gate.yml scripts/_apply_full_suite_expectation_reconciliation.py
+      - name: Validate final patch shape
+        run: git diff --check
+      - name: Create clean accepted commit object
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           python - <<'PY'
-          import json, os, subprocess, urllib.request
+          import base64
+          import json
+          import os
+          import subprocess
+          import urllib.request
+
           repo = os.environ["GITHUB_REPOSITORY"]
           token = os.environ["GH_TOKEN"]
           parent = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           base_tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip()
+          paths = [p for p in subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines() if p]
+          if not paths:
+              raise SystemExit("no accepted changes to materialize")
+
           def post(endpoint, payload):
               req = urllib.request.Request(
                   f"https://api.github.com/repos/{repo}/{endpoint}",
-                  data=json.dumps(payload).encode(),
+                  data=json.dumps(payload).encode("utf-8"),
                   headers={
                       "Authorization": f"Bearer {token}",
                       "Accept": "application/vnd.github+json",
@@ -93,19 +113,27 @@ jobs:
               )
               with urllib.request.urlopen(req) as response:
                   return json.load(response)
-          tree = post("git/trees", {
-              "base_tree": base_tree,
-              "tree": [{
-                  "path": ".github/workflows/_corrective_acceptance_gate.yml",
-                  "mode": "100644",
-                  "type": "blob",
-                  "sha": None,
-              }],
-          })["sha"]
+
+          entries = []
+          for path in paths:
+              mode_line = subprocess.check_output(["git", "ls-files", "-s", "--", path], text=True).strip()
+              mode = mode_line.split()[0] if mode_line else "100644"
+              if not os.path.exists(path):
+                  entries.append({"path": path, "mode": mode, "type": "blob", "sha": None})
+                  continue
+              raw = open(path, "rb").read()
+              blob = post("git/blobs", {
+                  "content": base64.b64encode(raw).decode("ascii"),
+                  "encoding": "base64",
+              })["sha"]
+              entries.append({"path": path, "mode": mode, "type": "blob", "sha": blob})
+
+          tree = post("git/trees", {"base_tree": base_tree, "tree": entries})["sha"]
           commit = post("git/commits", {
-              "message": "chore(repair): seal accepted S2.4-S2.5 corrective tree",
+              "message": "test(s2.5): reconcile accepted runtime expectations",
               "tree": tree,
               "parents": [parent],
           })["sha"]
           print(f"ACCEPTED_CLEAN_COMMIT_SHA={commit}")
+          print("ACCEPTED_PATHS=" + ",".join(paths))
           PY
