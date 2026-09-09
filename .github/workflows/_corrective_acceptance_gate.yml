@@ -55,7 +55,11 @@ jobs:
           .venv/bin/python -m pytest -q
           .venv/bin/python scripts/verify_slice0.py
           .venv/bin/python scripts/verify_slice1.py
-          .venv/bin/python scripts/verify_slice2.py
+          if [ -f scripts/verify_slice2.py ]; then
+            .venv/bin/python scripts/verify_slice2.py
+          else
+            echo "[slice2-gate] SKIP: scripts/verify_slice2.py is not present (prompt makes this conditional)"
+          fi
       - name: Run exact corrective gate (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -63,7 +67,12 @@ jobs:
           .venv/Scripts/python -m pytest -q
           .venv/Scripts/python scripts/verify_slice0.py
           .venv/Scripts/python scripts/verify_slice1.py
-          .venv/Scripts/python scripts/verify_slice2.py
+          if (Test-Path scripts/verify_slice2.py) {
+            .venv/Scripts/python scripts/verify_slice2.py
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Host "[slice2-gate] SKIP: scripts/verify_slice2.py is not present (prompt makes this conditional)"
+          }
 
   materialize:
     name: Materialize clean accepted tree
