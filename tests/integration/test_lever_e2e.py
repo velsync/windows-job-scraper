@@ -72,6 +72,7 @@ _LIST_ROUTES = {
     "missingfields": ("postings_list_missing_required_fields.json", 200, _JSON),
     "malformed": ("postings_list_malformed.json", 200, _JSON),
     "idmismatch": ("postings_list.json", 200, _JSON),
+    "rejectedthenclean": ("postings_list_rejected_member_paged.json", 200, _JSON),
     "ratelimited": ("rate_limited.429.json", 429, _JSON),
     "challenge": ("challenge.403.html", 403, "text/html; charset=utf-8"),
 }
@@ -672,6 +673,51 @@ def test_a_server_that_ignores_skip_is_a_trap_not_a_complete_enumeration(db, ser
     assert cov["pages_completed"] == 2
     assert _outcome(db, run_id) == "SATISFIED_PARTIAL"
     # nothing was expired or closed on the strength of a trapped walk
+    assert all(p["presence_state"] == "ACTIVE" for p in _presences(db))
+
+
+def test_a_rejected_member_on_an_earlier_page_is_never_laundered_into_complete(db, server):
+    """S2.6 corrective (ACQ-03, RUN-13).
+
+    Page 1 (``limit=2``) is full but carries a listed member the adapter must
+    reject (no usable id).  Page 2 would be a clean short page.  If the walk
+    continued, the clean terminal page would finalize the *same* generation
+    COMPLETE and grant absence authority over a membership set that was
+    provably incomplete on page 1.  The adapter therefore proposes no cursor
+    after a PARTIAL page: coverage stays PARTIAL, and the good observations
+    from page 1 are still persisted (PARTIAL is not FAILURE).
+    """
+    run_id, _ = _run_board(
+        db, server, board="rejectedthenclean", config={"page_size": 2, "detail_fetch": False}
+    )
+    assert execute_run(db.conn, run_id) == "PARTIAL"
+
+    requests = _requests(db, run_id)
+    # exactly one page was fetched: the walk stopped at the degraded page
+    assert [(r["request_type"], r["status"]) for r in requests] == [("LIST_FETCH", "SUCCEEDED")]
+    assert [u.rsplit("?", 1)[1] for u in _fetch_urls(db)] == ["mode=json&skip=0&limit=2"]
+    parse = db.conn.execute(
+        "SELECT outcome_kind, continuation_required, coverage_proposal_json, cursor_proposal_json,"
+        " review_evidence_json FROM parse_attempts"
+    ).fetchone()
+    assert parse["outcome_kind"] == "PARTIAL"
+    assert parse["continuation_required"] == 1
+    proposal = json.loads(parse["coverage_proposal_json"])
+    assert proposal["rejected_members"] == 1
+    assert proposal["page_full"] is True
+    review = json.loads(parse["review_evidence_json"])
+    assert any(item["reason"] == "REQUIRED_FIELD_MISSING" for item in review)
+    assert db.conn.execute("SELECT COUNT(*) FROM crawl_cursors").fetchone()[0] == 0
+
+    # the valid member was persisted; nothing was invented for the rejected one
+    assert [j["title"] for j in _jobs(db)] == ["Backend Engineer"]
+    assert len(_presences(db)) == 1
+
+    cov = _coverage(db)[0]
+    assert cov["completion_state"] == "PARTIAL"
+    assert cov["terminal_enumeration_proven"] == 0
+    assert cov["pages_completed"] == 1
+    assert _outcome(db, run_id) == "SATISFIED_PARTIAL"
     assert all(p["presence_state"] == "ACTIVE" for p in _presences(db))
 
 

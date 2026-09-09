@@ -1,0 +1,79 @@
+[
+  {
+    "id": "1a2b3c4d-0000-4000-8000-000000004001",
+    "text": "Backend Engineer",
+    "categories": {
+      "commitment": "Full-time",
+      "location": "Berlin, Germany",
+      "team": "Engineering",
+      "allLocations": [
+        "Berlin, Germany"
+      ]
+    },
+    "country": "DE",
+    "createdAt": 1787032800000,
+    "workplaceType": "on-site",
+    "hostedUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004001",
+    "applyUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004001/apply",
+    "descriptionPlain": "Acme Fixtures builds local-first tooling.",
+    "description": "<div><p>Acme Fixtures builds <b>local-first</b> tooling. You will design and ship durable Python services backed by SQLite.</p></div>",
+    "lists": [
+      {
+        "text": "Responsibilities",
+        "content": "<li>Own the ingestion pipeline</li><li>Write tests first</li><li>Keep provenance immutable</li>"
+      },
+      {
+        "text": "Requirements",
+        "content": "<li>Python</li><li>SQLite</li>"
+      }
+    ],
+    "additional": "<div><p>Salary band: EUR 78.000 - 92.000 per year.</p><p>Apply through the board: <a href=\"https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004001/apply\">apply</a>.</p></div>",
+    "additionalPlain": "",
+    "salaryRange": {
+      "currency": "EUR",
+      "interval": "per-year-salary",
+      "min": 78000,
+      "max": 92000
+    },
+    "openingPlain": "Acme Fixtures builds local-first tooling.",
+    "opening": "<p>Acme Fixtures builds local-first tooling.</p>"
+  },
+  {
+    "text": "Role without a source-native id",
+    "categories": {
+      "location": "Berlin, Germany",
+      "commitment": "Full-time"
+    },
+    "createdAt": 1786698000000,
+    "hostedUrl": "https://jobs.lever.co/missingfields/nope"
+  },
+  {
+    "id": "1a2b3c4d-0000-4000-8000-000000004002",
+    "text": "Platform Engineer",
+    "categories": {
+      "commitment": "Full-time",
+      "location": "Berlin, Germany",
+      "team": "Infrastructure",
+      "allLocations": [
+        "Berlin, Germany",
+        "Paris, France"
+      ],
+      "department": "Technology"
+    },
+    "country": "DE",
+    "createdAt": 1788264000000,
+    "workplaceType": "hybrid",
+    "hostedUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004002",
+    "applyUrl": "https://jobs.lever.co/acme/1a2b3c4d-0000-4000-8000-000000004002/apply",
+    "descriptionPlain": "",
+    "description": "<div><p>Hybrid role split between our Berlin and Paris hubs. You will run the platform team's durable queues.</p></div>",
+    "lists": [
+      {
+        "text": "Responsibilities",
+        "content": "<li>Own the durable queue</li><li>Review platform provenance</li>"
+      }
+    ],
+    "additional": "",
+    "additionalPlain": ""
+  }
+]

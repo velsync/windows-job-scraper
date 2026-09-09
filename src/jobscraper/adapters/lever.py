@@ -34,6 +34,12 @@ Provider semantics adapted (not copied) from S2.5:
   same posting-id set as the page before it is a repeated page, and the
   adapter stops proposing cursors instead of walking a server that ignores
   ``skip``; the outcome stays non-terminal;
+* a page with a rejected listed member is ``PARTIAL`` and proposes **no**
+  continuation either: the membership proof for this generation is already
+  broken, and walking on would let a later clean short page finalize the
+  same generation ``COMPLETE`` (ACQ-03 forbids absence inference from a
+  PARTIAL unit; RUN-13).  Good observations from the page are still
+  persisted — PARTIAL is not FAILURE;
 * Lever's ``createdAt`` is the posting's *creation* time, which the provider
   does not state to be its publication time.  It is kept as a durable UTC
   evidence field (``posting_created_at``) and deliberately **not** mapped to
@@ -43,9 +49,12 @@ Provider semantics adapted (not copied) from S2.5:
   ``on-site`` are preserved verbatim as evidence only;
 * the direct application link is derived from the versioned endpoint table
   plus the pinned site token and validated id (PROD-06).  The provider's own
-  ``hostedUrl``/``applyUrl`` are kept as candidates/evidence only when they
-  are safe http(s) URLs on a reviewed hosted host; anything else is refused
-  with review evidence, never used;
+  ``hostedUrl``/``applyUrl`` are kept as candidates/evidence only when the
+  endpoint table reads them as **this site's, this posting's** hosted job
+  URL: ``hostedUrl`` becomes the canonical-URL candidate that origin
+  resolution consumes (02 §32), so a well-formed link about another site or
+  posting would re-attribute the job.  Anything else is refused with review
+  evidence, never used;
 * required-field failures reject the item with structured review evidence and
   never invent values; a page whose items all fail is ``PARSE_MARKER_MISSING``,
   never ``SUCCESS_EMPTY`` (02 §22, ACQ-03);
@@ -68,7 +77,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
-from jobscraper.acquisition.atsendpoints import spec_for_provider
+from jobscraper.acquisition.atsendpoints import identify_url, spec_for_provider
 from jobscraper.acquisition.envelope import RequestPlan
 from jobscraper.acquisition.failures import FailureKind, FailureRecord
 from jobscraper.adapters.contract import (
@@ -131,10 +140,6 @@ _, DETAIL_PATH_TEMPLATE = _origin_and_path(_SPEC.detail_url_template)
 #: Public, job-specific hosted page a user is sent to (PROD-06).  Derived from
 #: the endpoint table + pinned site token, never from scraped content.
 JOB_PAGE_TEMPLATE = _SPEC.job_url_template
-#: Reviewed hosted hosts (endpoint table): the only hosts on which a
-#: provider-supplied hostedUrl/applyUrl is accepted as a link candidate.
-_HOSTED_HOSTS = frozenset(host.lower() for host in _SPEC.hosted_hosts)
-
 #: Offset paging bounds.  Lever documents ``limit`` with a default of 100 and
 #: no larger page; the adapter never asks for more than that.
 MAX_PAGE_SIZE = 100
@@ -142,14 +147,15 @@ DEFAULT_PAGE_SIZE = MAX_PAGE_SIZE
 
 #: Declared stop policy (02 §19).  Offset paging is bounded by pages *and* by
 #: the same-page trap check; the request budget is the pages plus the bounded
-#: detail enrichment they may spawn.
+#: detail enrichment they may spawn, and ``max_requests`` is sized so the
+#: adapter cannot exceed its own declaration (see ``MAX_DETAIL_REQUESTS``).
 STOP_POLICY = StopPolicy(
     max_pages=10,
     max_consecutive_empty_pages=1,
     max_consecutive_no_new_jobs_pages=1,
     max_duplicate_pages=1,
     max_runtime_s=300.0,
-    max_requests=60,
+    max_requests=200,
 )
 
 #: Host policy caps the plan may not exceed (02 §11.1 / 04 §5.1); a config
@@ -157,9 +163,14 @@ STOP_POLICY = StopPolicy(
 MAX_TIMEOUT_S = 30.0
 MAX_BODY_BYTES = 2_000_000
 
-#: Hard bound on typed detail child work per enumeration page (ACQ-04).
-MAX_DETAIL_REQUESTS = STOP_POLICY.max_requests - STOP_POLICY.max_pages
-DEFAULT_MAX_DETAIL_REQUESTS = 25
+#: Hard bound on typed detail child work per enumeration page (ACQ-04),
+#: sized so that even a walk that reaches ``max_pages`` — every page spawning
+#: its full detail budget — stays inside the declared ``max_requests``.  The
+#: adapter's stop policy is a promise the host bounds a run against; it must
+#: not be one the adapter itself can exceed.
+MAX_DETAIL_REQUESTS = (STOP_POLICY.max_requests - STOP_POLICY.max_pages) // STOP_POLICY.max_pages
+DEFAULT_MAX_DETAIL_REQUESTS = MAX_DETAIL_REQUESTS
+assert STOP_POLICY.max_pages * (1 + MAX_DETAIL_REQUESTS) <= STOP_POLICY.max_requests
 
 #: Detail child work is claimed *after* the enumeration pages that produced
 #: it, so listing coverage is proven before enrichment spends the budget.
@@ -367,17 +378,42 @@ def _safe_http_url(value: Any) -> str | None:
     return candidate
 
 
-def _reviewed_hosted_url(value: Any) -> str | None:
-    """A provider-supplied link, accepted only on a reviewed hosted host.
+def _reviewed_hosted_url(value: Any, *, board: str, posting_id: str) -> str | None:
+    """A provider-supplied link, accepted only when it is *this* posting's.
 
-    The endpoint table — not the payload — decides which hosts are Lever's.
-    A safe-looking URL on any other host is content, not a link candidate.
+    Three gates, all host-owned: the URL must be safe http(s); the endpoint
+    table — not the payload — must recognize it as a Lever hosted job URL;
+    and the site token and posting id it names must equal the pinned site
+    and the id being parsed.  A safe-looking URL on another host, another
+    site or another posting is content, not a link candidate: origin
+    resolution consumes this value as the canonical job URL (02 §32), so a
+    foreign spelling here would re-attribute the job to an employer or a
+    posting the host never fetched.
+
+    Lever's ``applyUrl`` is the hosted job URL plus an ``/apply`` segment,
+    which the endpoint table deliberately does not treat as job-specific
+    (a form is not the posting).  It is accepted as an *evidence field* under
+    the same site/id gate by matching its parent path.
     """
     safe = _safe_http_url(value)
     if safe is None:
         return None
-    host = (normalize_url(safe, drop_fragment=False).host or "").lower()
-    return safe if host in _HOSTED_HOSTS else None
+    if _matches_this_posting(safe, board=board, posting_id=posting_id):
+        return safe
+    normalized = normalize_url(safe, drop_fragment=False)
+    if normalized.path.rstrip("/").endswith("/apply") and not normalized.query:
+        parent = f"{normalized.scheme}://{normalized.host}{normalized.path.rstrip('/')[: -len('/apply')]}"
+        if _matches_this_posting(parent, board=board, posting_id=posting_id):
+            return safe
+    return None
+
+
+def _matches_this_posting(url: str, *, board: str, posting_id: str) -> bool:
+    """Endpoint-table recognition of ``url`` as *this* site's *this* posting."""
+    match = identify_url(url, spec=_SPEC)
+    if not match.job_specific or match.kind != "HOSTED":
+        return False
+    return match.board == board and match.job_id == posting_id
 
 
 def _posting_id(value: Any) -> str | None:
@@ -623,6 +659,14 @@ class LeverAdapter:
             return None
         if not outcome.continuation_required or not outcome.observations:
             return None
+        if outcome.kind is ParseOutcomeKind.PARTIAL:
+            # A page with a rejected listed member already broke the
+            # membership proof for this generation (ACQ-03: absence inference
+            # forbidden).  Proposing a continuation would let a later clean
+            # short page terminalize the same generation as COMPLETE, laundering
+            # the earlier rejection into absence authority.  Stop here; the
+            # host records the bounded PARTIAL result.
+            return None
         skip, page = self._cursor_position(current_cursor, ctx)
         previous = self._cursor_state(current_cursor, ctx)
         ids_hash = _ids_hash(outcome.observations)
@@ -664,7 +708,7 @@ class LeverAdapter:
             )
         payload, error = _json_payload(result.envelope.body)
         if error is not None:
-            return self._failure(result.envelope, FailureKind.PARSE_MARKER_MISSING, error)
+            return self._failure(result, FailureKind.PARSE_MARKER_MISSING, error)
         if kind is AdapterTaskKind.ENUMERATE:
             return self._parse_list(payload, result)
         return self._parse_detail(payload, result, task)
@@ -674,7 +718,7 @@ class LeverAdapter:
         payload, error = _json_payload(result.envelope.body)
         if error is not None or not isinstance(payload, list):
             return self._failure(
-                result.envelope,
+                result,
                 FailureKind.PARSE_MARKER_MISSING,
                 error or "health probe did not find a postings array",
             )
@@ -697,7 +741,7 @@ class LeverAdapter:
             else:
                 review["payload_type"] = type(payload).__name__
             return self._failure(
-                envelope,
+                result,
                 FailureKind.PARSE_MARKER_MISSING,
                 "response is not the bare postings array — the postings template changed",
                 review=(review,),
@@ -742,7 +786,7 @@ class LeverAdapter:
 
         if not observations:
             return self._failure(
-                envelope,
+                result,
                 FailureKind.PARSE_MARKER_MISSING,
                 f"all {len(payload)} listed postings failed required-field validation",
                 review=review_items,
@@ -801,7 +845,7 @@ class LeverAdapter:
         record = ObservationRecord(
             source_job_id=posting_id,
             raw_url=envelope.final_url,
-            canonical_url_candidate=_reviewed_hosted_url(item.get("hostedUrl")),
+            canonical_url_candidate=self._reviewed_link(item.get("hostedUrl"), posting_id),
             application_url_candidate=self._job_page_url(posting_id),
             fields=fields,
             field_evidence=tuple(evidence),
@@ -836,13 +880,20 @@ class LeverAdapter:
             review["rejected_id_excerpt"] = _excerpt(raw_id)
         for name in ("hostedUrl", "applyUrl"):
             raw_url = item.get(name)
-            if raw_url is not None and _reviewed_hosted_url(raw_url) is None:
+            if raw_url is not None and (
+                posting_id is None
+                or self._reviewed_link(raw_url, posting_id) is None
+            ):
                 review[f"rejected_{name}_excerpt"] = _excerpt(raw_url)
         return review
 
     def _job_page_url(self, posting_id: str) -> str:
         """The direct application URL: endpoint table + pinned site + id."""
         return JOB_PAGE_TEMPLATE.format(board=self.config.board, job_id=posting_id)
+
+    def _reviewed_link(self, value: Any, posting_id: str) -> str | None:
+        """A provider link candidate for *this* posting on *this* site."""
+        return _reviewed_hosted_url(value, board=self.config.board, posting_id=posting_id)
 
     # ---------------------------------------------------------- detail parse
 
@@ -851,7 +902,7 @@ class LeverAdapter:
         refs = _evidence_refs(result)
         if not isinstance(payload, Mapping):
             return self._failure(
-                envelope,
+                result,
                 FailureKind.PARSE_MARKER_MISSING,
                 f"detail response is not a posting object, got {type(payload).__name__}",
             )
@@ -913,7 +964,7 @@ class LeverAdapter:
         observation = ObservationRecord(
             source_job_id=posting_id,
             raw_url=envelope.final_url,
-            canonical_url_candidate=_reviewed_hosted_url(payload.get("hostedUrl")),
+            canonical_url_candidate=self._reviewed_link(payload.get("hostedUrl"), posting_id),
             application_url_candidate=self._job_page_url(posting_id),
             fields=fields,
             field_evidence=tuple(evidence),
@@ -989,7 +1040,7 @@ class LeverAdapter:
             raw_url = item.get(name)
             if raw_url is None:
                 continue
-            reviewed = _reviewed_hosted_url(raw_url)
+            reviewed = self._reviewed_link(raw_url, posting_id)
             if reviewed is None:
                 refused.append({"field": name, "excerpt": _excerpt(raw_url)})
             else:
@@ -1009,7 +1060,7 @@ class LeverAdapter:
 
     def _failure(
         self,
-        envelope,
+        result: ValidatedResult,
         kind: FailureKind,
         detail: str,
         *,
@@ -1018,7 +1069,10 @@ class LeverAdapter:
         return ParseOutcome(
             kind=ParseOutcomeKind.FAILURE,
             review_evidence=tuple(review),
-            failure=self._failure_record(envelope, kind, detail),
+            failure=self._failure_record(result.envelope, kind, detail),
+            # ACQ-09: a failure is as traceable as a success — the envelope
+            # and validity evidence that produced it stay linked.
+            evidence_refs=_evidence_refs(result),
         )
 
     def _failure_record(self, envelope, kind: FailureKind, detail: str) -> FailureRecord:

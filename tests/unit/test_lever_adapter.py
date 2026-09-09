@@ -231,6 +231,20 @@ class TestManifestAndRegistry:
     def test_listing_identity_is_declared_sufficient(self):
         assert LeverAdapter.listing_identity_sufficient is True
 
+    def test_the_adapter_cannot_exceed_its_own_declared_request_budget(self):
+        """S2.6 corrective: the stop policy is a promise the host bounds a run
+        against.  A full walk (``max_pages`` pages, each spawning its maximum
+        detail budget) must fit inside the declared ``max_requests``."""
+        from jobscraper.adapters.lever import DEFAULT_MAX_DETAIL_REQUESTS, MAX_DETAIL_REQUESTS
+
+        worst_case = STOP_POLICY.max_pages * (1 + MAX_DETAIL_REQUESTS)
+        assert worst_case <= STOP_POLICY.max_requests
+        assert DEFAULT_MAX_DETAIL_REQUESTS <= MAX_DETAIL_REQUESTS
+        # and the config cap is that same bound, not a looser one
+        with pytest.raises(ValueError):
+            LeverConfig(board=BOARD, max_detail_requests=MAX_DETAIL_REQUESTS + 1)
+        assert LeverConfig(board=BOARD, max_detail_requests=MAX_DETAIL_REQUESTS).max_detail_requests == MAX_DETAIL_REQUESTS
+
 
 # --------------------------------------------------------------------------
 # Config validation (typed, fail closed)
@@ -528,6 +542,48 @@ class TestListParse:
         assert observation.application_url_candidate.startswith(HOSTED)
         assert any(item.get("reason") == "UNSAFE_URL_REFUSED" for item in outcome.review_evidence)
 
+    @pytest.mark.parametrize(
+        "hosted_url",
+        [
+            # reviewed host, *another site*: would re-attribute the employer
+            f"{HOSTED.rsplit('/', 1)[0]}/evilcorp/{ID1}",
+            # reviewed host, this site, *another posting*: would re-attribute the job
+            f"{HOSTED}/9e9f9a9b-0000-4000-8000-000000009999",
+            # the API host is not a hosted job page
+            f"https://api.lever.co/v0/postings/acme/{ID1}",
+            # a hosted-looking host that is not in the endpoint table
+            f"https://jobs.lever.co.evil.example/acme/{ID1}",
+            # path games never reach a different identity
+            f"{HOSTED}/{ID1}/../../evilcorp/{ID1}",
+        ],
+    )
+    def test_a_provider_link_for_another_site_or_posting_is_refused(self, hosted_url):
+        """S2.6 corrective (02 §32): ``hostedUrl`` feeds origin resolution as
+        the canonical job URL, so it is accepted only when the endpoint table
+        reads it as *this* site's *this* posting.  A well-formed link about
+        something else is content, not a candidate."""
+        payload = [_posting(1, id=ID1, hostedUrl=hosted_url, applyUrl=f"{hosted_url}/apply")]
+        outcome = _adapter().parse(_task(), _validated_payload(payload), ctx=None)
+        assert outcome.kind is ParseOutcomeKind.SUCCESS_WITH_JOBS
+        observation = outcome.observations[0]
+        assert observation.canonical_url_candidate is None
+        assert "hosted_url" not in observation.fields
+        assert "apply_url" not in observation.fields
+        # the product link is still derived from the pinned site + validated id
+        assert observation.application_url_candidate == f"{HOSTED}/{ID1}"
+        assert any(item.get("reason") == "UNSAFE_URL_REFUSED" for item in outcome.review_evidence)
+
+    def test_this_postings_hosted_and_apply_links_are_accepted_on_every_reviewed_host(self):
+        for host in ("jobs.lever.co", "eu.jobs.lever.co", "hk.jobs.lever.co"):
+            hosted = f"https://{host}/acme/{ID1}"
+            payload = [_posting(1, id=ID1, hostedUrl=hosted, applyUrl=f"{hosted}/apply")]
+            outcome = _adapter().parse(_task(), _validated_payload(payload), ctx=None)
+            observation = outcome.observations[0]
+            assert observation.canonical_url_candidate == hosted
+            assert observation.fields["hosted_url"] == hosted
+            assert observation.fields["apply_url"] == f"{hosted}/apply"
+            assert outcome.review_evidence == ()
+
     def test_company_comes_from_the_pinned_binding_config(self):
         outcome = _parse(_adapter(), "postings_list.json")
         assert outcome.observations[0].fields["company"] == "Acme Fixtures"
@@ -752,6 +808,50 @@ class TestListParse:
 # --------------------------------------------------------------------------
 
 
+class TestFailureTraceability:
+    """S2.6 corrective (ACQ-09): a failed parse is as traceable as a success."""
+
+    @pytest.mark.parametrize(
+        "fixture",
+        [
+            "postings_list_changed_template.json",
+            "postings_list_missing_required_fields.json",
+            "postings_list_malformed.json",
+        ],
+    )
+    def test_list_failures_link_the_envelope_and_validity_evidence(self, fixture):
+        outcome = _parse(_adapter(), fixture)
+        assert outcome.kind is ParseOutcomeKind.FAILURE
+        assert outcome.failure is not None
+        assert outcome.evidence_refs, "failure outcome lost its ACQ-09 evidence refs"
+        assert len(outcome.evidence_refs) == len(set(outcome.evidence_refs))
+
+    def test_detail_failures_link_the_envelope_and_validity_evidence(self):
+        adapter = _adapter()
+        task = _task(AdapterTaskKind.DETAIL, {"target_reference": ID1})
+        for body in (b"[]", b"not json", b'{"id": "' + ID1.encode() + b'"}'):
+            outcome = adapter.parse(
+                task,
+                ValidatedResultEnvelope(
+                    envelope=_envelope(body, url=f"{API}{LIST_PATH}/{ID1}"),
+                    page_class=PageClass.VALID_JOB,
+                    validation_evidence={"fixture": "inline"},
+                ),
+                ctx=None,
+            )
+            assert outcome.kind is ParseOutcomeKind.FAILURE, body
+            assert outcome.evidence_refs, body
+
+    def test_health_probe_failures_link_evidence(self):
+        outcome = _adapter().parse(
+            _task(AdapterTaskKind.HEALTH),
+            _validated("postings_list_changed_template.json", task_kind=AdapterTaskKind.HEALTH),
+            ctx=None,
+        )
+        assert outcome.kind is ParseOutcomeKind.FAILURE
+        assert outcome.evidence_refs
+
+
 class TestDetailParse:
     def _detail(self, adapter, fixture, reference=ID1, **kwargs):
         url = kwargs.pop("url", f"{API}{LIST_PATH}/{reference}")
@@ -928,6 +1028,21 @@ class TestCursor:
         repeated = self._full_page(adapter, skip=5, start=0)  # same ids again
         assert repeated.continuation_required is True
         assert adapter.next_cursor(_task(), repeated, cursor, ctx=_ctx()) is None
+
+    def test_a_full_page_with_a_rejected_member_proposes_no_cursor(self):
+        """S2.6 corrective (ACQ-03, RUN-13): a PARTIAL page has already broken
+        the membership proof; continuing would let a later clean short page
+        launder it into COMPLETE.  The page stays ``continuation_required``
+        (bounded PARTIAL at the host), but no cursor is proposed."""
+        adapter = _adapter(page_size=3, detail_fetch=False)
+        page = _page(2) + [{"text": "No id here", "hostedUrl": f"{HOSTED}/nope"}]
+        url = f"{API}{LIST_PATH}?mode=json&skip=0&limit=3"
+        outcome = adapter.parse(_task(), _validated_payload(page, url=url), ctx=None)
+        assert outcome.kind is ParseOutcomeKind.PARTIAL
+        assert outcome.continuation_required is True
+        assert len(outcome.observations) == 2
+        assert outcome.coverage_proposal["rejected_members"] == 1
+        assert adapter.next_cursor(_task(), outcome, None, ctx=_ctx()) is None
 
     def test_a_different_full_page_keeps_walking(self):
         adapter = _adapter(page_size=5, detail_fetch=False)
