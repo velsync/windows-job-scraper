@@ -84,6 +84,17 @@ def greenhouse_db(db):
     return db
 
 
+def _seed_source(conn, source_id: str) -> None:
+    now = "2026-09-08T00:00:00.000000Z"
+    conn.execute(
+        "INSERT INTO sources "
+        "(id, display_name, source_family, entry_url, canonical_host, created_at, updated_at) "
+        "VALUES (?, ?, 'ATS_BOARD', ?, 'boards.greenhouse.io', ?, ?)",
+        (source_id, f"Evidence {source_id}", f"https://boards.greenhouse.io/{source_id}", now, now),
+    )
+    conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Fingerprint recording (append-only evidence)
 # ---------------------------------------------------------------------------
@@ -93,6 +104,7 @@ class TestRecordFingerprint:
 
     def test_record_fingerprint_inserts_row(self, populated_db):
         conn = populated_db.conn
+        _seed_source(conn, "src-test")
         fp = AtsFingerprint(
             family="GREENHOUSE",
             confidence=0.95,
@@ -116,6 +128,7 @@ class TestRecordFingerprint:
 
     def test_record_fingerprint_is_append_only(self, populated_db):
         conn = populated_db.conn
+        _seed_source(conn, "src-1")
         fp = AtsFingerprint(
             family="GREENHOUSE",
             confidence=0.95,
@@ -136,6 +149,7 @@ class TestRecordFingerprint:
 
     def test_record_fingerprint_stores_evidence_json(self, populated_db):
         conn = populated_db.conn
+        _seed_source(conn, "src-1")
         fp = AtsFingerprint(
             family="GREENHOUSE",
             confidence=0.95,
@@ -166,6 +180,7 @@ class TestRecordRouteDecision:
 
     def test_record_route_decision_inserts_row(self, populated_db):
         conn = populated_db.conn
+        _seed_source(conn, "src-test")
         fp = AtsFingerprint(
             family="GREENHOUSE", confidence=0.95,
             evidence=(), recommended_adapter_id="greenhouse",
@@ -185,6 +200,10 @@ class TestRecordRouteDecision:
             ),
             unsupported_candidates=(),
             router_version=1,
+        )
+        record_fingerprint(
+            conn, source_id="src-test", url="https://boards.greenhouse.io/acme",
+            fingerprint=fp, now="2026-09-08T00:00:00.500000Z",
         )
         row_id = record_route_decision(
             conn,
@@ -202,6 +221,7 @@ class TestRecordRouteDecision:
 
     def test_record_route_decision_is_append_only(self, populated_db):
         conn = populated_db.conn
+        _seed_source(conn, "src-1")
         fp = AtsFingerprint(
             family="GREENHOUSE", confidence=0.95,
             evidence=(), recommended_adapter_id="greenhouse",
@@ -221,6 +241,10 @@ class TestRecordRouteDecision:
             ),
             unsupported_candidates=(),
             router_version=1,
+        )
+        record_fingerprint(
+            conn, source_id="src-1", url="https://boards.greenhouse.io/acme",
+            fingerprint=fp, now="2026-09-08T00:00:00.500000Z",
         )
         r1 = record_route_decision(
             conn, source_id="src-1", fingerprint=fp,

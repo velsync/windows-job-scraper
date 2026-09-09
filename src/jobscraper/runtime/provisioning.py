@@ -59,6 +59,22 @@ def _source_target_key(value: str) -> str:
         raise ProvisioningError(f"entry_url is not a usable source target: {exc}") from exc
 
 
+def _require_existing_source(conn: sqlite3.Connection, source_id: str) -> None:
+    if conn.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone() is None:
+        raise ProvisioningError(f"Source {source_id!r} does not exist; refusing orphan evidence")
+
+
+def _validate_fingerprint_decision(fingerprint, decision) -> None:
+    if decision is None:
+        return
+    if fingerprint is None:
+        raise ProvisioningError("route decision requires fingerprint evidence")
+    if decision.fingerprint_family != fingerprint.family:
+        raise ProvisioningError("route decision fingerprint family does not match fingerprint evidence")
+    if decision.fingerprint_confidence != fingerprint.confidence:
+        raise ProvisioningError("route decision fingerprint confidence does not match fingerprint evidence")
+
+
 def _registered_definition_state(
     conn: sqlite3.Connection,
     adapter_id: str,
@@ -181,6 +197,7 @@ def record_fingerprint(
     v14 retains nullable source ids for released-schema compatibility. The
     production provisioning path calls this only after Source creation.
     """
+    _require_existing_source(conn, source_id)
     ts = now or db_utc_now(conn)
     row_id = new_id("fp")
     evidence_json = json.dumps(
@@ -219,7 +236,15 @@ def record_route_decision(
     now: str | None = None,
     commit: bool = True,
 ) -> str:
-    """Insert append-only route-decision evidence."""
+    """Insert append-only route-decision evidence with durable causal authority."""
+    _require_existing_source(conn, source_id)
+    _validate_fingerprint_decision(fingerprint, decision)
+    prior = conn.execute(
+        "SELECT 1 FROM ats_fingerprints WHERE source_id = ? AND family = ? AND confidence = ? LIMIT 1",
+        (source_id, fingerprint.family, fingerprint.confidence),
+    ).fetchone()
+    if prior is None:
+        raise ProvisioningError("route decision requires a matching persisted fingerprint first")
     ts = now or db_utc_now(conn)
     row_id = new_id("rd")
     candidates_json = json.dumps(
@@ -292,6 +317,8 @@ def provision_source_and_binding(
     """Idempotently provision one source target and binding revision."""
     ts = now or db_utc_now(conn)
     config_json = _canonical_json(config)
+    # Reject impossible evidence pairs before any Source/Binding mutation.
+    _validate_fingerprint_decision(fingerprint, decision)
 
     adapter_def = conn.execute(
         "SELECT adapter_id FROM adapter_definitions"
