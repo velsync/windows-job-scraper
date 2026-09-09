@@ -57,7 +57,9 @@ from jobscraper.net.destination import (
 )
 from jobscraper.net.urlnorm import normalize_url
 from jobscraper.pipeline.coverage import (
+    degrade_coverage,
     finalize_coverage,
+    is_coverage_degraded,
     open_or_resume_coverage,
     record_seen_identity,
 )
@@ -514,8 +516,15 @@ def _execute_plan(
         )
 
     terminal = durable_complete is not None
-    coverage_degraded = False
-    run_degraded = False
+    # ACQ-03 / RUN-13: degradation is durable per generation.  A resumed pass
+    # that never saw the PARTIAL outcome in memory must still know about it.
+    coverage_degraded = (
+        False if coverage_finalized else is_coverage_degraded(conn, coverage_id)
+    )
+    # …and a plan whose open generation is already degraded cannot end this
+    # pass SATISFIED: the group outcome is derived from the same durable truth
+    # the coverage is, not from what this process happened to witness.
+    run_degraded = coverage_degraded
     cancelled = False
     pages = 0
     details = 0
@@ -785,6 +794,23 @@ def _execute_plan(
                 if outcome_obj.kind.value == "SUCCESS_EMPTY":
                     signal["value"] = "EMPTY" if is_enumeration else "JOBS"
                     return
+                if (
+                    outcome_obj.kind is ParseOutcomeKind.PARTIAL
+                    and (is_enumeration or not listing_identity_sufficient)
+                    and not coverage_finalized
+                ):
+                    # ACQ-03 / RUN-13 at the host boundary: PARTIAL ⇒ this
+                    # generation is degraded, durably, *before* any
+                    # continuation is planned.  Whatever the adapter proposes
+                    # next (a cursor, more pages, a clean terminal page), the
+                    # generation can no longer become absence-authoritative.
+                    degrade_coverage(
+                        cursor_conn,
+                        coverage_id,
+                        reason="degraded by PARTIAL acquisition unit",
+                        commit=False,
+                    )
+                    signal["degraded"] = True
                 _dispatch_child_tasks(
                     cursor_conn,
                     outcome_obj=outcome_obj,
@@ -872,6 +898,11 @@ def _execute_plan(
             run_degraded = True
             if is_enumeration or not listing_identity_sufficient:
                 coverage_degraded = True
+        if signal.get("degraded"):
+            # PARTIAL that also continued (CONTINUE path): the generation was
+            # degraded under the fence; the run is degraded too.
+            run_degraded = True
+            coverage_degraded = True
         if is_enumeration and value in ("EMPTY", "TERMINAL"):
             # 03 §40: only a recognized terminal enumeration — an accepted
             # empty result or a complete listing with no further cursor —
@@ -905,7 +936,12 @@ def _execute_plan(
                 and details >= MAX_DETAIL_REQUESTS_PER_RUN
             )
         )
-        if terminal and not coverage_degraded and coverage_barrier_open == 0:
+        # A degraded generation holds no terminal-enumeration authority even
+        # when its last page happened to be short/empty: "the enumeration
+        # ended" is only membership proof when every page in it was whole
+        # (ACQ-03, RUN-13).
+        terminal_proven = terminal and not coverage_degraded
+        if terminal_proven and coverage_barrier_open == 0:
             completion_state = "COMPLETE"
             stop_reason = "terminal cursor"
         elif cancelled:
@@ -917,6 +953,9 @@ def _execute_plan(
         elif coverage_barrier_open:
             completion_state = "PARTIAL"
             stop_reason = "open contributing work remains"
+        elif terminal and coverage_degraded:
+            completion_state = "PARTIAL"
+            stop_reason = "degraded by PARTIAL acquisition unit"
         else:
             completion_state = "PARTIAL"
             stop_reason = "driver stop"
@@ -926,7 +965,7 @@ def _execute_plan(
                 coverage_id,
                 completion_state=completion_state,
                 stop_reason=stop_reason,
-                terminal_enumeration_proven=terminal,
+                terminal_enumeration_proven=terminal_proven,
                 pages_completed=pages,
                 now=db_utc_now(conn),
             )

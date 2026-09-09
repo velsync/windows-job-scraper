@@ -136,6 +136,56 @@ def open_or_resume_coverage(
     )
 
 
+def degrade_coverage(
+    conn: sqlite3.Connection,
+    coverage_id: str,
+    *,
+    reason: str,
+    commit: bool = True,
+) -> None:
+    """Irreversibly withdraw absence authority from one open generation.
+
+    ACQ-03 / RUN-13: a ``PARTIAL`` acquisition unit means the membership
+    proof for this generation is incomplete, so the generation may never
+    become absence-authoritative — regardless of how many clean pages follow
+    it, whether a continuation cursor was proposed, or whether the pass that
+    saw the PARTIAL outcome is the pass that finalizes.  The flag is the
+    existing durable ``absence_inference_allowed`` column: it only ever moves
+    from 1 to 0, is written inside the same fenced commit as the PARTIAL
+    page, and is what :func:`finalize_coverage` consults, so a resumed pass
+    that never saw the PARTIAL outcome in memory inherits the degradation.
+
+    Finalized generations are immutable and are left untouched.
+    """
+    conn.execute(
+        """
+        UPDATE enumeration_coverage
+           SET absence_inference_allowed = 0,
+               stop_reason = COALESCE(stop_reason, ?)
+         WHERE id = ? AND finalized_at IS NULL AND absence_inference_allowed = 1
+        """,
+        (reason, coverage_id),
+    )
+    if commit:
+        conn.commit()
+
+
+def is_coverage_degraded(conn: sqlite3.Connection, coverage_id: str) -> bool:
+    """Durable truth for a generation whose authority class would otherwise
+    permit absence inference: has it been degraded?"""
+    row = conn.execute(
+        "SELECT coverage_authority, absence_inference_allowed"
+        " FROM enumeration_coverage WHERE id = ?",
+        (coverage_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    return (
+        row["coverage_authority"] in _ABSENCE_AUTHORITIES
+        and not row["absence_inference_allowed"]
+    )
+
+
 def record_seen_identity(
     conn: sqlite3.Connection,
     coverage_id: str,
@@ -190,6 +240,17 @@ def finalize_coverage(
         if not terminal_enumeration_proven:
             raise CoverageFinalizationError(
                 "COMPLETE requires proven terminal enumeration (cursor reached end)"
+            )
+        if (
+            row["coverage_authority"] in _ABSENCE_AUTHORITIES
+            and not row["absence_inference_allowed"]
+        ):
+            # ACQ-03 / RUN-13: a generation that contained a PARTIAL unit was
+            # durably degraded when that unit committed; no later clean page
+            # can restore the membership proof it lacks.
+            raise CoverageFinalizationError(
+                "COMPLETE refused: this generation was degraded by a PARTIAL"
+                " acquisition unit and cannot become absence-authoritative"
             )
         open_requests = conn.execute(
             """
@@ -291,7 +352,9 @@ def _apply_absence(
 
 __all__ = [
     "CoverageFinalizationError",
+    "degrade_coverage",
     "finalize_coverage",
+    "is_coverage_degraded",
     "open_coverage",
     "open_or_resume_coverage",
     "record_seen_identity",

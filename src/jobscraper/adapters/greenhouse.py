@@ -512,7 +512,7 @@ class GreenhouseAdapter:
         payload, error = _json_object(result.envelope.body)
         if payload is None:
             return self._failure(
-                result.envelope, FailureKind.PARSE_MARKER_MISSING, error or "unusable body"
+                result, FailureKind.PARSE_MARKER_MISSING, error or "unusable body"
             )
         if kind is AdapterTaskKind.ENUMERATE:
             return self._parse_list(payload, result)
@@ -524,7 +524,7 @@ class GreenhouseAdapter:
         jobs = payload.get("jobs") if payload is not None else None
         if payload is None or not isinstance(jobs, list):
             return self._failure(
-                result.envelope,
+                result,
                 FailureKind.PARSE_MARKER_MISSING,
                 error or "health probe did not find a 'jobs' array",
             )
@@ -543,7 +543,7 @@ class GreenhouseAdapter:
         items = payload.get("jobs")
         if not isinstance(items, list):
             return self._failure(
-                envelope,
+                result,
                 FailureKind.PARSE_MARKER_MISSING,
                 "response carries no 'jobs' array — the board template changed",
                 review=(
@@ -587,7 +587,7 @@ class GreenhouseAdapter:
 
         if not observations:
             return self._failure(
-                envelope,
+                result,
                 FailureKind.PARSE_MARKER_MISSING,
                 f"all {len(items)} listed jobs failed required-field validation",
                 review=review,
@@ -863,7 +863,7 @@ class GreenhouseAdapter:
 
     def _failure(
         self,
-        envelope,
+        result: ValidatedResult,
         kind: FailureKind,
         detail: str,
         *,
@@ -872,7 +872,10 @@ class GreenhouseAdapter:
         return ParseOutcome(
             kind=ParseOutcomeKind.FAILURE,
             review_evidence=tuple(review),
-            failure=self._failure_record(envelope, kind, detail),
+            failure=self._failure_record(result.envelope, kind, detail),
+            # ACQ-09: a failure is as traceable as a success — the envelope
+            # and validity evidence that produced it stay linked.
+            evidence_refs=_evidence_refs(result),
         )
 
     def _failure_record(self, envelope, kind: FailureKind, detail: str) -> FailureRecord:

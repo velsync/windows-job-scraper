@@ -720,6 +720,61 @@ class TestDetailParse:
 # --------------------------------------------------------------------------
 
 
+class TestFailureTraceability:
+    """Pre-S2.7 corrective B (ACQ-09): a failed Greenhouse parse is as
+    traceable as a success — the envelope and validity evidence that produced
+    it stay linked on the outcome.  Mirrors the S2.6 Lever F3 fix."""
+
+    @pytest.mark.parametrize(
+        "fixture",
+        [
+            "board_list_changed_template.json",
+            "board_list_missing_required_fields.json",
+            "board_list_malformed.json",
+        ],
+    )
+    def test_list_failures_link_the_envelope_and_validity_evidence(self, fixture):
+        outcome = _parse(_adapter(), fixture)
+        assert outcome.kind is ParseOutcomeKind.FAILURE
+        assert outcome.failure is not None
+        assert outcome.evidence_refs, "failure outcome lost its ACQ-09 evidence refs"
+        assert len(outcome.evidence_refs) == len(set(outcome.evidence_refs))
+
+    def test_detail_failures_link_the_envelope_and_validity_evidence(self):
+        adapter = _adapter()
+        detail_id = "4001"
+        task = _task(AdapterTaskKind.DETAIL, {"target_reference": detail_id})
+        for body in (b"[]", b"not json", b'{"id": 4001}'):
+            envelope = ResultEnvelope(
+                execution_plan_id="plan-1", request_id="req-1", attempt_id="att-1",
+                run_source_plan_id="rsp-1", source_id="src-1", binding_id="bnd-1",
+                binding_revision_id="bndrev-1", adapter_id=ADAPTER_ID,
+                adapter_version=ADAPTER_VERSION, strategy="PROVIDER_NATIVE",
+                execution_class="HTTP", requested_url=f"{LIST_URL}/{detail_id}",
+                final_url=f"{LIST_URL}/{detail_id}", status_code=200,
+                content_type="application/json", body=body,
+            ).finalize()
+            outcome = adapter.parse(
+                task,
+                ValidatedResultEnvelope(
+                    envelope=envelope, page_class=PageClass.VALID_JOB,
+                    validation_evidence={"fixture": "inline"},
+                ),
+                ctx=None,
+            )
+            assert outcome.kind is ParseOutcomeKind.FAILURE, body
+            assert outcome.evidence_refs, body
+
+    def test_health_probe_failures_link_evidence(self):
+        outcome = _adapter().parse(
+            _task(AdapterTaskKind.HEALTH),
+            _validated("board_list_changed_template.json", task_kind=AdapterTaskKind.HEALTH),
+            ctx=None,
+        )
+        assert outcome.kind is ParseOutcomeKind.FAILURE
+        assert outcome.evidence_refs
+
+
 class TestCursor:
     def test_the_board_endpoint_is_not_paginated(self):
         adapter = _adapter()

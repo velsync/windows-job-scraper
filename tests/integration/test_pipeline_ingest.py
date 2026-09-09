@@ -43,7 +43,9 @@ from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
 from jobscraper.pipeline.canonical import select_canonical_provenance
 from jobscraper.pipeline.coverage import (
     CoverageFinalizationError,
+    degrade_coverage,
     finalize_coverage,
+    is_coverage_degraded,
     open_coverage,
     record_seen_identity,
 )
@@ -668,6 +670,76 @@ def test_a_resumed_pass_continues_an_unfinished_generation(db):
     fourth, resumed = open_or_resume_coverage(db.conn, now=MUCH_LATER, **kwargs)
     assert (fourth, resumed) == (third, True)
     assert db.conn.execute("SELECT COUNT(*) FROM enumeration_coverage").fetchone()[0] == 2
+
+
+def test_finalization_barrier_refuses_complete_for_a_degraded_generation(db):
+    """Pre-S2.7 corrective A: ``degrade_coverage`` is the durable
+    ``PARTIAL ⇒ degraded`` primitive (ACQ-03, RUN-13).  Once applied to an
+    open generation, ``finalize_coverage(COMPLETE)`` is refused even with
+    terminal enumeration proven and every contributing request closed."""
+    run_id, plan_id, cov, rid_b = _coverage_setup(db)
+    assert is_coverage_degraded(db.conn, cov) is False
+
+    degrade_coverage(db.conn, cov, reason="degraded by PARTIAL acquisition unit")
+    assert is_coverage_degraded(db.conn, cov) is True
+    row = db.conn.execute("SELECT * FROM enumeration_coverage WHERE id = ?", (cov,)).fetchone()
+    assert row["absence_inference_allowed"] == 0
+    assert row["finalized_at"] is None  # degrading is not finalizing
+
+    # idempotent and irreversible: a second call changes nothing, and there
+    # is no API that sets the flag back
+    degrade_coverage(db.conn, cov, reason="again")
+    assert db.conn.execute(
+        "SELECT absence_inference_allowed, stop_reason FROM enumeration_coverage WHERE id = ?", (cov,)
+    ).fetchone()[0] == 0
+
+    with pytest.raises(CoverageFinalizationError):
+        finalize_coverage(
+            db.conn, cov, completion_state="COMPLETE", stop_reason="terminal cursor",
+            terminal_enumeration_proven=True, now=MUCH_LATER,
+        )
+    assert db.conn.execute(
+        "SELECT finalized_at FROM enumeration_coverage WHERE id = ?", (cov,)
+    ).fetchone()["finalized_at"] is None
+
+    # PARTIAL finalization is what remains possible; it applies no absence
+    finalize_coverage(
+        db.conn, cov, completion_state="PARTIAL", stop_reason="degraded by PARTIAL acquisition unit",
+        terminal_enumeration_proven=False, now=MUCH_LATER,
+    )
+    row = db.conn.execute("SELECT * FROM enumeration_coverage WHERE id = ?", (cov,)).fetchone()
+    assert row["completion_state"] == "PARTIAL"
+    assert row["applied_at"] is not None
+    for presence in db.conn.execute("SELECT presence_state, last_absence_coverage_id FROM job_sources"):
+        assert presence["presence_state"] == "ACTIVE"
+        assert presence["last_absence_coverage_id"] != cov
+
+
+def test_degrade_coverage_leaves_a_finalized_generation_untouched(db):
+    """Generations are immutable once finalized (03 §40); degradation of a
+    later PARTIAL never rewrites an earlier COMPLETE proof."""
+    run_id, plan_id, cov, rid_b = _coverage_setup(db)
+    db.conn.execute("UPDATE scrape_requests SET status = 'SUCCEEDED' WHERE id = ?", (rid_b,))
+    db.conn.commit()
+    finalize_coverage(
+        db.conn, cov, completion_state="COMPLETE", stop_reason="terminal cursor",
+        terminal_enumeration_proven=True, now=MUCH_LATER,
+    )
+    degrade_coverage(db.conn, cov, reason="too late")
+    row = db.conn.execute("SELECT * FROM enumeration_coverage WHERE id = ?", (cov,)).fetchone()
+    assert row["completion_state"] == "COMPLETE"
+    assert row["absence_inference_allowed"] == 1
+    assert is_coverage_degraded(db.conn, cov) is False
+
+
+def test_degrade_coverage_is_a_no_op_for_non_absence_authorities(db):
+    """A NON_AUTHORITATIVE_QUERY generation never had absence authority to
+    lose; degrading it neither flips anything nor reports degraded."""
+    run_id, plan_id, cov, rid_b = _coverage_setup(db, authority="NON_AUTHORITATIVE_QUERY")
+    before = db.conn.execute("SELECT * FROM enumeration_coverage WHERE id = ?", (cov,)).fetchone()
+    assert before["absence_inference_allowed"] == 0
+    degrade_coverage(db.conn, cov, reason="x")
+    assert is_coverage_degraded(db.conn, cov) is False
 
 
 def test_finalization_barrier_refuses_complete_while_requests_running(db):
