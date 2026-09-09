@@ -30,6 +30,7 @@ def _permissions(conn):
 
 def _greenhouse(conn, board: str, *, entry_url: str | None = None, config=None):
     definition = ensure_builtin_adapter_definition(conn, "greenhouse", now=NOW)
+    assert definition.verified
     return provision_source_and_binding(
         conn,
         display_name=f"{board} board",
@@ -102,7 +103,7 @@ def test_missing_greenhouse_config_never_becomes_current_authority(db):
     assert binding["current_revision_id"] is None
 
 
-def test_existing_builtin_identity_with_wrong_manifest_is_rejected(db):
+def test_existing_builtin_identity_with_wrong_manifest_is_explicitly_unverified_and_unusable(db):
     db.conn.execute(
         "INSERT INTO adapter_definitions "
         "(adapter_id, adapter_version, adapter_api_version, manifest_json, is_builtin, created_at) "
@@ -111,5 +112,23 @@ def test_existing_builtin_identity_with_wrong_manifest_is_rejected(db):
     )
     db.conn.commit()
 
-    with pytest.raises(ProvisioningError, match="manifest|identity|definition"):
-        ensure_builtin_adapter_definition(db.conn, "greenhouse", now=NOW)
+    definition = ensure_builtin_adapter_definition(db.conn, "greenhouse", now=NOW)
+    assert definition.created is False
+    assert definition.verified is False
+    assert definition.conflict_reason and "manifest" in definition.conflict_reason
+
+    _permissions(db.conn)
+    with pytest.raises(ProvisioningError, match="manifest|definition|activated"):
+        provision_source_and_binding(
+            db.conn,
+            display_name="Acme board",
+            source_family="ATS_BOARD",
+            entry_url="https://boards.greenhouse.io/acme",
+            canonical_host="boards.greenhouse.io",
+            adapter_id="greenhouse",
+            adapter_version="1.0.0",
+            strategy="PROVIDER_NATIVE",
+            execution_class="HTTP",
+            config={"board": "acme"},
+            now=NOW,
+        )

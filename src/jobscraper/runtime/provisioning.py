@@ -1,23 +1,12 @@
-"""Idempotent provisioning of immutable routing decision objects (03 §50).
+"""Host-owned provisioning of immutable source/routing objects (02 §8/§9, 03 §50).
 
-Provisioning is the **host-owned** surface that creates the immutable objects
-authorized by a routing decision:
+A ``Source`` is one real collection target (one board/feed/careers target), not
+a shared provider hostname. Adapter configuration is validated before it can
+become current runnable authority. Built-in adapter-definition conflicts are
+reported explicitly and cannot be activated; rows remain append-only.
 
-* ``adapter_definitions`` — reusable adapter identity (idempotent, derived
-  from the registered adapter's own manifest by
-  :func:`ensure_builtin_adapter_definition`)
-* ``sources`` — the real-world collection target (idempotent per canonical host)
-* ``source_adapter_bindings`` — stable binding identity (idempotent per source + display name)
-* ``source_adapter_binding_revisions`` — immutable revision (idempotent per
-  binding + adapter + strategy + execution class + pinned adapter config)
-* ``ats_fingerprints`` — append-only fingerprint evidence
-* ``source_route_decisions`` — append-only route decision evidence
-
-Adapters must not gain direct authority to write these rows — they are
-provisioned by this module at the host's direction only.
-
-Authority: docs/spec/v0.3.1.3/03_durable_runtime_and_persistence.md §50;
-docs/spec/v0.3.1.3/02_acquisition_adapters_and_crawler.md §8, §9.
+Released schema bytes are unchanged. ``canonical_host`` remains descriptive
+metadata; source idempotency is derived from the normalized entry target.
 """
 
 from __future__ import annotations
@@ -29,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from jobscraper.ids import new_id
+from jobscraper.net.urlnorm import UrlNormalizationError, normalize_url
 from jobscraper.runtime.clock import db_utc_now
 
 
@@ -37,34 +27,119 @@ class ProvisioningError(Exception):
 
 
 def _canonical_json(config: Mapping | None) -> str:
-    """Deterministic serialization of a pinned adapter config.
-
-    Key order is not identity: two spellings of the same config must pin the
-    *same* immutable revision, so serialization is canonical (sorted keys,
-    compact separators) exactly like every other durable JSON projection.
-    """
     return json.dumps(dict(config or {}), sort_keys=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
 class BuiltinAdapterDefinition:
-    """Result of ensuring one built-in adapter's durable identity row."""
-
     adapter_id: str
     adapter_version: str
     adapter_api_version: str
-    #: ``True`` when this call inserted the row, ``False`` when it already existed
     created: bool
+    #: False means an append-only pre-existing row conflicts with this build's
+    #: registered manifest. It is retained for history but cannot be activated.
+    verified: bool = True
+    conflict_reason: str | None = None
 
 
 @dataclass(frozen=True)
 class ProvisionedSource:
-    """Result of provisioning a source and its binding."""
     source_id: str
     binding_id: str
     binding_revision_id: str
     fingerprint_id: str | None = None
     route_decision_id: str | None = None
+
+
+def _source_target_key(value: str) -> str:
+    """Stable identity for one collection target, preserving board/path scope."""
+    try:
+        return normalize_url(value).normalized
+    except (UrlNormalizationError, ValueError, TypeError) as exc:
+        raise ProvisioningError(f"entry_url is not a usable source target: {exc}") from exc
+
+
+def _registered_definition_state(
+    conn: sqlite3.Connection,
+    adapter_id: str,
+    adapter_version: str,
+) -> tuple[bool, str | None]:
+    """Check the stored built-in identity against this process's registry.
+
+    Slice 1's `json_api_feed` predates manifest-derived provisioning and may
+    have a historical `{}` manifest row. That one legacy representation remains
+    runnable for backwards compatibility; all S2.5+ manifest-derived built-ins
+    are exact-match/fail-closed.
+    """
+    from jobscraper.adapters.contract import validate_manifest
+    from jobscraper.adapters.registry import BUILTIN_ADAPTERS
+
+    adapter_cls = BUILTIN_ADAPTERS.get(adapter_id)
+    if adapter_cls is None:
+        return True, None  # FK/external definition policy is owned elsewhere
+    row = conn.execute(
+        "SELECT adapter_api_version, manifest_json, is_builtin FROM adapter_definitions"
+        " WHERE adapter_id = ? AND adapter_version = ?",
+        (adapter_id, adapter_version),
+    ).fetchone()
+    if row is None:
+        return False, "adapter definition is missing"
+
+    manifest = validate_manifest(dataclasses.asdict(adapter_cls.manifest))
+    if manifest.version != adapter_version:
+        return False, "registered manifest version disagrees with durable identity"
+
+    # Accepted Slice-1 compatibility representation. New provider adapters do
+    # not get this exception.
+    if adapter_id == "json_api_feed" and (row["manifest_json"] or "").strip() == "{}":
+        return True, None
+
+    try:
+        stored = json.loads(row["manifest_json"])
+        stored_json = _canonical_json(stored)
+    except (ValueError, TypeError):
+        return False, "stored manifest is not a canonical JSON object"
+    expected_json = _canonical_json(dataclasses.asdict(manifest))
+    if int(row["is_builtin"] or 0) != 1:
+        return False, "stored definition is not marked built-in"
+    if row["adapter_api_version"] != manifest.adapter_api_version:
+        return False, "stored adapter_api_version disagrees with registered manifest"
+    if stored_json != expected_json:
+        return False, "stored manifest disagrees with registered built-in manifest"
+    return True, None
+
+
+def _validate_adapter_config(
+    adapter_id: str,
+    adapter_version: str,
+    config: Mapping | None,
+) -> bool:
+    """Whether this revision is valid to make current runnable authority.
+
+    ``None`` may still be retained as a draft/historical empty config for
+    backwards compatibility. If the adapter cannot construct from it, the
+    revision is not activated. A supplied invalid config is rejected before any
+    Source/Binding mutation.
+    """
+    from jobscraper.adapters.registry import BUILTIN_ADAPTERS, build_adapter
+
+    adapter_cls = BUILTIN_ADAPTERS.get(adapter_id)
+    if adapter_cls is None:
+        return False
+    if adapter_cls.manifest.version != adapter_version:
+        raise ProvisioningError(
+            f"registered adapter {adapter_id!r} is version "
+            f"{adapter_cls.manifest.version!r}, not {adapter_version!r}"
+        )
+    try:
+        build_adapter(adapter_id, config)
+    except (ValueError, TypeError) as exc:
+        if config is None:
+            return False
+        raise ProvisioningError(
+            f"invalid config for built-in adapter {adapter_id!r}: {exc}"
+        ) from exc
+    return True
 
 
 def _next_revision_number(
@@ -76,26 +151,14 @@ def _next_revision_number(
     execution_class: str,
     config_json: str = "{}",
 ) -> tuple[int, str | None]:
-    """Return (next_revision_number, existing_revision_id | None).
-
-    If a binding revision with the exact same adapter + strategy + execution
-    class + pinned config already exists, return its revision number and id
-    (idempotent).  Otherwise return the next available revision number.
-
-    The config is part of revision identity because a revision is the
-    authorization a run replays against (03 §50): re-pointing a provider board
-    is a *new* authorization, never an edit of the old one.
-    """
     existing = conn.execute(
         "SELECT id, revision FROM source_adapter_binding_revisions"
         " WHERE binding_id = ? AND adapter_id = ? AND adapter_version = ?"
         " AND strategy = ? AND execution_class = ? AND config_json = ?",
-        (binding_id, adapter_id, adapter_version, strategy, execution_class,
-         config_json),
+        (binding_id, adapter_id, adapter_version, strategy, execution_class, config_json),
     ).fetchone()
     if existing:
         return existing["revision"], existing["id"]
-
     max_rev = conn.execute(
         "SELECT COALESCE(MAX(revision), 0) FROM source_adapter_binding_revisions"
         " WHERE binding_id = ?",
@@ -109,31 +172,14 @@ def record_fingerprint(
     *,
     source_id: str,
     url: str,
-    fingerprint,  # AtsFingerprint — avoid circular import at module level
+    fingerprint,
     now: str | None = None,
     commit: bool = True,
 ) -> str:
-    """Insert an append-only fingerprint evidence row.
+    """Insert append-only fingerprint evidence.
 
-    Parameters
-    ----------
-    conn:
-        Database write connection.
-    source_id:
-        The source this fingerprint classifies.
-    url:
-        The URL that was fingerprinted.
-    fingerprint:
-        The :class:`~jobscraper.adapters.fingerprint.AtsFingerprint` result.
-    now:
-        Timestamp override (for testing).  Defaults to database UTC.
-    commit:
-        Whether to commit after the insert.
-
-    Returns
-    -------
-    str
-        The id of the inserted row.
+    v14 retains nullable source ids for released-schema compatibility. The
+    production provisioning path calls this only after Source creation.
     """
     ts = now or db_utc_now(conn)
     row_id = new_id("fp")
@@ -168,33 +214,12 @@ def record_route_decision(
     conn: sqlite3.Connection,
     *,
     source_id: str,
-    fingerprint,  # AtsFingerprint
-    decision,  # RouteDecision
+    fingerprint,
+    decision,
     now: str | None = None,
     commit: bool = True,
 ) -> str:
-    """Insert an append-only route decision evidence row.
-
-    Parameters
-    ----------
-    conn:
-        Database write connection.
-    source_id:
-        The source this decision applies to.
-    fingerprint:
-        The input fingerprint (recorded for audit).
-    decision:
-        The :class:`~jobscraper.adapters.router.RouteDecision` result.
-    now:
-        Timestamp override (for testing).
-    commit:
-        Whether to commit after the insert.
-
-    Returns
-    -------
-    str
-        The id of the inserted row.
-    """
+    """Insert append-only route-decision evidence."""
     ts = now or db_utc_now(conn)
     row_id = new_id("rd")
     candidates_json = json.dumps(
@@ -260,73 +285,14 @@ def provision_source_and_binding(
     execution_class: str,
     config: Mapping | None = None,
     now: str | None = None,
-    fingerprint=None,  # AtsFingerprint | None
-    decision=None,  # RouteDecision | None
+    fingerprint=None,
+    decision=None,
     commit: bool = True,
 ) -> ProvisionedSource:
-    """Idempotently provision source, binding, and binding revision.
-
-    Creates (or reuses) the following immutable objects:
-
-    1. ``adapter_definitions`` — the adapter identity row (if missing).
-    2. ``sources`` — the source row, keyed by ``canonical_host``.
-    3. ``source_adapter_bindings`` — the stable binding identity.
-    4. ``source_adapter_binding_revisions`` — one immutable revision per
-       (binding, adapter, strategy, execution_class, pinned config)
-       combination, pinned as the binding's ``current_revision_id`` so the
-       host's run planner can actually select it.
-    5. ``ats_fingerprints`` — fingerprint evidence (if provided).
-    6. ``source_route_decisions`` — route decision evidence (if provided).
-
-    Parameters
-    ----------
-    conn:
-        Database write connection.
-    display_name:
-        Human-readable source name.
-    source_family:
-        Source family classifier (e.g. ``ATS``).
-    entry_url:
-        The URL used to discover this source.
-    canonical_host:
-        The canonical host for deduplication.
-    adapter_id:
-        The adapter id to bind.
-    adapter_version:
-        The adapter version to bind.
-    strategy:
-        The acquisition strategy (e.g. ``PROVIDER_NATIVE``).
-    execution_class:
-        The execution class (e.g. ``HTTP``).
-    config:
-        The adapter configuration pinned into the immutable revision (e.g.
-        ``{"board": "acme"}`` for a provider-native adapter).  It participates
-        in revision identity: the same binding with a different config pins a
-        new revision and leaves the previous one byte-identical.  ``None`` pins
-        an empty config, which is what Slice 1's feed adapter needs.
-    now:
-        Timestamp override (for testing).
-    fingerprint:
-        Optional fingerprint to record as evidence.
-    decision:
-        Optional route decision to record as evidence.
-    commit:
-        Whether to commit after all inserts.
-
-    Returns
-    -------
-    ProvisionedSource
-        The ids of the provisioned (or reused) objects.
-
-    Raises
-    ------
-    ProvisioningError
-        If a required FK target (e.g. adapter_definitions) does not exist.
-    """
+    """Idempotently provision one source target and binding revision."""
     ts = now or db_utc_now(conn)
     config_json = _canonical_json(config)
 
-    # 1. Verify adapter definition exists
     adapter_def = conn.execute(
         "SELECT adapter_id FROM adapter_definitions"
         " WHERE adapter_id = ? AND adapter_version = ?",
@@ -335,65 +301,78 @@ def provision_source_and_binding(
     if adapter_def is None:
         raise ProvisioningError(
             f"adapter_definitions row not found for "
-            f"(adapter_id={adapter_id!r}, adapter_version={adapter_version!r}). "
-            f"Insert it before provisioning a binding."
+            f"(adapter_id={adapter_id!r}, adapter_version={adapter_version!r})"
+        )
+    definition_ok, definition_reason = _registered_definition_state(
+        conn, adapter_id, adapter_version
+    )
+    if not definition_ok:
+        raise ProvisioningError(
+            f"adapter definition {adapter_id!r}/{adapter_version!r} cannot be "
+            f"activated: {definition_reason}"
         )
 
-    # 2. Provision source (idempotent per canonical_host)
-    source_id = _provision_source(conn, display_name, source_family, entry_url,
-                                  canonical_host, ts)
+    # Both checks occur before any Source/Binding mutation.
+    activatable = _validate_adapter_config(adapter_id, adapter_version, config)
+    _source_target_key(entry_url)
 
-    # 3. Provision binding (idempotent per source + adapter_id)
-    binding_display = adapter_id
-    binding_id = _provision_binding(conn, source_id, binding_display, ts)
+    source_id = _provision_source(
+        conn, display_name, source_family, entry_url, canonical_host, ts
+    )
+    binding_id = _provision_binding(conn, source_id, adapter_id, ts)
 
-    # 4. Provision binding revision (idempotent per binding + adapter + strategy)
     rev_number, existing_rev_id = _next_revision_number(
-        conn, binding_id, adapter_id, adapter_version, strategy, execution_class,
+        conn,
+        binding_id,
+        adapter_id,
+        adapter_version,
+        strategy,
+        execution_class,
         config_json,
     )
-    if existing_rev_id:
-        binding_revision_id = existing_rev_id
-    else:
-        binding_revision_id = _create_binding_revision(
-            conn, binding_id, rev_number, adapter_id, adapter_version,
-            strategy, execution_class, ts, config_json=config_json,
-        )
-
-    # 4b. Pin it as the binding's current revision.  A revision nobody points
-    # at cannot run: the host's run planner selects plans through
-    # ``source_adapter_bindings.current_revision_id``, so provisioning — the
-    # surface that just authorized this adapter+config for this source — is
-    # also the surface that makes it the binding's live authorization.  The
-    # binding row is mutable identity/state (only *revisions* are immutable),
-    # the pointer move is idempotent, and the previous revision row stays
-    # byte-identical and inspectable.  (``source_adapter_bindings`` carries no
-    # ``updated_at``: the revision rows are the timeline.)
-    conn.execute(
-        "UPDATE source_adapter_bindings SET current_revision_id = ?"
-        " WHERE id = ? AND (current_revision_id IS NULL OR current_revision_id != ?)",
-        (binding_revision_id, binding_id, binding_revision_id),
+    binding_revision_id = existing_rev_id or _create_binding_revision(
+        conn,
+        binding_id,
+        rev_number,
+        adapter_id,
+        adapter_version,
+        strategy,
+        execution_class,
+        ts,
+        config_json=config_json,
     )
 
-    # 5. Record fingerprint evidence (append-only, always a new row)
+    if activatable:
+        conn.execute(
+            "UPDATE source_adapter_bindings SET current_revision_id = ?"
+            " WHERE id = ? AND (current_revision_id IS NULL OR current_revision_id != ?)",
+            (binding_revision_id, binding_id, binding_revision_id),
+        )
+
     fingerprint_id = None
     if fingerprint is not None:
         fingerprint_id = record_fingerprint(
-            conn, source_id=source_id, url=entry_url,
-            fingerprint=fingerprint, now=ts, commit=False,
+            conn,
+            source_id=source_id,
+            url=entry_url,
+            fingerprint=fingerprint,
+            now=ts,
+            commit=False,
         )
 
-    # 6. Record route decision evidence (append-only, always a new row)
     route_decision_id = None
     if decision is not None:
         route_decision_id = record_route_decision(
-            conn, source_id=source_id, fingerprint=fingerprint,
-            decision=decision, now=ts, commit=False,
+            conn,
+            source_id=source_id,
+            fingerprint=fingerprint,
+            decision=decision,
+            now=ts,
+            commit=False,
         )
 
     if commit:
         conn.commit()
-
     return ProvisionedSource(
         source_id=source_id,
         binding_id=binding_id,
@@ -411,23 +390,21 @@ def _provision_source(
     canonical_host: str | None,
     ts: str,
 ) -> str:
-    """Insert or reuse a source row (idempotent per canonical_host)."""
-    if canonical_host:
-        existing = conn.execute(
-            "SELECT id FROM sources WHERE canonical_host = ?",
-            (canonical_host,),
-        ).fetchone()
-        if existing:
+    """Insert/reuse the same normalized target, never hostname-only identity."""
+    target_key = _source_target_key(entry_url)
+    for existing in conn.execute("SELECT id, entry_url FROM sources").fetchall():
+        try:
+            existing_key = _source_target_key(existing["entry_url"])
+        except ProvisioningError:
+            continue
+        if existing_key == target_key:
             return existing["id"]
-
     source_id = new_id("src")
     conn.execute(
         "INSERT INTO sources"
-        " (id, display_name, source_family, entry_url, canonical_host,"
-        " created_at, updated_at)"
+        " (id, display_name, source_family, entry_url, canonical_host, created_at, updated_at)"
         " VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (source_id, display_name, source_family, entry_url, canonical_host,
-         ts, ts),
+        (source_id, display_name, source_family, entry_url, canonical_host, ts, ts),
     )
     return source_id
 
@@ -438,7 +415,6 @@ def _provision_binding(
     display_name: str,
     ts: str,
 ) -> str:
-    """Insert or reuse a binding row (idempotent per source + display_name)."""
     existing = conn.execute(
         "SELECT id FROM source_adapter_bindings"
         " WHERE source_id = ? AND display_name = ?",
@@ -446,11 +422,9 @@ def _provision_binding(
     ).fetchone()
     if existing:
         return existing["id"]
-
     binding_id = new_id("bnd")
     conn.execute(
-        "INSERT INTO source_adapter_bindings"
-        " (id, source_id, display_name, created_at)"
+        "INSERT INTO source_adapter_bindings (id, source_id, display_name, created_at)"
         " VALUES (?, ?, ?, ?)",
         (binding_id, source_id, display_name, ts),
     )
@@ -468,39 +442,27 @@ def _create_binding_revision(
     ts: str,
     config_json: str = "{}",
 ) -> str:
-    """Create a new immutable binding revision.
-
-    Requires a default permission profile to exist.
-    """
-    # Find the default permission profile
     perm_profile = conn.execute(
-        "SELECT id FROM adapter_permission_profiles LIMIT 1",
+        "SELECT id FROM adapter_permission_profiles ORDER BY id LIMIT 1"
     ).fetchone()
     if perm_profile is None:
         raise ProvisioningError(
-            "no adapter_permission_profiles row exists — "
-            "cannot create a binding revision without a permission profile"
+            "no adapter_permission_profiles row exists — cannot create a binding revision"
         )
     perm_profile_id = perm_profile["id"]
-
     perm_rev = conn.execute(
         "SELECT revision FROM adapter_permission_profile_revisions"
         " WHERE permission_profile_id = ? ORDER BY revision DESC LIMIT 1",
         (perm_profile_id,),
     ).fetchone()
     if perm_rev is None:
-        raise ProvisioningError(
-            f"no revision for permission profile {perm_profile_id!r}"
-        )
-    perm_revision = perm_rev["revision"]
-
+        raise ProvisioningError(f"no revision for permission profile {perm_profile_id!r}")
     revision_id = new_id("bndrev")
     conn.execute(
         "INSERT INTO source_adapter_binding_revisions"
         " (id, binding_id, revision, adapter_id, adapter_version, strategy,"
-        " priority, config_json, auth_requirement, auth_scope_id,"
-        " execution_class, permission_profile_id,"
-        " permission_profile_revision, created_at)"
+        " priority, config_json, auth_requirement, auth_scope_id, execution_class,"
+        " permission_profile_id, permission_profile_revision, created_at)"
         " VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'NONE', NULL, ?, ?, ?, ?)",
         (
             revision_id,
@@ -512,7 +474,7 @@ def _create_binding_revision(
             config_json,
             execution_class,
             perm_profile_id,
-            perm_revision,
+            perm_rev["revision"],
             ts,
         ),
     )
@@ -527,23 +489,12 @@ def ensure_builtin_adapter_definition(
     now: str | None = None,
     commit: bool = True,
 ) -> BuiltinAdapterDefinition:
-    """Idempotently pin one built-in adapter's durable identity row.
+    """Pin/verify a built-in identity without mutating conflicting history.
 
-    The row is derived from the adapter's own manifest as registered in
-    :mod:`jobscraper.adapters.registry` — never from caller-supplied strings.
-    That keeps ``adapter_definitions`` (what the durable record authorizes)
-    and the code that runs (what the registry can build) in agreement, so
-    provenance written under an ``adapter_id``/``adapter_version`` pair always
-    names a manifest that existed (02 §8, ARC-04.3).
-
-    An existing row is reused byte-for-byte: adapter identity rows are
-    append-only, so a previously pinned identity is never rewritten.
-
-    Raises
-    ------
-    ProvisioningError
-        If the adapter is not registered as built-in, or if ``adapter_version``
-        names a version the registered manifest does not declare.
+    A pre-existing conflicting row is returned with ``verified=False`` rather
+    than silently treated as trustworthy. Provisioning refuses to activate such
+    a definition. This preserves append-only history while making the conflict
+    explicit and fail-closed at the authorization boundary.
     """
     from jobscraper.adapters.contract import validate_manifest
     from jobscraper.adapters.registry import BUILTIN_ADAPTERS
@@ -557,30 +508,33 @@ def ensure_builtin_adapter_definition(
     manifest = validate_manifest(dataclasses.asdict(adapter_cls.manifest))
     if adapter_version is not None and adapter_version != manifest.version:
         raise ProvisioningError(
-            f"adapter {adapter_id!r} manifest declares version"
-            f" {manifest.version!r}, not {adapter_version!r}"
+            f"adapter {adapter_id!r} manifest declares version {manifest.version!r}, "
+            f"not {adapter_version!r}"
         )
     ts = now or db_utc_now(conn)
     manifest_json = _canonical_json(dataclasses.asdict(manifest))
 
     existing = conn.execute(
-        "SELECT adapter_version, adapter_api_version FROM adapter_definitions"
-        " WHERE adapter_id = ? AND adapter_version = ?",
+        "SELECT adapter_version, adapter_api_version, manifest_json, is_builtin"
+        " FROM adapter_definitions WHERE adapter_id = ? AND adapter_version = ?",
         (adapter_id, manifest.version),
     ).fetchone()
     if existing is not None:
+        ok, reason = _registered_definition_state(conn, adapter_id, manifest.version)
         return BuiltinAdapterDefinition(
             adapter_id=adapter_id,
             adapter_version=existing["adapter_version"],
             adapter_api_version=existing["adapter_api_version"],
             created=False,
+            verified=ok,
+            conflict_reason=reason,
         )
+
     conn.execute(
         "INSERT INTO adapter_definitions (adapter_id, adapter_version,"
         " adapter_api_version, manifest_json, is_builtin, created_at)"
         " VALUES (?, ?, ?, ?, 1, ?)",
-        (adapter_id, manifest.version, manifest.adapter_api_version,
-         manifest_json, ts),
+        (adapter_id, manifest.version, manifest.adapter_api_version, manifest_json, ts),
     )
     if commit:
         conn.commit()
@@ -589,6 +543,7 @@ def ensure_builtin_adapter_definition(
         adapter_version=manifest.version,
         adapter_api_version=manifest.adapter_api_version,
         created=True,
+        verified=True,
     )
 
 
