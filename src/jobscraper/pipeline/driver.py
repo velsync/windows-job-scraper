@@ -28,6 +28,7 @@ import ipaddress
 import json
 import sqlite3
 
+from jobscraper.acquisition.atsendpoints import spec_for_provider
 from jobscraper.acquisition.envelope import (
     ExecutionPlanEnvelope,
     RequestPlan,
@@ -100,13 +101,28 @@ _CLOSURE_CLASSES = frozenset({PageClass.NOT_FOUND, PageClass.JOB_CLOSED})
 _OPEN_REQUEST_STATUSES = ("PENDING", "RUNNING", "RETRY_WAIT")
 
 
-def source_policy(source_row: sqlite3.Row) -> DestinationPolicy:
-    """Host-owned destination policy for one source (04 §5.1)."""
+def source_policy(
+    source_row: sqlite3.Row | dict, *, adapter_id: str | None = None
+) -> DestinationPolicy:
+    """Host-owned destination policy for one source (04 §5.1).
+
+    A provider adapter may add only hosts from the reviewed, versioned ATS
+    endpoint table, and only when the Source entry host itself is a reviewed
+    host for that provider. Adapter config is deliberately not an input, so
+    imported/scraped data cannot widen network authority.
+    """
     try:
         normalized = normalize_url(source_row["entry_url"])
         host = normalized.host or ""
     except Exception:
         host = ""
+
+    allowed_hosts: set[str] = {host} if host else set()
+    if adapter_id == "greenhouse" and host:
+        spec = spec_for_provider("GREENHOUSE")
+        if host in {*spec.hosted_hosts, *spec.api_hosts}:
+            allowed_hosts.update(spec.api_hosts)
+
     grant = None
     try:
         literal = ipaddress.ip_address(host.strip("[]"))
@@ -121,7 +137,7 @@ def source_policy(source_row: sqlite3.Row) -> DestinationPolicy:
             purpose="loopback-source-entry", allowed_hosts=frozenset({host})
         )
     return DestinationPolicy(
-        allowed_hosts=frozenset({host}) if host else None,
+        allowed_hosts=frozenset(allowed_hosts) if allowed_hosts else None,
         internal_grant=grant,
         max_redirects=3,
         timeout_s=30.0,
@@ -438,7 +454,7 @@ def _execute_plan(
     source = conn.execute(
         "SELECT * FROM sources WHERE id = ?", (plan_row["source_id"],)
     ).fetchone()
-    policy = source_policy(source)
+    policy = source_policy(source, adapter_id=plan_row["adapter_id"])
     config = _plan_config(conn, plan_row)
     try:
         adapter = build_adapter(plan_row["adapter_id"], config)

@@ -787,7 +787,11 @@ class GreenhouseAdapter:
 
         put("source_job_id", job_id, "id")
         put("title", title, "title")
-        put("company", self.config.company_name, "company_name", kind="binding_config")
+        provider_company = _text(item.get("company_name"))
+        if provider_company is not None:
+            put("company", provider_company, "company_name")
+        else:
+            put("company", self.config.company_name, "company_name", kind="binding_config")
         put("careers_url", self.config.careers_url, "careers_url", kind="binding_config")
 
         content = item.get("content")
@@ -962,6 +966,7 @@ def _posted_at(item: Mapping) -> tuple[str | None, str]:
     ``first_seen_at`` still record when the host saw the posting.
     """
     for locator in (
+        "first_published",
         "first_published_at",
         "job_post_information.date_published",
     ):
@@ -971,7 +976,7 @@ def _posted_at(item: Mapping) -> tuple[str | None, str]:
         stamp = _utc_timestamp(node)
         if stamp is not None:
             return stamp, locator
-    return None, "updated_at"
+    return None, ""
 
 
 def _employment_type(item: Mapping) -> tuple[str | None, str]:

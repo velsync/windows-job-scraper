@@ -38,7 +38,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-CONTENT_CLEANING_VERSION = "content-clean-v1"
+CONTENT_CLEANING_VERSION = "content-clean-v2"
 
 TRACKING_PARAM_PREFIXES = ("utm_",)
 TRACKING_PARAM_NAMES = frozenset(
@@ -128,9 +128,11 @@ def _neutralize_url(url: str) -> str | None:
     return candidate
 
 
-def _safe_link(url: str, label: str) -> str:
+def _safe_link(
+    url: str, label: str, *, decode_entities: bool = True
+) -> str:
     """One HTML anchor → safe Markdown link or visible label only."""
-    url = html_lib.unescape(url or "").strip()
+    url = (html_lib.unescape(url or "") if decode_entities else (url or "")).strip()
     label = _collapse(_HTML_TAG.sub(" ", label or ""))
     retained = _neutralize_url(url)
     if retained is None:
@@ -138,7 +140,7 @@ def _safe_link(url: str, label: str) -> str:
     return f"[{label}]({retained})"
 
 
-def _html_to_markdown(markup: str) -> str:
+def _html_to_markdown(markup: str, *, decode_entities: bool = True) -> str:
     text = _HTML_COMMENT.sub(" ", markup or "")
     text = _SCRIPT_STYLE.sub(" ", text)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
@@ -178,20 +180,22 @@ def _html_to_markdown(markup: str) -> str:
     )
     text = re.sub(
         r"<a\b[^>]*href\s*=\s*[\"']([^\"']*)[\"'][^>]*>(.*?)</a>",
-        lambda m: _safe_link(m.group(1), m.group(2)),
+        lambda m: _safe_link(m.group(1), m.group(2), decode_entities=decode_entities),
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
     text = _HTML_TAG.sub(" ", text)
-    return _collapse(html_lib.unescape(text))
+    collapsed = _collapse(text)
+    return html_lib.unescape(collapsed) if decode_entities else collapsed
 
 
-def _html_to_text(markup: str) -> str:
+def _html_to_text(markup: str, *, decode_entities: bool = True) -> str:
     text = _HTML_COMMENT.sub(" ", markup or "")
     text = _SCRIPT_STYLE.sub(" ", text)
     text = _BLOCK_TAGS.sub("\n", text)
     text = _HTML_TAG.sub(" ", text)
-    return _derived_text(html_lib.unescape(text))
+    derived = _derived_text(text)
+    return html_lib.unescape(derived) if decode_entities else derived
 
 
 def _clean_markdown(raw: str) -> str:
@@ -290,12 +294,20 @@ def clean(raw: str) -> CleanedContent:
     if _looks_like_html(raw):
         markdown = _html_to_markdown(raw)
         text = _html_to_text(raw)
-    elif _looks_like_markdown(raw):
-        markdown = _clean_markdown(raw)
-        text = _markdown_to_text(markdown)
     else:
-        text = _collapse(raw)
-        markdown = text
+        decoded_once = html_lib.unescape(raw)
+        if decoded_once != raw and _looks_like_html(decoded_once):
+            # Provider payloads such as Greenhouse encode the markup itself.
+            # The outer entity layer is decoded exactly once here; the HTML
+            # sanitizer must not decode nested text entities a second time.
+            markdown = _html_to_markdown(decoded_once, decode_entities=False)
+            text = _html_to_text(decoded_once, decode_entities=False)
+        elif _looks_like_markdown(raw):
+            markdown = _clean_markdown(raw)
+            text = _markdown_to_text(markdown)
+        else:
+            text = _collapse(raw)
+            markdown = text
 
     content_hash = hashlib.sha256(text.encode()).hexdigest() if text else None
     return CleanedContent(
