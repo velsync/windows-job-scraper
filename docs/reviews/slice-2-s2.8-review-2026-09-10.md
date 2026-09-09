@@ -12,7 +12,9 @@ and low-confidence fallbacks, FTS mode honesty in all three capability states
 (FTS5 / substring / drift), and the security negatives. Full local gate
 **1280 passed, 5 skipped** (baseline 1267/5 + 12 acceptance + 1 red-first
 unit test; zero regressions), Slice 0 and Slice 1 automated gates **PASS**,
-migration bytes **UNCHANGED**.
+migration bytes **UNCHANGED**. CI run `34407259447` **SUCCESS on both
+platforms** (`Python 3.12, ubuntu-latest` 2m42s; `Python 3.12,
+windows-latest` 4m47s).
 
 The acceptance pass uncovered **one real defect (F1)** in a sealed S2.4
 surface — the honest generic fallback decision was unrecordable for a
@@ -22,6 +24,17 @@ is the only behavior-bearing change in this package.
 **S2.9 remains untouched and blocked** (no `scripts/verify_slice2.py`, no
 migration-from-v10 verification, no packaging/native prep, DF-1/DF-2
 untouched). This record does not authorize S2.9.
+
+## Package seal
+
+- Implementation commit:
+  `2378e10ca3f80fe93691f1afa2a34eb8e40fb9c6` on
+  `arena/01a087f1-windows-job-scraper` (4 files, +1646/−2)
+- CI: run `34407259447`, `.github/workflows/ci.yml` "Automated test gate",
+  push event on the session branch — `ubuntu-latest 2m42s ✓,
+  windows-latest 4m47s ✓` (Python 3.12, exact dev lock on both platforms;
+  the run's only annotations are the pre-existing Node.js 20 deprecation
+  notices on actions/checkout@v4 and actions/setup-python@v5).
 
 ## Authority and scope
 
