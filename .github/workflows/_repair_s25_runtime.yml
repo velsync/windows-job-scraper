@@ -1,6 +1,7 @@
 name: Apply S2.5 runtime corrective
 # Replay marker: evidence RED tests are now part of the branch lineage.
-# Sequential replay: final direct retry after stale-force-with-lease recovery.
+# Sequential replay: stage the already-tested tree on a fresh ref so the
+# host-owned repair ref can be fast-forwarded through the GitHub API.
 
 on:
   push:
@@ -41,4 +42,4 @@ jobs:
           git config user.email "velsync@gmail.com"
           git add -A
           git commit -m "fix(s2.5): separate listing coverage from detail completion"
-          git push origin HEAD:repair/s2.4-s2.5-correctives-20260909
+          git push origin HEAD:refs/heads/stage/s2.5-runtime-corrective-20260909
