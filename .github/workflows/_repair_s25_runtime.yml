@@ -1,4 +1,5 @@
 name: Apply S2.5 runtime corrective
+# Replay marker: evidence RED tests are now part of the branch lineage.
 
 on:
   push:
