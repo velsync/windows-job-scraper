@@ -55,24 +55,46 @@ jobs:
           .venv/bin/python -m pytest -q
           .venv/bin/python scripts/verify_slice0.py
           .venv/bin/python scripts/verify_slice1.py
-          if [ -f scripts/verify_slice2.py ]; then
-            .venv/bin/python scripts/verify_slice2.py
-          else
-            echo "[slice2-gate] SKIP: scripts/verify_slice2.py is not present (prompt makes this conditional)"
-          fi
+          echo "[slice2-pre-s2.9-gate] verify_slice2.py: N/A — authoritative Slice 2 plan reserves it for S2.9; validating cumulative S2.0-S2.5 surface directly"
+          .venv/bin/python -m pytest -q \
+            tests/contract/test_slice2_contract.py \
+            tests/integration/test_schema_slice2.py \
+            tests/integration/test_schema_slice2_s24.py \
+            tests/integration/test_acquisition_evidence.py \
+            tests/integration/test_company_location_provenance.py \
+            tests/integration/test_company_resolution.py \
+            tests/integration/test_search_indexed_pipeline.py \
+            tests/integration/test_greenhouse_e2e.py \
+            tests/integration/test_s2_2_corrective.py \
+            tests/integration/test_s2_2_platform_host_coverage.py \
+            tests/integration/test_s2_5_runtime_correctives.py \
+            tests/unit/test_origin_resolver.py \
+            tests/unit/test_locations.py \
+            tests/unit/test_provenance_classes.py \
+            tests/unit/test_contentclean.py \
+            tests/unit/test_search_index.py \
+            tests/unit/test_fingerprint.py \
+            tests/unit/test_router.py \
+            tests/unit/test_provisioning.py \
+            tests/unit/test_greenhouse_adapter.py \
+            tests/unit/test_s2_3_corrective.py \
+            tests/unit/test_s2_4_correctives.py \
+            tests/unit/test_s2_4_evidence_boundary_correctives.py \
+            tests/unit/test_s2_4_provisioning_correctives.py \
+            tests/unit/test_s2_5_greenhouse_contract_correctives.py
       - name: Run exact corrective gate (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           .venv/Scripts/python -m pytest -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .venv/Scripts/python scripts/verify_slice0.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .venv/Scripts/python scripts/verify_slice1.py
-          if (Test-Path scripts/verify_slice2.py) {
-            .venv/Scripts/python scripts/verify_slice2.py
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          } else {
-            Write-Host "[slice2-gate] SKIP: scripts/verify_slice2.py is not present (prompt makes this conditional)"
-          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "[slice2-pre-s2.9-gate] verify_slice2.py: N/A — authoritative Slice 2 plan reserves it for S2.9; validating cumulative S2.0-S2.5 surface directly"
+          .venv/Scripts/python -m pytest -q tests/contract/test_slice2_contract.py tests/integration/test_schema_slice2.py tests/integration/test_schema_slice2_s24.py tests/integration/test_acquisition_evidence.py tests/integration/test_company_location_provenance.py tests/integration/test_company_resolution.py tests/integration/test_search_indexed_pipeline.py tests/integration/test_greenhouse_e2e.py tests/integration/test_s2_2_corrective.py tests/integration/test_s2_2_platform_host_coverage.py tests/integration/test_s2_5_runtime_correctives.py tests/unit/test_origin_resolver.py tests/unit/test_locations.py tests/unit/test_provenance_classes.py tests/unit/test_contentclean.py tests/unit/test_search_index.py tests/unit/test_fingerprint.py tests/unit/test_router.py tests/unit/test_provisioning.py tests/unit/test_greenhouse_adapter.py tests/unit/test_s2_3_corrective.py tests/unit/test_s2_4_correctives.py tests/unit/test_s2_4_evidence_boundary_correctives.py tests/unit/test_s2_4_provisioning_correctives.py tests/unit/test_s2_5_greenhouse_contract_correctives.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   materialize:
     name: Materialize clean accepted tree
@@ -139,7 +161,7 @@ jobs:
 
           tree = post("git/trees", {"base_tree": base_tree, "tree": entries})["sha"]
           commit = post("git/commits", {
-              "message": "test(s2.5): reconcile accepted runtime expectations",
+              "message": "chore(repair): seal accepted S2.4-S2.5 corrective tree",
               "tree": tree,
               "parents": [parent],
           })["sha"]
