@@ -40,10 +40,20 @@ _PERIOD_PATTERNS = [
     ("MONTH", re.compile(r"(per month|a month|monthly|/month|/mo|lună|luna|monat)", re.IGNORECASE)),
     ("HOUR", re.compile(r"(per hour|an hour|hourly|/h\b|/hr)", re.IGNORECASE)),
 ]
+#: DF-1 closure (S2.9): a provider-verbatim range may carry a currency glyph
+#: and/or a K-suffix on *each* endpoint independently (e.g. ``$150K - $210K``,
+#: ``$130K - $224K``).  The accepted Slice-1 pattern allowed a K-suffix only on
+#: the second number and no currency glyph before the second number, so such a
+#: range never matched and degraded to the single-number parse on the *first*
+#: value — max collapsed to min.  Each endpoint here is ``[glyph] number
+#: [K-suffix]``; low <= high is enforced in ``parse_salary`` and a lone value
+#: still falls through to ``_SINGLE_RE`` unchanged.
 _RANGE_RE = re.compile(
-    r"(\d{1,3}(?:[.,\s]\d{3})+|\d+(?:\.\d+)?)\s*(?:-|–|—|to|bis| până la )\s*"
-    r"(\d{1,3}(?:[.,\s]\d{3})+|\d+(?:\.\d+)?)"
-    r"(\s*k\b)?",
+    r"(?:[$€£])?\s*"
+    r"(\d{1,3}(?:[.,\s]\d{3})+|\d+(?:\.\d+)?)\s*(k\b)?\s*"
+    r"(?:-|–|—|to|bis| până la )\s*"
+    r"(?:[$€£])?\s*"
+    r"(\d{1,3}(?:[.,\s]\d{3})+|\d+(?:\.\d+)?)\s*(k\b)?",
     re.IGNORECASE,
 )
 _SINGLE_RE = re.compile(
@@ -77,8 +87,10 @@ def parse_salary(text: str):
     period = next((code for code, pattern in _PERIOD_PATTERNS if pattern.search(text)), None)
     match = _RANGE_RE.search(text)
     if match:
-        low = _number(match.group(1), bool(match.group(3)))
-        high = _number(match.group(2), bool(match.group(3)))
+        # groups: 1=low number, 2=low K-suffix, 3=high number, 4=high K-suffix
+        # (each endpoint's K-suffix is expanded independently — DF-1)
+        low = _number(match.group(1), bool(match.group(2)))
+        high = _number(match.group(3), bool(match.group(4)))
         if low is not None and high is not None and low <= high:
             return low, high, currency, period
     match = _SINGLE_RE.search(text)

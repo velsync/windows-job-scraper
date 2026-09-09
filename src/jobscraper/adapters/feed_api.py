@@ -47,6 +47,20 @@ ADAPTER_ID = MANIFEST.id
 ADAPTER_VERSION = MANIFEST.version
 
 
+def _evidence_refs(result: ValidatedResult) -> tuple[str, ...]:
+    """ACQ-09 references to the durable evidence behind this outcome.
+
+    Parity with the S2.5+ provider adapters (DF-2): a failure outcome is as
+    traceable as a success — it links the same envelope + validity evidence
+    rows that produced it.
+    """
+    refs: list[str] = []
+    for ref in (result.result_envelope_ref, result.validation_evidence_ref):
+        if ref and ref not in refs:
+            refs.append(ref)
+    return tuple(refs)
+
+
 @dataclass(frozen=True)
 class FeedApiConfig:
     url_template: str
@@ -162,12 +176,12 @@ class FeedApiAdapter:
         try:
             payload = json.loads(envelope.body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as exc:
-            return self._failure(envelope, FailureKind.PARSE_MARKER_MISSING,
+            return self._failure(result, FailureKind.PARSE_MARKER_MISSING,
                                  f"body is not valid JSON: {exc}")
         found, items = _dig(payload, self.config.items_path)
         if not found or not isinstance(items, list):
             return self._failure(
-                envelope, FailureKind.PARSE_MARKER_MISSING,
+                result, FailureKind.PARSE_MARKER_MISSING,
                 f"items path {self.config.items_path!r} not found or not a list",
             )
         if not items:
@@ -184,7 +198,7 @@ class FeedApiAdapter:
 
         if not observations:
             return self._failure(
-                envelope, FailureKind.PARSE_MARKER_MISSING,
+                result, FailureKind.PARSE_MARKER_MISSING,
                 f"all {len(items)} items failed required-field validation",
                 review=review,
             )
@@ -244,8 +258,9 @@ class FeedApiAdapter:
         )
 
     def _failure(
-        self, envelope, kind: FailureKind, detail: str, *, review=()
+        self, result: ValidatedResult, kind: FailureKind, detail: str, *, review=()
     ) -> ParseOutcome:
+        envelope = result.envelope
         return ParseOutcome(
             kind=ParseOutcomeKind.FAILURE,
             review_evidence=tuple(review),
@@ -262,6 +277,9 @@ class FeedApiAdapter:
                 attempt_id=envelope.attempt_id,
                 details_redacted={"detail": detail[:500]},
             ),
+            # ACQ-09 / DF-2: a feed failure is as traceable as a success — the
+            # envelope + validity evidence that produced it stay linked.
+            evidence_refs=_evidence_refs(result),
         )
 
     # ------------------------------------------------------------ next cursor

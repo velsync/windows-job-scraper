@@ -412,15 +412,14 @@ def test_board_run_reaches_canonical_jobs_through_the_whole_spine(db, server):
     assert backend["description_text"] and "local-first" in backend["description_text"]
     assert "Salary band" in backend["description_text"]
     # inline compensation: the scrapeable summary is the salary signal and is
-    # preserved verbatim as evidence.  NOTE: the accepted Slice-1
-    # ``parse_salary`` does not expand the K-suffix on the *first* number of a
-    # range ("$150K - $210K"), so its normalized max collapses to the min —
-    # recorded as deferred finding DF-1 for S2.9; the adapter never rewrites
-    # the provider's string to work around the host parser.
+    # preserved verbatim as evidence.  The host parser expands the K-suffix on
+    # *each* endpoint of a provider range (DF-1 closed in S2.9), so the max no
+    # longer collapses to the min; the adapter never rewrites the provider's
+    # string.
     assert backend["salary_original_text"] == "$150K - $210K"
     assert backend["salary_currency"] == "USD"
     assert backend["salary_min"] == 150000
-    assert backend["salary_max"] == 150000  # host parser artifact — DF-1
+    assert backend["salary_max"] == 210000
     backend_locations = db.conn.execute(
         "SELECT raw_text, city, region, country, remote FROM job_locations"
         " WHERE job_id = ?",
