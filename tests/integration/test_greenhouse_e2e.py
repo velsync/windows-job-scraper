@@ -471,7 +471,7 @@ def test_board_run_reaches_canonical_jobs_through_the_whole_spine(db, server):
     assert cov["completion_state"] == "COMPLETE"
     assert cov["terminal_enumeration_proven"] == 1
     assert cov["coverage_authority"] == "AUTHORITATIVE_FULL_SOURCE"
-    assert cov["pages_completed"] == 4
+    assert cov["pages_completed"] == 1
     # the barrier is the enumeration: listing identity is sufficient, so the
     # detail children are not linked as contributing requests
     contributing = db.conn.execute(
@@ -635,12 +635,12 @@ def test_detail_identity_mismatch_is_refused_and_recorded(db, server):
         # body did not describe the identity that was asked about
         assert json.loads(parse["closure_evidence_json"])
     cov = _coverage(db)[0]
-    # The listing itself was complete and terminal, and that fact is recorded;
-    # what withholds authority is the generation state.  Absence is applied only
-    # for COMPLETE (RUN-13), and a provider whose detail answers contradict its
-    # own listing has not earned a COMPLETE generation.
-    assert cov["completion_state"] == "PARTIAL"
+    # The listing itself was complete and terminal, so its membership proof
+    # stays COMPLETE.  Contradictory DETAIL responses degrade the run, not the
+    # already-proven listing set (RUN-13 / listing_identity_sufficient).
+    assert cov["completion_state"] == "COMPLETE"
     assert cov["terminal_enumeration_proven"] == 1
+    assert cov["pages_completed"] == 1
     assert db.conn.execute(
         "SELECT COUNT(*) FROM job_sources WHERE presence_state != 'ACTIVE'"
     ).fetchone()[0] == 0
@@ -957,12 +957,13 @@ def test_an_open_detail_child_blocks_terminalization_until_drained(db, server):
     ).fetchone()[0]
     assert open_details == 3
     cov = _coverage(db)[0]
-    # the enumeration fact is recorded, the generation is not relyable: a
-    # budget-stopped run with accepted child work outstanding never applies
-    # absence evidence (only COMPLETE does)
-    assert cov["completion_state"] == "BUDGET_EXHAUSTED"
+    # The listing already proved the full stable membership set.  DETAIL work
+    # remains an accepted run obligation, but it is not part of this adapter's
+    # absence-authority barrier.
+    assert cov["completion_state"] == "COMPLETE"
     assert cov["terminal_enumeration_proven"] == 1
-    assert "budget" in cov["stop_reason"]
+    assert cov["pages_completed"] == 1
+    assert "terminal" in cov["stop_reason"]
     assert db.conn.execute(
         "SELECT group_outcome FROM run_source_plans WHERE run_id = ?", (run_id,)
     ).fetchone()["group_outcome"] == "SATISFIED_PARTIAL"

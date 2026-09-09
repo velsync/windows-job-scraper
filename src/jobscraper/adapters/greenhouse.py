@@ -570,10 +570,16 @@ class GreenhouseAdapter:
         observations: list[ObservationRecord] = []
         review: list[dict] = []
         tasks: list[DiscoveredTask] = []
+        rejected_members = 0
         for order, item in enumerate(items):
             observation, item_review, task = self._list_observation(item, order, envelope)
             if observation is not None:
                 observations.append(observation)
+            else:
+                # The provider declared a member that could not be admitted to
+                # the stable membership set.  Preserve good observations, but
+                # never turn the resulting subset into absence authority.
+                rejected_members += 1
             if item_review is not None:
                 review.append(item_review)
             if task is not None:
@@ -599,11 +605,17 @@ class GreenhouseAdapter:
                 }
             )
 
-        # §19/ACQ-03: the provider declared more members than it returned, so
-        # this enumeration did not complete — bounded PARTIAL, no authority.
+        # §19/ACQ-03/RUN-13: truncation or a rejected listed member means
+        # the membership proof is incomplete.  Detail-budget review is not a
+        # membership gap because listing_identity_sufficient is true.
         truncated = declared_total is not None and declared_total > len(items)
+        membership_incomplete = truncated or rejected_members > 0
         return ParseOutcome(
-            kind=ParseOutcomeKind.PARTIAL if truncated else ParseOutcomeKind.SUCCESS_WITH_JOBS,
+            kind=(
+                ParseOutcomeKind.PARTIAL
+                if membership_incomplete
+                else ParseOutcomeKind.SUCCESS_WITH_JOBS
+            ),
             observations=tuple(observations),
             discovered_tasks=tuple(tasks),
             review_evidence=tuple(review),
@@ -611,6 +623,7 @@ class GreenhouseAdapter:
             coverage_proposal={
                 "declared_total": declared_total,
                 "observed": len(observations),
+                "rejected_members": rejected_members,
                 "detail_tasks": len(tasks),
             },
             evidence_refs=refs,

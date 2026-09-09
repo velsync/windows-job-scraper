@@ -32,7 +32,7 @@ from jobscraper.pipeline.contentclean import (
 
 
 def test_cleaning_version_is_pinned() -> None:
-    assert CONTENT_CLEANING_VERSION == "content-clean-v1"
+    assert CONTENT_CLEANING_VERSION == "content-clean-v2"
 
 
 def test_clean_returns_markdown_text_lang_and_hash() -> None:

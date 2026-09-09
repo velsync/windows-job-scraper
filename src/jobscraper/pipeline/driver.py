@@ -295,6 +295,19 @@ def _open_acquisition_requests(conn: sqlite3.Connection, run_source_plan_id: str
     ).fetchone()[0]
 
 
+def _latest_complete_coverage(
+    conn: sqlite3.Connection, run_source_plan_id: str
+) -> sqlite3.Row | None:
+    """Latest durable COMPLETE enumeration proof for this immutable plan."""
+    return conn.execute(
+        "SELECT * FROM enumeration_coverage"
+        " WHERE run_source_plan_id = ? AND completion_state = 'COMPLETE'"
+        " AND finalized_at IS NOT NULL AND terminal_enumeration_proven = 1"
+        " ORDER BY finalized_at DESC, id DESC LIMIT 1",
+        (run_source_plan_id,),
+    ).fetchone()
+
+
 def _dispatch_child_tasks(
     conn: sqlite3.Connection,
     *,
@@ -467,22 +480,32 @@ def _execute_plan(
         getattr(adapter, "listing_identity_sufficient", False)
     )
 
-    # A resumed pass continues an unfinished generation of this run, or opens a
-    # distinct one when the earlier pass already finalized its own (generations
-    # are immutable; 03 §40).
-    coverage_id, _resumed = open_or_resume_coverage(
-        conn,
-        run_source_plan_id=plan_id,
-        source_id=plan_row["source_id"],
-        binding_id=plan_row["binding_id"],
-        scope_key="full-source",
-        generation_key=f"run-{run_id}",
-        coverage_authority="AUTHORITATIVE_FULL_SOURCE",
-        now=now,
+    # If enumeration alone proves stable membership, a COMPLETE generation
+    # remains durable truth while accepted DETAIL enrichment is resumed.  A
+    # detail-only restart must not invent a second enumeration generation.
+    durable_complete = (
+        _latest_complete_coverage(conn, plan_id)
+        if listing_identity_sufficient
+        else None
     )
+    coverage_finalized = durable_complete is not None
+    if durable_complete is not None:
+        coverage_id = durable_complete["id"]
+    else:
+        coverage_id, _resumed = open_or_resume_coverage(
+            conn,
+            run_source_plan_id=plan_id,
+            source_id=plan_row["source_id"],
+            binding_id=plan_row["binding_id"],
+            scope_key="full-source",
+            generation_key=f"run-{run_id}",
+            coverage_authority="AUTHORITATIVE_FULL_SOURCE",
+            now=now,
+        )
 
-    terminal = False
-    degraded = False
+    terminal = durable_complete is not None
+    coverage_degraded = False
+    run_degraded = False
     cancelled = False
     pages = 0
     details = 0
@@ -587,7 +610,9 @@ def _execute_plan(
                 pages += 1
             else:
                 details += 1
-            degraded = True
+            run_degraded = True
+            if is_enumeration or not listing_identity_sufficient:
+                coverage_degraded = True
             continue
 
         envelope = ExecutionPlanEnvelope(
@@ -738,7 +763,11 @@ def _execute_plan(
                         ),
                         source_family=source["source_family"] if source else None,
                     )
-                    if observation.source_job_id:
+                    if (
+                        observation.source_job_id
+                        and (is_enumeration or not listing_identity_sufficient)
+                        and not coverage_finalized
+                    ):
                         record_seen_identity(
                             cursor_conn, coverage_id, observation.source_job_id,
                             evidence_ref=observation.raw_url, commit=False,
@@ -830,7 +859,9 @@ def _execute_plan(
             details += 1
         value = signal.get("value")
         if value in ("INVALID", "FAILURE", "PARTIAL", "REFUSED"):
-            degraded = True
+            run_degraded = True
+            if is_enumeration or not listing_identity_sufficient:
+                coverage_degraded = True
         if is_enumeration and value in ("EMPTY", "TERMINAL"):
             # 03 §40: only a recognized terminal enumeration — an accepted
             # empty result or a complete listing with no further cursor —
@@ -839,56 +870,67 @@ def _execute_plan(
             terminal = True
 
     open_child_work = _open_acquisition_requests(conn, plan_id)
-    budget_exhausted = (
-        pages >= MAX_PAGES_PER_RUN or details >= MAX_DETAIL_REQUESTS_PER_RUN
-    )
     if cancelled:
         outcome = "CANCELLED"
-    elif terminal and not degraded and open_child_work == 0 and (pages or details):
-        # SATISFIED requires the whole accepted work set closed: a proven
-        # enumeration with a detail child still claimable is not satisfied.
+    elif terminal and not run_degraded and open_child_work == 0:
+        # Run satisfaction is the accepted-work barrier: even a COMPLETE
+        # listing cannot terminalize the run while child work is open.
         outcome = "SATISFIED"
-    elif pages or details:
+    elif pages or details or terminal:
         outcome = "SATISFIED_PARTIAL"
     else:
         outcome = "FAILED"
 
-    if terminal and not degraded and open_child_work == 0:
-        completion_state = "COMPLETE"
-        stop_reason = "terminal cursor"
-    elif cancelled:
-        completion_state = "PARTIAL"
-        stop_reason = "cancelled"
-    elif budget_exhausted and open_child_work:
-        completion_state = "BUDGET_EXHAUSTED"
-        stop_reason = "host acquisition budget exhausted with open child work"
-    elif open_child_work:
-        completion_state = "PARTIAL"
-        stop_reason = "open child work remains"
-    else:
-        completion_state = "PARTIAL"
-        stop_reason = "driver stop"
-    try:
-        finalize_coverage(
-            conn,
-            coverage_id,
-            completion_state=completion_state,
-            stop_reason=stop_reason,
-            terminal_enumeration_proven=terminal,
-            pages_completed=pages + details,
-            now=db_utc_now(conn),
+    if not coverage_finalized:
+        # Enumeration completeness is a different truth from run completion.
+        # DETAIL work joins this barrier only for adapters whose listing does
+        # not itself prove stable membership.
+        coverage_barrier_open = (
+            open_child_work if not listing_identity_sufficient else 0
         )
-    except Exception:
-        # Coverage finalization must never block the run outcome.
-        finalize_coverage(
-            conn,
-            coverage_id,
-            completion_state="PARTIAL",
-            stop_reason="driver stop",
-            terminal_enumeration_proven=False,
-            pages_completed=pages + details,
-            now=db_utc_now(conn),
+        coverage_budget_exhausted = (
+            pages >= MAX_PAGES_PER_RUN
+            or (
+                not listing_identity_sufficient
+                and details >= MAX_DETAIL_REQUESTS_PER_RUN
+            )
         )
+        if terminal and not coverage_degraded and coverage_barrier_open == 0:
+            completion_state = "COMPLETE"
+            stop_reason = "terminal cursor"
+        elif cancelled:
+            completion_state = "PARTIAL"
+            stop_reason = "cancelled"
+        elif coverage_budget_exhausted and coverage_barrier_open:
+            completion_state = "BUDGET_EXHAUSTED"
+            stop_reason = "host coverage budget exhausted with open contributing work"
+        elif coverage_barrier_open:
+            completion_state = "PARTIAL"
+            stop_reason = "open contributing work remains"
+        else:
+            completion_state = "PARTIAL"
+            stop_reason = "driver stop"
+        try:
+            finalize_coverage(
+                conn,
+                coverage_id,
+                completion_state=completion_state,
+                stop_reason=stop_reason,
+                terminal_enumeration_proven=terminal,
+                pages_completed=pages,
+                now=db_utc_now(conn),
+            )
+        except Exception:
+            # Coverage finalization must never block the run outcome.
+            finalize_coverage(
+                conn,
+                coverage_id,
+                completion_state="PARTIAL",
+                stop_reason="driver stop",
+                terminal_enumeration_proven=False,
+                pages_completed=pages,
+                now=db_utc_now(conn),
+            )
     set_group_outcome(conn, plan_id, outcome, now=db_utc_now(conn))
 
 
