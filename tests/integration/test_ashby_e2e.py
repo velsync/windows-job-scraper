@@ -596,6 +596,80 @@ def test_a_partial_generation_ages_nothing_then_a_clean_one_judges(db, server):
 
 
 # ---------------------------------------------------------------------------
+# The declared health capability through the real dispatch path
+# ---------------------------------------------------------------------------
+
+
+def test_a_health_probe_rides_the_same_pins_and_leaves_coverage_untouched(db, server):
+    """``health`` is a declared capability: the driver dispatches
+    ``SOURCE_HEALTH_CHECK`` → ``AdapterTaskKind.HEALTH`` through the same
+    typed request machinery.  The probe plans the *same* pinned board
+    document (never a task-supplied URL), parses recognition-only, emits no
+    observations, and is never a coverage-contributing request — so it can
+    never grant or break absence authority."""
+    provisioned = _provision(db, server, board="acme", config=dict(ACME_CONFIG))
+    run_id = _start_run(db, provisioned, board="acme")
+    enqueue_request(
+        db.conn,
+        run_id=run_id,
+        run_source_plan_id=db.conn.execute(
+            "SELECT id FROM run_source_plans WHERE run_id = ?", (run_id,)
+        ).fetchone()["id"],
+        source_id=provisioned.source_id,
+        binding_id=provisioned.binding_id,
+        request_type="SOURCE_HEALTH_CHECK",
+        target_identity="ashby://acme/health",
+        logical_key='{"probe": "health"}',
+        strategy="PROVIDER_NATIVE",
+        execution_class="HTTP",
+        now=NOW,
+    )
+
+    assert execute_run(db.conn, run_id) == "SUCCEEDED"
+
+    requests = sorted(_requests(db, run_id), key=lambda r: r["request_type"])
+    assert [(r["request_type"], r["status"], r["page_class"]) for r in requests] == [
+        ("LIST_FETCH", "SUCCEEDED", "VALID_LIST"),
+        ("SOURCE_HEALTH_CHECK", "SUCCEEDED", "VALID_LIST"),
+    ]
+    health = requests[1]
+    # the probe fetched exactly the pinned board document, from config only
+    health_fetch = db.conn.execute(
+        "SELECT requested_url FROM fetch_attempts WHERE request_id = ?", (health["id"],)
+    ).fetchone()
+    assert health_fetch
+    assert health_fetch["requested_url"] == (
+        f"http://127.0.0.1:{server.server_address[1]}"
+        "/posting-api/job-board/acme?includeCompensation=true"
+    )
+    parse_attempts = db.conn.execute(
+        "SELECT * FROM parse_attempts ORDER BY parsed_at, id"
+    ).fetchall()
+    assert len(parse_attempts) == 2
+    probe = next(p for p in parse_attempts if p["outcome_kind"] == "SUCCESS_EMPTY")
+    probe_review = json.loads(probe["review_evidence_json"])
+    recognized = [item for item in probe_review if item["reason"] == "HEALTH_PROBE_RECOGNIZED"]
+    assert recognized and recognized[0]["postings_total"] == 3 and recognized[0]["listed_members"] == 3
+    # recognition-only means exactly that: no observations from the probe
+    assert db.conn.execute("SELECT COUNT(*) FROM job_observations").fetchone()[0] == 3
+    probe_parse_attempts = db.conn.execute(
+        "SELECT COUNT(*) FROM job_observations WHERE parse_attempt_id = ?", (probe["id"],)
+    ).fetchone()[0]
+    assert probe_parse_attempts == 0
+    # and it is never a page in the enumeration proof
+    cov = _coverage(db)[0]
+    assert cov["completion_state"] == "COMPLETE"
+    assert cov["absence_inference_allowed"] == 1
+    contributing = {row[0] for row in db.conn.execute(
+        "SELECT request_id FROM coverage_contributing_request WHERE coverage_id = ?",
+        (cov["id"],),
+    )}
+    listing_id = next(r["id"] for r in requests if r["request_type"] == "LIST_FETCH")
+    assert contributing == {listing_id}
+    assert _outcome(db, run_id) == "SATISFIED"
+
+
+# ---------------------------------------------------------------------------
 # Listing discipline: isListed is membership
 # ---------------------------------------------------------------------------
 

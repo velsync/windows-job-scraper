@@ -361,6 +361,21 @@ class TestConfig:
         with pytest.raises(ValueError):
             AshbyConfig.from_mapping({"board": "acme", "stealth": 1})
 
+    @pytest.mark.parametrize("board", [42, None, ["acme"], True])
+    def test_board_must_be_a_string(self, board):
+        with pytest.raises(ValueError):
+            AshbyConfig(board=board)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("origin", [42, True, ["https://api.ashbyhq.com"]])
+    def test_api_base_url_must_be_a_string(self, origin):
+        with pytest.raises(ValueError):
+            AshbyConfig(board=BOARD, api_base_url=origin)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("name", [42, True, ["Acme"]])
+    def test_company_name_must_be_a_string_or_null(self, name):
+        with pytest.raises(ValueError):
+            AshbyConfig(board=BOARD, company_name=name)  # type: ignore[arg-type]
+
 
 # --------------------------------------------------------------------------
 # Planning (ACQ-02/ACQ-04): one endpoint, no child fetch surface
@@ -581,6 +596,59 @@ class TestListParse:
             _adapter(), {"jobs": [_job(employmentType="Seasonal")], "apiVersion": "1"}
         )
         assert outcome.observations[0].fields["employment_type"] == "Seasonal"
+
+    def test_a_member_without_provider_links_is_honest_and_undramatic(self):
+        """No ``jobUrl``/``applyUrl`` keys: no link fields, no canonical
+        candidate — but also no drama (absence of a link is not a refusable
+        value), and the apply link is still derived from the endpoint table."""
+        member = _job()
+        del member["jobUrl"]
+        del member["applyUrl"]
+        outcome = _parse_payload(_adapter(), {"jobs": [member], "apiVersion": "1"})
+        observation = outcome.observations[0]
+        assert observation.canonical_url_candidate is None
+        assert observation.application_url_candidate == f"{HOSTED}/{ID1}"
+        assert "hosted_url" not in observation.fields
+        assert "apply_url" not in observation.fields
+        assert not any(
+            item["reason"] == "UNSAFE_URL_REFUSED" for item in outcome.review_evidence
+        )
+
+    def test_an_unparseable_provider_url_is_refused_never_coerced(self):
+        """Characters that make the URL unparseable (a space in the host)
+        must fail the safe-URL gate itself — the value is recorded as
+        bounded evidence, never weakened into something fetchable."""
+        outcome = _parse_payload(
+            _adapter(),
+            {"jobs": [_job(jobUrl="https://exa mple.com/acme/x")], "apiVersion": "1"},
+        )
+        observation = outcome.observations[0]
+        assert observation.canonical_url_candidate is None
+        assert "hosted_url" not in observation.fields
+        assert observation.application_url_candidate == f"{HOSTED}/{ID1}"
+        assert any(item["reason"] == "UNSAFE_URL_REFUSED" for item in outcome.review_evidence)
+
+    def test_address_projection_drops_nulls_and_bools_and_keeps_scalars(self):
+        """``address.postalAddress`` is projected JSON-safe, scalar-only:
+        nulls and booleans are holes (not strings), numbers stay numeric,
+        strings are trimmed — and nothing is invented for absent keys."""
+        member = _job(
+            address={
+                "postalAddress": {
+                    "postalCode": None,
+                    "isRural": True,
+                    "floor": 3,
+                    "addressLocality": " Berlin ",
+                    "addressCountry": "Germany",
+                }
+            }
+        )
+        outcome = _parse_payload(_adapter(), {"jobs": [member], "apiVersion": "1"})
+        assert outcome.observations[0].fields["address"] == {
+            "floor": 3,
+            "addressLocality": "Berlin",
+            "addressCountry": "Germany",
+        }
 
     def test_description_falls_back_to_plain_text(self):
         outcome = _parse_payload(
@@ -895,8 +963,22 @@ class TestHealthProbe:
         assert outcome.kind is ParseOutcomeKind.SUCCESS_EMPTY
         assert outcome.observations == ()
         review = [item for item in outcome.review_evidence if item["reason"] == "HEALTH_PROBE_RECOGNIZED"]
-        assert review and review[0]["listed_postings"] == 3
+        assert review
+        assert review[0]["postings_total"] == 3
+        assert review[0]["listed_members"] == 3
         assert outcome.evidence_refs
+
+    def test_a_probe_counts_listed_membership_exactly(self):
+        """The probe is recognition-only, but what it records must be exact:
+        a document of two postings where one is ``isListed: false`` has one
+        listed member, never two (evidence honesty — an unlisted posting is
+        not part of the board it was health-checked for)."""
+        outcome = _parse(_adapter(), "board_jobs_unlisted.json", kind=AdapterTaskKind.HEALTH)
+        assert outcome.kind is ParseOutcomeKind.SUCCESS_EMPTY
+        review = [item for item in outcome.review_evidence if item["reason"] == "HEALTH_PROBE_RECOGNIZED"]
+        assert review
+        assert review[0]["postings_total"] == 2
+        assert review[0]["listed_members"] == 1
 
     def test_a_recognized_empty_board_is_a_healthy_probe(self):
         outcome = _parse(

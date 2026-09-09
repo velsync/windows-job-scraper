@@ -616,8 +616,21 @@ class AshbyAdapter:
             )
         return ParseOutcome(
             kind=ParseOutcomeKind.SUCCESS_EMPTY,
+            # The probe is recognition-only, but every number it records must
+            # be exact: postings_total is the document's array size, while
+            # listed_members applies the same ``isListed is False`` gate as
+            # enumeration — an unlisted posting is not part of the board this
+            # probe just health-checked for.
             review_evidence=(
-                {"reason": "HEALTH_PROBE_RECOGNIZED", "listed_postings": len(jobs)},
+                {
+                    "reason": "HEALTH_PROBE_RECOGNIZED",
+                    "postings_total": len(jobs),
+                    "listed_members": sum(
+                        1
+                        for job in jobs
+                        if isinstance(job, Mapping) and job.get("isListed") is not False
+                    ),
+                },
             ),
             evidence_refs=_evidence_refs(result),
         )
