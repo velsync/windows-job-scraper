@@ -124,11 +124,14 @@ def test_all_acquisition_task_kinds_are_fixture_locked_and_host_native_is_non_ne
 
 
 def test_validated_result_envelope_v3_keeps_the_page_validity_gate():
+    locked = FIXTURE["validated_result_envelope"]
     validated = ValidatedResultEnvelope(
         envelope=_result(),
-        page_class=PageClass.EMPTY,
-        validation_evidence={"recognized_empty": True},
-        security_policy_result="ALLOWED",
+        page_class=PageClass(locked["validated_page_class"]),
+        validation_evidence=locked["validation_evidence"],
+        contract_version=locked["contract_version"],
+        security_policy_result=locked["security_policy_result"],
+        cache_representation_ref=locked["cache_representation_ref"],
     )
     assert validated.contract_version == 3
     assert validated.validated_page_class is PageClass.EMPTY
