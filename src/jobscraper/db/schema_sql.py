@@ -1326,6 +1326,53 @@ CREATE INDEX idx_route_decisions_outcome
     return sql
 
 
+# ----------------------------- v15 S3.0 durable runtime foundation (ROAD-04)
+# S3.0 owns only storage required by S3.1-S3.4: auditable service/clock epoch
+# identity plus durable per-binding/host/(optional approved egress) rate and
+# circuit state. Later Slice-3 packages append new migrations when proven
+# necessary; they never reopen this step.
+@_step(15, "s3_0_runtime_foundation")
+def _(sql: str = """
+CREATE TABLE service_clock_epochs (
+    id TEXT PRIMARY KEY,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    end_reason TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_service_clock_epochs_started
+    ON service_clock_epochs(started_at);
+
+ALTER TABLE request_attempts ADD COLUMN service_epoch_id TEXT
+    REFERENCES service_clock_epochs(id);
+CREATE INDEX idx_request_attempts_service_epoch
+    ON request_attempts(service_epoch_id, started_at);
+
+CREATE TABLE binding_host_rate_state (
+    id TEXT PRIMARY KEY,
+    binding_id TEXT NOT NULL REFERENCES source_adapter_bindings(id),
+    host TEXT NOT NULL,
+    egress_identity TEXT,
+    circuit_state TEXT NOT NULL DEFAULT 'CLOSED',
+    cooldown_until TEXT,
+    recent_failure_count INTEGER NOT NULL DEFAULT 0
+        CHECK (recent_failure_count >= 0),
+    recent_success_count INTEGER NOT NULL DEFAULT 0
+        CHECK (recent_success_count >= 0),
+    last_retry_after TEXT,
+    last_rate_event_at TEXT,
+    last_success_at TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_binding_host_rate_state_identity
+    ON binding_host_rate_state(binding_id, host, COALESCE(egress_identity, ''));
+CREATE INDEX idx_binding_host_rate_state_cooldown
+    ON binding_host_rate_state(cooldown_until);
+"""
+) -> None:
+    return sql
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1340,6 +1387,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 14, (
-    "Slice 1 ships versions 1-10 (v10 corrective); Slice 2 appends v11-v14"
+assert LATEST_SCHEMA_VERSION == 15, (
+    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15"
 )
