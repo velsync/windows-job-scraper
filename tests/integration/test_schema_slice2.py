@@ -3,13 +3,15 @@
 Slice 2 may only *append* migrations after the accepted Slice-1 corrective
 (v10).  This module owns:
 
-* the byte pins for every Slice-2 released step (v11+);
-* the proof that the released Slice-1 steps v1–v10 are untouched;
+* the byte pins for every Slice-2 released step (v11-v14);
+* the proof that the released Slice-1 steps v1-v10 are untouched;
 * the proof that a populated v10 database migrates forward to
   ``LATEST_SCHEMA_VERSION`` with every pre-existing row preserved, foreign-key
   integrity clean, and the whole chain recorded in ``schema_migrations``;
-* the completeness rule that every released step is pinned in exactly one of
-  the two schema test modules (no unpinned gap).
+* the completeness rule that every released Slice-2 step is pinned here.
+
+Later slices append their own separately pinned migrations; their existence
+must not make this historical Slice-2 ownership test claim those versions.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from jobscraper.version import SCHEMA_VERSION
 
 NOW = "2026-09-08T00:00:00.000000Z"
 ACCEPTED_SLICE1_HEAD_VERSION = 10
+PROMOTED_SLICE2_HEAD_VERSION = 14
 
 #: Slice-1 released bytes, copied verbatim from
 #: ``tests/integration/test_schema_slice1.py`` — Slice 2 must not move them.
@@ -47,7 +50,7 @@ SLICE1_RELEASED_STEP_SHA256 = {
     10: "053df479f2c0f1dcf431b73e38aa000c2fa8878b630552c528787759534f5136",
 }
 
-#: Slice-2 released steps (v11+).  Each Slice-2 package appends its own pin.
+#: Slice-2 released steps (v11-v14). Each Slice-2 package appended its own pin.
 RELEASED_STEP_SHA256: dict[int, str] = {
     11: "dc3a29389a35b1e24396ac9d662cd6c6dfd460341d95125a3171a504f65e8ddb",
     12: "912888da60343657e561504d7458e9e45707029a3c8e67399f2157f1b9faef60",
@@ -70,12 +73,16 @@ def test_slice1_released_bytes_are_untouched():
 
 
 def test_every_slice2_step_is_pinned_exactly_once():
-    released = {version for version, _name, _sql in MIGRATION_STEPS}
+    slice2_released = {
+        version
+        for version, _name, _sql in MIGRATION_STEPS
+        if ACCEPTED_SLICE1_HEAD_VERSION < version <= PROMOTED_SLICE2_HEAD_VERSION
+    }
     pinned_here = set(RELEASED_STEP_SHA256)
     pinned_slice1 = set(SLICE1_RELEASED_STEP_SHA256)
     assert pinned_here.isdisjoint(pinned_slice1), "a step is pinned in two places"
-    assert released - pinned_slice1 == pinned_here, (
-        f"unpinned Slice-2 steps: {sorted(released - pinned_slice1 - pinned_here)}"
+    assert slice2_released == pinned_here, (
+        f"unpinned Slice-2 steps: {sorted(slice2_released - pinned_here)}"
     )
     # no Slice-1 step is re-pinned here with a different digest
     for version, pinned in SLICE1_RELEASED_STEP_SHA256.items():
@@ -101,7 +108,9 @@ def test_schema_version_matches_the_latest_step():
 def test_slice2_steps_add_no_later_slice_objects():
     """Each appended Slice-2 step stays inside ROAD-03 ownership."""
     appended = [
-        (v, sql) for v, _n, sql in MIGRATION_STEPS if v > ACCEPTED_SLICE1_HEAD_VERSION
+        (v, sql)
+        for v, _n, sql in MIGRATION_STEPS
+        if ACCEPTED_SLICE1_HEAD_VERSION < v <= PROMOTED_SLICE2_HEAD_VERSION
     ]
     for step_index, sql in appended:
         _assert_no_later_slice_objects(step_index, sql)
