@@ -222,6 +222,52 @@ def test_queued_discovery_survives_process_restart_before_claim(tmp_path, server
         reopened.close()
 
 
+def test_execute_rejects_crossed_discovery_identity_before_network_io(tmp_path, server):
+    """Execution authority comes from durable rows, never caller-owned identity."""
+    db = _database(tmp_path / "crossed-identity.db")
+    try:
+        first = queue_source_discovery(
+            db.conn,
+            display_name="First careers",
+            entry_url=f"http://127.0.0.1:{server.server_address[1]}/careers/greenhouse",
+            source_family="EMPLOYER_CAREERS",
+            now=NOW,
+        )
+        second = queue_source_discovery(
+            db.conn,
+            display_name="Second careers",
+            entry_url=f"http://127.0.0.1:{server.server_address[1]}/careers/generic",
+            source_family="EMPLOYER_CAREERS",
+            now=NOW,
+        )
+        crossed = discovery_runtime.QueuedDiscovery(
+            run_id=first.run_id,
+            run_source_plan_id=first.run_source_plan_id,
+            request_id=first.request_id,
+            source_id=second.source_id,
+            binding_id=second.binding_id,
+            binding_revision_id=second.binding_revision_id,
+        )
+
+        assert _Handler.hits == 0
+        with pytest.raises(discovery_runtime.DiscoveryError, match="durable.*identity"):
+            execute_source_discovery(
+                db.conn, crossed, worker_id="crossed-worker", now=NOW
+            )
+        assert _Handler.hits == 0
+        request = db.conn.execute(
+            "SELECT status FROM scrape_requests WHERE id = ?", (first.request_id,)
+        ).fetchone()
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (first.run_id,)
+        ).fetchone()
+        assert request["status"] == "PENDING"
+        assert run["status"] == "QUEUED"
+        assert db.conn.execute("SELECT COUNT(*) FROM fetch_attempts").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
 def test_discovery_terminal_state_is_atomic_with_fenced_request_commit(
     tmp_path, server, monkeypatch
 ):
