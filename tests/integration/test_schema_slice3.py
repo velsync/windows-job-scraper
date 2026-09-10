@@ -1,9 +1,11 @@
 """Slice 3 S3.0 schema gate — append-only v15 runtime foundation.
 
 The promoted Slice-2 schema ends at v14. S3.0 appends the first Slice-3
-runtime-foundation migration and must not pre-create crawler/coverage/fallback
-schema owned by later S3 packages. Later packages may append new versions but
-must never edit v15.
+runtime-foundation migration and must not pre-create crawler/coverage schema
+owned by later S3 packages. The explicit logical source-plan-group state is
+S3.0 foundation because the existing per-plan ``group_outcome`` cannot also
+represent one group's current active fallback rank without ambiguity. Later
+packages may append new versions but must never edit v15.
 """
 
 from __future__ import annotations
@@ -48,7 +50,7 @@ PROMOTED_STEP_SHA256 = {
 # S3.0 freezes the first Slice-3 migration at package completion. This digest
 # is over schema_sql.MIGRATION_STEPS' stripped SQL text.
 S3_0_STEP_SHA256 = {
-    15: "1848e82890da89863de913cee74a039485bf0939ba4536b607e2f94b58a902bc",
+    15: "c504a49cd6626bdf707becdb56535bc0ac64d62f961b1e7cee26d1705e3608bb",
 }
 
 
@@ -77,11 +79,12 @@ def test_s30_v15_is_sequential_and_pinned():
     assert _digest(sql) == S3_0_STEP_SHA256[15]
 
 
-def test_v15_contains_only_s31_to_s34_runtime_foundation_storage():
+def test_v15_contains_only_s31_to_s39_runtime_foundation_storage():
     _name, sql = _step(15)
     assert "CREATE TABLE service_clock_epochs" in sql
     assert "ALTER TABLE request_attempts ADD COLUMN service_epoch_id" in sql
     assert "CREATE TABLE binding_host_rate_state" in sql
+    assert "CREATE TABLE source_plan_group_state" in sql
     for required in (
         "circuit_state",
         "cooldown_until",
@@ -91,14 +94,15 @@ def test_v15_contains_only_s31_to_s34_runtime_foundation_storage():
         "last_rate_event_at",
         "last_success_at",
         "egress_identity",
+        "active_fallback_rank",
+        "group_outcome",
     ):
         assert required in sql
 
-    # R2-F1: do not steal later S3/future-slice schema into v15.
+    # R2-F1: do not steal crawler/coverage/future-slice schema into v15.
     for forbidden in (
         "CREATE TABLE cache_representation",
         "CREATE TABLE coverage_scope_membership",
-        "CREATE TABLE source_plan_group_state",
         "CREATE TABLE recipes",
         "CREATE TABLE recipe_versions",
         "CREATE TABLE navigation_plans",
@@ -203,4 +207,39 @@ def test_v15_rate_state_identity_is_binding_host_and_optional_egress(tmp_path):
         " FROM binding_host_rate_state WHERE id='rate-1'"
     ).fetchone()
     assert tuple(row) == ("CLOSED", 0, 0)
+    db.close()
+
+
+def test_v15_has_one_explicit_current_state_row_per_logical_source_plan_group(tmp_path):
+    db = Database(tmp_path / "group-state.db")
+    migrate_schema(db.conn, 15)
+    db.conn.execute(
+        "INSERT INTO scrape_runs(id, created_at) VALUES ('run-1', ?)",
+        (NOW,),
+    )
+    db.conn.execute(
+        "INSERT INTO source_plan_group_state"
+        " (run_id, source_plan_group_id, active_fallback_rank, updated_at)"
+        " VALUES ('run-1','group-a',0,?)",
+        (NOW,),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute(
+            "INSERT INTO source_plan_group_state"
+            " (run_id, source_plan_group_id, active_fallback_rank, updated_at)"
+            " VALUES ('run-1','group-a',1,?)",
+            (NOW,),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.conn.execute(
+            "INSERT INTO source_plan_group_state"
+            " (run_id, source_plan_group_id, active_fallback_rank, updated_at)"
+            " VALUES ('run-1','group-b',-1,?)",
+            (NOW,),
+        )
+    row = db.conn.execute(
+        "SELECT active_fallback_rank, group_outcome FROM source_plan_group_state"
+        " WHERE run_id='run-1' AND source_plan_group_id='group-a'"
+    ).fetchone()
+    assert tuple(row) == (0, None)
     db.close()
