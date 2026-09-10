@@ -390,11 +390,22 @@ def execute_source_discovery(
 ) -> DiscoveryOutcome:
     """Claim and execute one already-durable first probe.
 
+    The request ID is only a locator. The authoritative run/plan/source/binding
+    identity is reconstructed from committed rows and must exactly match the
+    caller-supplied continuation before any run transition, claim or network I/O.
+
     Network I/O occurs only after the request claim exists. All outputs that
     assert what the probe saw — fetch attempt, result/page evidence, fingerprint,
     route decision and discovery plan/run terminal state — commit under the same
     ownership fence. If ownership is stale, none of those outputs are committed.
     """
+    canonical = load_queued_discovery(conn, request_id=queued.request_id)
+    if canonical != queued:
+        raise DiscoveryError(
+            "caller-supplied discovery identity disagrees with durable request identity"
+        )
+    queued = canonical
+
     claim_ts = now or db_utc_now(conn)
     mark_run_started(conn, queued.run_id, now=claim_ts)
     claim = claim_next_request(
