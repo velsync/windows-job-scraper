@@ -236,6 +236,7 @@ class ParseContext:
     v3 exposes the normative recipe/parser and normalization-contract
     identities explicitly. ``normalization_version`` remains a compatibility
     alias for accepted Slice-2 callers; two supplied values must agree.
+    Existing positional fields remain in their v2 order; v3 fields append.
     """
 
     contract_version: int = PARSE_CONTRACT_VERSION
@@ -243,10 +244,10 @@ class ParseContext:
     attempt_id: str | None = None
     run_source_plan_id: str | None = None
     parser_version: str | None = None
-    recipe_version_id: str | None = None
-    normalization_contract_version: str | None = None
     normalization_version: str | None = None
     idempotency_namespace: str | None = None
+    recipe_version_id: str | None = None
+    normalization_contract_version: str | None = None
 
     def __post_init__(self) -> None:
         canonical = self.normalization_contract_version
