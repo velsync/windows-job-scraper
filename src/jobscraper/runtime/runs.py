@@ -47,6 +47,7 @@ def create_run(
     profile_id: str | None,
     plans: Iterable[Mapping[str, object]],
     now: str | None = None,
+    commit: bool = True,
 ) -> tuple[str, list[str]]:
     """Create a QUEUED run plus its immutable run_source_plans.
 
@@ -55,6 +56,9 @@ def create_run(
     adapter_id/adapter_version/adapter_api_version, strategy,
     execution_class, permission_profile_id/permission_profile_revision and
     the crawl/rate/config snapshots.
+
+    With ``commit=False`` the transaction remains open so a caller can add
+    dependent durable work and commit the complete creation boundary atomically.
     """
     ts = now or db_utc_now(conn)
     run_id = new_id("run")
@@ -107,7 +111,8 @@ def create_run(
                 ),
             )
             plan_ids.append(plan_id)
-        conn.execute("COMMIT")
+        if commit:
+            conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")
         raise
