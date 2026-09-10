@@ -31,11 +31,14 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 SRC = REPO_ROOT / "src" / "jobscraper"
 
-# The exact built-in adapter set as of the current Slice-2 package.  Each
+# The exact built-in adapter set as of the current Slice-2 package. Each
 # Slice-2 adapter package appends to this set consciously; nothing else may
-# register an adapter.  S2.5 graduated the first provider-native adapter
-# (02 §12.3); S2.6 appended Lever and S2.7 appended Ashby after `continue`.
-EXPECTED_BUILTIN_ADAPTERS = {"json_api_feed", "greenhouse", "lever", "ashby"}
+# register an adapter. S2.5 graduated Greenhouse, S2.6 Lever, S2.7 Ashby; the
+# S2.8 corrective adds the bounded generic-discovery first-probe planner that
+# 02 §12.1 requires before any discovery network I/O.
+EXPECTED_BUILTIN_ADAPTERS = {
+    "json_api_feed", "generic_discovery", "greenhouse", "lever", "ashby"
+}
 
 # Slice 2 supports the HTTP execution class only (02 §14; ROAD-07 defers
 # browser acquisition).  The router must report a browser-class candidate as
