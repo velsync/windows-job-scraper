@@ -2,7 +2,8 @@
 
 Slice 2 S2.4 appends migration v14 to the accepted v1–v13 schema.  The
 step is append-only and creates two new evidence tables plus required indexes.
-No released step (v1–v13) may be edited.
+No released step (v1–v13) may be edited. Later slices may append newer schema
+versions without changing the historical v14 milestone.
 """
 
 from __future__ import annotations
@@ -20,13 +21,16 @@ from jobscraper.db.schema_sql import LATEST_SCHEMA_VERSION, MIGRATION_STEPS
 from jobscraper.version import SCHEMA_VERSION
 
 NOW = "2026-09-08T00:00:00.000000Z"
+SLICE2_S24_SCHEMA_VERSION = 14
 
 
 # --------------------------------------------------------------- constants
 
-def test_schema_version_is_14():
-    assert SCHEMA_VERSION == 14
-    assert LATEST_SCHEMA_VERSION == 14
+def test_slice2_s24_schema_milestone_is_v14_and_current_schema_is_not_older():
+    names = {v: name for v, name, _sql in MIGRATION_STEPS}
+    assert names[SLICE2_S24_SCHEMA_VERSION] == "s2_4_ats_fingerprint_and_route_decision"
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION
+    assert LATEST_SCHEMA_VERSION >= SLICE2_S24_SCHEMA_VERSION
 
 
 def test_v14_step_is_present():
@@ -127,13 +131,14 @@ def test_migration_is_idempotent_and_refuses_downgrade(tmp_path):
     db.close()
 
 
-def test_full_migration_from_v1_preserves_existing_rows(tmp_path):
-    """A clean v1→v14 migration on a fresh database completes without error."""
-    db = Database(tmp_path / "fresh-v14.db")
+def test_full_migration_from_v1_reaches_current_schema(tmp_path):
+    """A clean fresh database migrates through the historical v14 milestone to current."""
+    db = Database(tmp_path / "fresh-current.db")
     from jobscraper.db.migrations import migrate_database_with_backup
     result = migrate_database_with_backup(
         db, create_backup=lambda kind: tmp_path / "backup",
     )
     assert result["ok"]
-    assert current_schema_version(db.conn) == 14
+    assert current_schema_version(db.conn) == LATEST_SCHEMA_VERSION == SCHEMA_VERSION
+    assert current_schema_version(db.conn) >= SLICE2_S24_SCHEMA_VERSION
     db.close()
