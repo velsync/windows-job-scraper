@@ -9,6 +9,7 @@ than manufacturing an ExecutionPlanEnvelope in test code.  Authority:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import http.server
 import json
 import threading
@@ -17,6 +18,7 @@ import pytest
 
 from jobscraper.db.connection import Database
 from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
+import jobscraper.runtime.discovery as discovery_runtime
 from jobscraper.runtime.discovery import (
     execute_source_discovery,
     load_queued_discovery,
@@ -218,6 +220,70 @@ def test_queued_discovery_survives_process_restart_before_claim(tmp_path, server
         ).fetchone()["status"] == "SUCCEEDED"
     finally:
         reopened.close()
+
+
+def test_discovery_terminal_state_is_atomic_with_fenced_request_commit(
+    tmp_path, server, monkeypatch
+):
+    """A crash after the ownership fence must not strand a terminal request.
+
+    The injected exception fires immediately after the real fenced transaction
+    commits and before any caller-side statement can run. Therefore the durable
+    request, plan outcome, run counters and aggregate run status must already be
+    committed together. Otherwise restart sees a SUCCEEDED request that is no
+    longer claimable while its run remains RUNNING.
+    """
+
+    class SimulatedCrash(RuntimeError):
+        pass
+
+    real_fenced_commit = discovery_runtime.fenced_commit
+
+    @contextmanager
+    def crash_immediately_after_real_commit(*args, **kwargs):
+        with real_fenced_commit(*args, **kwargs):
+            yield
+        raise SimulatedCrash("process died immediately after fenced commit")
+
+    monkeypatch.setattr(
+        discovery_runtime, "fenced_commit", crash_immediately_after_real_commit
+    )
+
+    db = _database(tmp_path / "post-fence-crash.db")
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/careers/greenhouse"
+        queued = queue_source_discovery(
+            db.conn,
+            display_name="Crash-after-commit careers",
+            entry_url=url,
+            source_family="EMPLOYER_CAREERS",
+            now=NOW,
+        )
+
+        with pytest.raises(SimulatedCrash):
+            execute_source_discovery(
+                db.conn, queued, worker_id="crash-worker", now=NOW
+            )
+
+        request = db.conn.execute(
+            "SELECT status FROM scrape_requests WHERE id = ?", (queued.request_id,)
+        ).fetchone()
+        plan = db.conn.execute(
+            "SELECT group_outcome FROM run_source_plans WHERE id = ?",
+            (queued.run_source_plan_id,),
+        ).fetchone()
+        run = db.conn.execute(
+            "SELECT status, requests_total, requests_failed FROM scrape_runs WHERE id = ?",
+            (queued.run_id,),
+        ).fetchone()
+
+        assert request["status"] == "SUCCEEDED"
+        assert plan["group_outcome"] == "SATISFIED"
+        assert run["status"] == "SUCCEEDED"
+        assert run["requests_total"] == 1
+        assert run["requests_failed"] == 0
+    finally:
+        db.close()
 
 
 def test_private_discovery_target_is_denied_with_durable_attempt_evidence(tmp_path):
