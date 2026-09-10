@@ -120,10 +120,10 @@ def source_policy(
 
     The operator-recorded Source entry host is always authorized. A graduated
     provider adapter may additionally authorize only that provider's reviewed
-    API hosts from the immutable endpoint table. This is keyed by the pinned
-    adapter identity, not by page content and not by adapter config, so a real
-    employer-owned careers URL can route to its provider API without granting
-    arbitrary cross-host authority.
+    API hosts from the immutable endpoint table when the entry host is either
+    employer-owned/unknown or belongs to that same provider. A known host of a
+    *different* graduated provider fails closed. Adapter config and scraped
+    content are never authority inputs.
     """
     try:
         normalized = normalize_url(source_row["entry_url"])
@@ -133,7 +133,14 @@ def source_policy(
 
     allowed_hosts: set[str] = {host} if host else set()
     provider = _PROVIDER_NATIVE_ADAPTERS.get(adapter_id or "")
-    if provider is not None:
+    entry_provider = None
+    if host:
+        for candidate_provider in frozenset(_PROVIDER_NATIVE_ADAPTERS.values()):
+            candidate_spec = spec_for_provider(candidate_provider)
+            if host in candidate_spec.hosts():
+                entry_provider = candidate_provider
+                break
+    if provider is not None and (entry_provider is None or entry_provider == provider):
         spec = spec_for_provider(provider)
         allowed_hosts.update(spec.api_hosts)
 
@@ -209,7 +216,7 @@ def _save_cursor(
         (
             new_id("cur"),
             cursor.source_id or plan_row["source_id"],
-            plan_row["binding_id"],
+            cursor.binding_id or plan_row["binding_id"],
             cursor.adapter_id,
             cursor.adapter_version,
             cursor.cursor_schema_version,
