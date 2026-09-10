@@ -257,7 +257,7 @@ class LeverConfig:
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> "LeverConfig":
-        """Typed construction from a binding-revision config snapshot.
+        """Typed construction from a binding-revision ``config_json`` object.
 
         Unknown keys are refused rather than ignored: a config the adapter
         does not understand must not silently run with different semantics
