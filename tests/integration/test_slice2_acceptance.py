@@ -91,21 +91,22 @@ import pytest
 from jobscraper.acquisition.envelope import ExecutionPlanEnvelope, RequestPlan
 from jobscraper.acquisition.httpexec import execute_request
 from jobscraper.acquisition.pagevalidity import classify_page
-from jobscraper.adapters.fingerprint import classify_content
 from jobscraper.adapters.registry import BUILTIN_ADAPTERS
-from jobscraper.adapters.router import RouteOutcome, plan_routes
+from jobscraper.adapters.router import RouteOutcome
 from jobscraper.applications.applylink import best_application_url
 from jobscraper.db.connection import Database
 from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
 from jobscraper.net.safelinks import safe_external_url
 from jobscraper.pipeline.driver import execute_run, source_policy
 from jobscraper.profiles.core import create_profile
+from jobscraper.runtime.discovery import (
+    execute_source_discovery,
+    queue_source_discovery,
+)
 from jobscraper.runtime.provisioning import (
     ProvisionedSource,
     ensure_builtin_adapter_definition,
     provision_source_and_binding,
-    record_fingerprint,
-    record_route_decision,
 )
 from jobscraper.runtime.requests import enqueue_request
 from jobscraper.runtime.runs import create_run
@@ -303,7 +304,13 @@ class _Slice2AcceptanceHandler(http.server.BaseHTTPRequestHandler):
     """One loopback stand-in serving all three provider APIs, the careers
     pages, the aggregator feed and the security-negative endpoints."""
 
+    # Observed network I/O.  The §12.1 ordering claim ("discovery itself is
+    # not pre-queue I/O") is only meaningful if the suite can see that no
+    # request left the process before the durable SOURCE_DISCOVERY row existed.
+    hits = 0
+
     def do_GET(self):  # noqa: N802 - http.server interface
+        type(self).hits += 1
         parts = urlsplit(self.path)
         query = parse_qs(parts.query)
         path = parts.path
@@ -411,6 +418,7 @@ class _Slice2AcceptanceHandler(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture()
 def server():
+    _Slice2AcceptanceHandler.hits = 0
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Slice2AcceptanceHandler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
@@ -434,18 +442,17 @@ def db(tmp_path, server):
 # ---------------------------------------------------------------------------
 
 
-def _probe(server, *, path=None, content_type="text/html", max_bytes=1_000_000,
-           url_override=None):
-    """Acquire one careers page through the host executor.
+def _executor_probe(server, *, path=None, content_type="text/html",
+                    max_bytes=1_000_000, url_override=None):
+    """One raw acquisition-boundary fetch: the security-negative instrument.
 
-    Slice 2 has no generic-discovery binding yet — the router records that
-    limitation honestly (``GENERIC_DISCOVERY_NOT_IMPLEMENTED``) — so the
-    careers probe is a host-executor fetch, not a run request.  It still
-    exercises every host security surface a run fetch would: the destination
-    policy is exactly what the host derives for the provisional source
-    (``driver.source_policy``), the envelope is validated before any
-    connection, redirects are revalidated per hop, and caps are enforced.
-    The fingerprint recorded at provisioning cites this probe's URL.
+    This bypasses the durable request machinery on purpose — it exists so the
+    04 §5.1/SEC-02/03/09 negatives can assert the *acquisition boundary's own*
+    shields (scheme gate, address classification, per-hop revalidation, caps)
+    independently of any request plumbing.  It is validated exactly like a run
+    fetch: the envelope is validated before any connection, redirects are
+    revalidated per hop, and caps are enforced.  The §12.1 careers probe used
+    by the chain is ``_durable_probe`` below.
     """
     port = server.server_address[1]
     probe_url = url_override or (
@@ -483,16 +490,57 @@ def _probe(server, *, path=None, content_type="text/html", max_bytes=1_000_000,
     return probe_url, result
 
 
-def _fingerprint_and_route(probe_url, result):
-    """Steps 2–3 of the chain: classify the acquired content, then route."""
-    fingerprint = classify_content(
-        url=probe_url, body=result.body, content_type=result.content_type or ""
+def _durable_probe(db, server, *, path, max_bytes=None, now=NOW):
+    """Step 1 of the chain: the §12.1 durable first probe.
+
+    The careers URL is probed through the product's own discovery primitive,
+    not by test code: a provisional Source, an immutable ``generic_discovery``
+    binding revision, a pinned RunSourcePlan and a durable ``SOURCE_DISCOVERY``
+    request are committed *before* the first byte of network I/O, the probe
+    runs under the host's own destination policy, and the fingerprint, route
+    decision, fetch attempt and page-validity evidence all commit under the
+    request's ownership fence.  Returns ``(probe_url, queued, outcome)``.
+    """
+    _seed_permission_profiles(db)
+    probe_url = f"http://127.0.0.1:{server.server_address[1]}{path}"
+    kwargs = {"max_bytes": max_bytes} if max_bytes is not None else {}
+    hits_before = _Slice2AcceptanceHandler.hits
+    queued = queue_source_discovery(
+        db.conn,
+        display_name="Acme careers",
+        entry_url=probe_url,
+        source_family="EMPLOYER_CAREERS",
+        now=now,
+        **kwargs,
     )
-    decision = plan_routes(
-        fingerprint=fingerprint,
-        supported_execution_classes=frozenset({"HTTP"}),
+    assert _Slice2AcceptanceHandler.hits == hits_before, (
+        "no network I/O may precede the durable request"
     )
-    return fingerprint, decision
+    for table, column in (
+        ("sources", "id"),
+        ("source_adapter_bindings", "id"),
+        ("source_adapter_binding_revisions", "id"),
+        ("run_source_plans", "id"),
+        ("scrape_requests", "id"),
+    ):
+        assert db.conn.execute(
+            f"SELECT 1 FROM {table} WHERE {column} = ?",
+            (
+                queued.source_id
+                if table == "sources"
+                else queued.binding_id
+                if table == "source_adapter_bindings"
+                else queued.binding_revision_id
+                if table == "source_adapter_binding_revisions"
+                else queued.run_source_plan_id
+                if table == "run_source_plans"
+                else queued.request_id,
+            ),
+        ).fetchone() is not None, f"{table} row must exist before the probe"
+    outcome = execute_source_discovery(
+        db.conn, queued, worker_id="slice2-acceptance", now=now
+    )
+    return probe_url, queued, outcome
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +549,11 @@ def _fingerprint_and_route(probe_url, result):
 
 
 def _seed_permission_profiles(db) -> None:
+    """Idempotent: the §12.1 probe needs a profile before it can bind."""
+    if db.conn.execute(
+        "SELECT 1 FROM adapter_permission_profiles WHERE id = 'perm-1'"
+    ).fetchone() is not None:
+        return
     db.conn.executescript(
         f"""
         INSERT INTO adapter_permission_profiles (id, display_name, created_at)
@@ -512,10 +565,15 @@ def _seed_permission_profiles(db) -> None:
     )
 
 
-def _provision_from_route(
-    db, server, spec, *, fingerprint, decision, now=NOW
-) -> ProvisionedSource:
-    """Step 4: provision source + binding with the route evidence attached.
+def _provision_from_route(db, server, spec, *, now=NOW) -> ProvisionedSource:
+    """Step 4: provision the specialized binding the probe's route chose.
+
+    The fingerprint and route decision are *not* re-recorded here: the §12.1
+    probe already committed them against this same Source under its own
+    request provenance, and both writers are append-only.  Passing them again
+    would duplicate the probe's evidence, so the specialization instead lands
+    on the Source the probe created (02 §12.1: "later specialized bindings do
+    not rewrite the probe history").
 
     The operator's source identity is the careers URL they added (06 §72.7);
     the specialized binding it routed to is pinned as an immutable revision
@@ -542,8 +600,6 @@ def _provision_from_route(
             "careers_url": "https://acme.example/careers",
         },
         now=now,
-        fingerprint=fingerprint,
-        decision=decision,
     )
 
 
@@ -609,20 +665,25 @@ def _seeker_profile(db, *, now=NOW) -> None:
 
 
 def _run_provider_chain(db, server, spec_key, *, now=NOW):
-    """Steps 1–5 for one provider; returns (run_id, provisioned)."""
+    """Steps 1–5 for one provider; returns (run_id, provisioned, probe)."""
     spec = PROVIDERS[spec_key]
-    probe_url, result = _probe(server, path=f"/careers/{spec['careers_slug']}")
-    assert result.failure is None
-    assert result.status_code == 200 and result.body
-    fingerprint, decision = _fingerprint_and_route(probe_url, result)
-    provisioned = _provision_from_route(
-        db, server, spec, fingerprint=fingerprint, decision=decision, now=now
+    probe_url, queued, probe = _durable_probe(
+        db, server, path=f"/careers/{spec['careers_slug']}", now=now
     )
+    assert probe_url == db.conn.execute(
+        "SELECT entry_url FROM sources WHERE id = ?", (queued.source_id,)
+    ).fetchone()["entry_url"]
+    assert probe.result.failure is None
+    assert probe.result.status_code == 200 and probe.result.body
+    assert probe.fingerprint is not None and probe.decision is not None
+    provisioned = _provision_from_route(db, server, spec, now=now)
+    # specialization lands on the probe's own Source
+    assert provisioned.source_id == queued.source_id
     _seeker_profile(db, now=now)
     run_id = _start_run(
         db, provisioned, list_path=spec["list_path"], now=now
     )
-    return run_id, provisioned
+    return run_id, provisioned, probe
 
 
 # ---------------------------------------------------------------------------
@@ -643,6 +704,37 @@ def _requests(db, run_id=None):
         sql += " AND run_id = ?"
         params.append(run_id)
     return db.conn.execute(sql + " ORDER BY created_at, id", params).fetchall()
+
+
+def _run_scoped(db, table, run_id, *, kind=None):
+    """Count rows of ``table`` belonging to one run's requests.
+
+    Since the §12.1 probe introduced its own durable run, global table counts
+    no longer describe a single provider run.  ``job_observations`` and
+    ``enumeration_coverage`` carry ``run_id`` directly; the attempt/evidence
+    tables are scoped through the request they belong to.
+    """
+    if table == "job_observations":
+        return db.conn.execute(
+            "SELECT COUNT(*) FROM job_observations WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+    if table == "enumeration_coverage":
+        return db.conn.execute(
+            "SELECT COUNT(*) FROM enumeration_coverage c"
+            " JOIN run_source_plans p ON p.id = c.run_source_plan_id"
+            " WHERE p.run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+    sql = (
+        f"SELECT COUNT(*) FROM {table} t"
+        " JOIN scrape_requests r ON r.id = t.request_id"
+        " WHERE r.run_id = ?"
+    )
+    params: list = [run_id]
+    if kind is not None:
+        sql += " AND t.kind = ?"
+        params.append(kind)
+    return db.conn.execute(sql, params).fetchone()[0]
 
 
 def _coverage(db):
@@ -687,11 +779,11 @@ def test_a_provider_careers_url_routes_specialized_and_delivers_a_searchable_res
     three graduated providers (02 §12/§19/§22/§31/§32, ACQ-02/03/04/09,
     03 §40; 06 §72.5/7/8/9/13/14)."""
     spec = PROVIDERS[spec_key]
-    run_id, provisioned = _run_provider_chain(db, server, spec_key)
+    run_id, provisioned, probe = _run_provider_chain(db, server, spec_key)
 
     # ---- the route decision and its causal fingerprint are durable
     fingerprint_row = db.conn.execute(
-        "SELECT * FROM ats_fingerprints WHERE id = ?", (provisioned.fingerprint_id,)
+        "SELECT * FROM ats_fingerprints WHERE id = ?", (probe.fingerprint_id,)
     ).fetchone()
     assert fingerprint_row["family"] == spec["family"]
     assert fingerprint_row["recommended_adapter_id"] == spec["adapter"]
@@ -699,7 +791,7 @@ def test_a_provider_careers_url_routes_specialized_and_delivers_a_searchable_res
     assert json.loads(fingerprint_row["evidence_json"]), "evidence-first: no naked confidence"
     decision_row = db.conn.execute(
         "SELECT * FROM source_route_decisions WHERE id = ?",
-        (provisioned.route_decision_id,),
+        (probe.route_decision_id,),
     ).fetchone()
     assert decision_row["outcome"] == "SPECIALIZED"
     assert decision_row["fingerprint_family"] == spec["family"]
@@ -859,14 +951,29 @@ def test_a_provider_careers_url_routes_specialized_and_delivers_a_searchable_res
     ).fetchall()
     assert [r["request_id"] for r in contributing] == [requests[0]["id"]]
 
-    # ---- the evidence spine is durable at every hop
-    assert db.conn.execute("SELECT COUNT(*) FROM fetch_attempts").fetchone()[0] == spec["attempts"]
-    assert db.conn.execute("SELECT COUNT(*) FROM parse_attempts").fetchone()[0] == spec["attempts"]
+    # ---- the evidence spine is durable at every hop (scoped to this run; the
+    # §12.1 probe's own attempt/evidence belongs to its discovery run)
+    assert _run_scoped(db, "fetch_attempts", run_id) == spec["attempts"]
+    assert _run_scoped(db, "parse_attempts", run_id) == spec["attempts"]
+    assert _run_scoped(db, "job_observations", run_id) == spec["observations"]
+    assert _run_scoped(db, "acquisition_evidence", run_id, kind="RESULT_ENVELOPE") == spec["attempts"]
+    assert _run_scoped(db, "acquisition_evidence", run_id, kind="PAGE_VALIDITY") == spec["attempts"]
+
+    # ---- the §12.1 probe itself is durable, fenced, and free of run pollution:
+    # it classified the source and manufactured no enumeration of its own
+    probe_run = probe.queued.run_id
+    assert probe_run != run_id
+    assert _run_scoped(db, "fetch_attempts", probe_run) == 1
+    assert _run_scoped(db, "parse_attempts", probe_run) == 0
+    assert _run_scoped(db, "job_observations", probe_run) == 0
+    assert _run_scoped(db, "enumeration_coverage", probe_run) == 0
+    assert _run_scoped(db, "acquisition_evidence", probe_run, kind="PAGE_VALIDITY") == 1
+    assert probe.run_status == "SUCCEEDED"
+    # the discovery request stayed the probe's own, not the provider run's
     assert db.conn.execute(
-        "SELECT COUNT(*) FROM job_observations"
-    ).fetchone()[0] == spec["observations"]
-    assert len(_evidence(db, kind="RESULT_ENVELOPE")) == spec["attempts"]
-    assert len(_evidence(db, kind="PAGE_VALIDITY")) == spec["attempts"]
+        "SELECT request_type FROM scrape_requests WHERE id = ?",
+        (probe.queued.request_id,),
+    ).fetchone()["request_type"] == "SOURCE_DISCOVERY"
 
     # ---- honest run accounting, plan satisfied
     run = db.conn.execute("SELECT * FROM scrape_runs WHERE id = ?", (run_id,)).fetchone()
@@ -937,7 +1044,7 @@ def test_an_aggregator_and_the_employer_ats_merge_on_origin_identity_with_the_em
     product link (PROD-05) — the winner's derived link is what the product
     shows."""
     # ---- the employer's own board first (the full chain from scenario 1)
-    employer_run, employer = _run_provider_chain(db, server, "greenhouse")
+    employer_run, employer, _ = _run_provider_chain(db, server, "greenhouse")
     assert execute_run(db.conn, employer_run) == "SUCCEEDED"
     jobs_before = {j["title"]: j["id"] for j in _jobs(db)}
     assert len(jobs_before) == 3
@@ -1043,52 +1150,46 @@ def test_an_aggregator_and_the_employer_ats_merge_on_origin_identity_with_the_em
 
 
 def _record_fallback_source(db, server, *, slug, source_family="EMPLOYER_CAREERS"):
-    """Record the operator's source identity plus the fallback evidence.
+    """Probe a careers URL that has no usable ATS route; return the outcome.
 
-    With no runnable route there is no binding to provision: the honest slice-2
-    state for this source is the recorded fingerprint + fallback decision and
-    nothing runnable.  ``record_fingerprint``/``record_route_decision`` are the
-    host's own evidence writers (the same ones provisioning uses).
+    Everything here is produced by the production discovery primitive: the
+    provisional Source, the fingerprint and the fallback route decision all
+    come from the §12.1 probe under its own request provenance.  No test-side
+    source row and no test-side evidence writer is involved.
     """
-    conn = db.conn
+    _seed_permission_profiles(db)
     port = server.server_address[1]
     entry_url = f"http://127.0.0.1:{port}/careers/{slug}"
-    probe_url, result = _probe(server, path=f"/careers/{slug}")
-    assert probe_url == entry_url and result.failure is None
-    fingerprint, decision = _fingerprint_and_route(probe_url, result)
-    conn.execute(
-        "INSERT INTO sources (id, display_name, source_family, entry_url,"
-        " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (f"src-{slug}", f"Acme careers ({slug})", source_family, entry_url, NOW, NOW),
-    )
-    conn.commit()
-    fingerprint_id = record_fingerprint(
-        conn, source_id=f"src-{slug}", url=probe_url, fingerprint=fingerprint, now=NOW
-    )
-    decision_id = record_route_decision(
-        conn,
-        source_id=f"src-{slug}",
-        fingerprint=fingerprint,
-        decision=decision,
-        now=NOW,
-    )
-    return fingerprint, decision, fingerprint_id, decision_id
+    _, queued, outcome = _durable_probe(db, server, path=f"/careers/{slug}")
+    assert db.conn.execute(
+        "SELECT entry_url FROM sources WHERE id = ?", (queued.source_id,)
+    ).fetchone()["entry_url"] == entry_url
+    assert outcome.result.failure is None
+    assert outcome.fingerprint is not None and outcome.decision is not None
+    return outcome, queued
 
 
 def test_a_generic_careers_url_falls_back_honestly_without_a_fabricated_route(
     db, server
 ):
-    """No ATS evidence → GENERIC_DISCOVERY_FALLBACK, no runnable candidate.
+    """No ATS evidence → GENERIC_DISCOVERY_FALLBACK, no runnable crawl route.
 
     The fallback must be honest in both directions: no specialized route is
-    forced (ARC-08, 02 §12.1), and no fictitious generic adapter is advertised
-    either — the missing generic route is durable unsupported evidence
-    (``GENERIC_DISCOVERY_NOT_IMPLEMENTED``), exactly the implemented Slice-2
-    truth."""
+    forced (ARC-08, 02 §12.1), and no generic *crawler* is advertised either —
+    generic job enumeration remains ROAD-04, so the router records the missing
+    route as durable unsupported evidence
+    (``GENERIC_DISCOVERY_NOT_IMPLEMENTED``).
+
+    What *does* exist for such a URL is the §12.1 probe planner itself
+    (``generic_discovery``): the built-in immutable binding whose only job is
+    the single bounded classification probe, so the first probe has normal
+    request/attempt provenance instead of being pre-queue I/O.  Its binding is
+    history, not a claimed crawl capability.
+    """
     adapters_before = dict(BUILTIN_ADAPTERS)
-    fingerprint, decision, fingerprint_id, decision_id = _record_fallback_source(
-        db, server, slug="generic"
-    )
+    outcome, queued = _record_fallback_source(db, server, slug="generic")
+    fingerprint, decision = outcome.fingerprint, outcome.decision
+    fingerprint_id, decision_id = outcome.fingerprint_id, outcome.route_decision_id
 
     # the fingerprint honestly says "no family"
     assert fingerprint.family is None
@@ -1116,16 +1217,34 @@ def test_a_generic_careers_url_falls_back_honestly_without_a_fabricated_route(
     assert json.loads(decision_row["candidates_json"]) == []
     assert decision_row["fallback_reason"]
 
-    # nothing runnable was invented: no binding, no revision, no new adapter
+    # no *specialized* binding was fabricated from a family-less fingerprint:
+    # the only binding the source has is the §12.1 probe binding itself
+    bindings = db.conn.execute(
+        "SELECT r.adapter_id, r.strategy, r.execution_class"
+        " FROM source_adapter_bindings b"
+        " JOIN source_adapter_binding_revisions r ON r.id = b.current_revision_id"
+        " WHERE b.source_id = ?",
+        (queued.source_id,),
+    ).fetchall()
+    assert [tuple(row) for row in bindings] == [
+        ("generic_discovery", "GENERIC_DISCOVERY", "HTTP")
+    ]
     assert db.conn.execute(
-        "SELECT COUNT(*) FROM source_adapter_bindings b"
-        " JOIN sources s ON s.id = b.source_id WHERE s.entry_url LIKE '%/careers/generic'"
-    ).fetchone()[0] == 0
-    assert db.conn.execute(
-        "SELECT COUNT(*) FROM source_adapter_binding_revisions"
-    ).fetchone()[0] == 0
+        "SELECT COUNT(*) FROM source_adapter_bindings"
+    ).fetchone()[0] == 1
+    # registry honesty: the probe planner is registered, the crawler is not
     assert dict(BUILTIN_ADAPTERS) == adapters_before
+    assert "generic_discovery" in BUILTIN_ADAPTERS
     assert "generic" not in BUILTIN_ADAPTERS
+
+    # the probe made exactly one bounded classification request and stopped:
+    # discovery is not enumeration, so the fallback source has no coverage
+    assert _Slice2AcceptanceHandler.hits == 1
+    assert _run_scoped(db, "enumeration_coverage", queued.run_id) == 0
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM job_observations"
+    ).fetchone()[0] == 0
+    assert outcome.run_status == "SUCCEEDED"
 
 
 def test_a_low_confidence_provider_hunch_never_forces_a_specialized_route(
@@ -1137,9 +1256,9 @@ def test_a_low_confidence_provider_hunch_never_forces_a_specialized_route(
     discovery rather than silently forcing a specialized adapter.  The family
     hunch is recorded as evidence; the route decision emits no candidate; and
     no specialized binding is provisioned from the hunch."""
-    fingerprint, decision, fingerprint_id, decision_id = _record_fallback_source(
-        db, server, slug="weak-greenhouse"
-    )
+    outcome, _queued = _record_fallback_source(db, server, slug="weak-greenhouse")
+    fingerprint, decision = outcome.fingerprint, outcome.decision
+    fingerprint_id, decision_id = outcome.fingerprint_id, outcome.route_decision_id
 
     assert fingerprint.family == "GREENHOUSE"
     assert fingerprint.confidence < 0.70
@@ -1157,9 +1276,15 @@ def test_a_low_confidence_provider_hunch_never_forces_a_specialized_route(
     ).fetchone()
     assert decision_row["outcome"] == "GENERIC_DISCOVERY_FALLBACK"
     assert json.loads(decision_row["candidates_json"]) == []
-    assert db.conn.execute(
-        "SELECT COUNT(*) FROM source_adapter_binding_revisions"
-    ).fetchone()[0] == 0
+    # the hunch produced no specialized binding: the only revision on the
+    # source is the §12.1 probe binding the discovery primitive created
+    revisions = db.conn.execute(
+        "SELECT r.adapter_id FROM source_adapter_binding_revisions r"
+        " JOIN source_adapter_bindings b ON b.id = r.binding_id"
+        " WHERE b.source_id = ?",
+        (_queued.source_id,),
+    ).fetchall()
+    assert [row["adapter_id"] for row in revisions] == ["generic_discovery"]
 
 
 # ---------------------------------------------------------------------------
@@ -1174,7 +1299,7 @@ def test_search_capability_is_reported_truthfully_in_both_modes(
     warning when it is not — same provisioning and query surface, so the
     reported mode cannot drift from what is actually serving the query."""
     # ---- state 1: this host really has FTS5 → FTS5_ACTIVE, no warning
-    fts_run, _ = _run_provider_chain(db, server, "ashby")
+    fts_run, _, _ = _run_provider_chain(db, server, "ashby")
     assert execute_run(db.conn, fts_run) == "SUCCEEDED"
     capability = read_capability(db.conn)
     assert capability["mode"] == SEARCH_MODE_FTS5
@@ -1204,7 +1329,7 @@ def test_search_capability_is_reported_truthfully_in_both_modes(
         assert not fts_table_present(fallback_db.conn)
 
         # the same full chain delivers the same jobs to the same query surface
-        fallback_run, _ = _run_provider_chain(fallback_db, server, "ashby")
+        fallback_run, _, _ = _run_provider_chain(fallback_db, server, "ashby")
         assert execute_run(fallback_db.conn, fallback_run) == "SUCCEEDED"
         substring_result = search_jobs(fallback_db.conn, query="engineer")
         assert substring_result.mode == SEARCH_MODE_SUBSTRING
@@ -1321,7 +1446,7 @@ def test_a_private_destination_is_denied_by_address_classification(server):
     """SEC-02: a private-range destination is denied by address
     classification before any connection exists — the net beneath the
     allow-host policy that also catches public names resolving private."""
-    _, result = _probe(
+    _, result = _executor_probe(
         server,
         path="/careers/generic",
         url_override="http://10.255.255.5/careers",
@@ -1362,7 +1487,7 @@ def test_a_javascript_probe_url_is_refused_before_any_connection(db, server):
     """A ``javascript:`` fetch target is refused by the scheme gate at the
     acquisition boundary (04 §5.1, SEC-03): typed POLICY_REJECTED with no
     network I/O and no body to parse."""
-    _, result = _probe(
+    _, result = _executor_probe(
         server,
         path="/careers/generic",
         url_override="javascript:alert(1)",

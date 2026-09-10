@@ -134,10 +134,19 @@ def _generic_fallback(
 ) -> RouteDecision:
     """Return an honest generic-discovery status for Slice 2.
 
-    v0.3.1.3 requires a durable generic discovery binding before such work can
-    execute.  S2.5 has not graduated that adapter yet, so an unregistered
-    ``generic`` candidate would be fictitious capability.  We record the
-    missing route as unsupported and emit no runnable candidate.
+    Two different things share the words "generic discovery", and only one of
+    them exists in Slice 2:
+
+    * the §12.1 *first-probe planner* (``generic_discovery``) — registered,
+      and required precisely so the first careers-page probe has durable
+      request/attempt provenance instead of being pre-queue I/O.  It classifies
+      a source and stops;
+    * the generic HTML *job crawler* — generic enumeration breadth, which is
+      ROAD-04 work and is deliberately not implemented.
+
+    This fallback describes the second: an unregistered generic crawler
+    candidate would be fictitious capability, so the missing route is recorded
+    as unsupported evidence and no runnable candidate is emitted.
     """
 
     generic = UnsupportedExecutionClass(
