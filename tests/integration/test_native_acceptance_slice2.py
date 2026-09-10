@@ -1,8 +1,9 @@
 """Slice-2 native acceptance harness contract.
 
-The real promotion run is Windows/package-only.  This test exercises the same
-W2 orchestration against the development target so the acceptance harness
-itself remains regression-tested in ordinary CI.
+The real promotion run is Windows/package-only. This test exercises the same
+W2 orchestration against the development target so the W2 companion harness
+itself remains regression-tested in ordinary CI. The accepted W0/W1 harness
+is intentionally left unchanged and is run separately for final promotion.
 """
 
 from __future__ import annotations
@@ -21,11 +22,9 @@ def test_native_acceptance_harness_supports_slice2_dev(tmp_path: Path) -> None:
     proc = subprocess.run(
         [
             sys.executable,
-            "scripts/native_acceptance.py",
+            "scripts/native_acceptance_slice2.py",
             "--target",
             "dev",
-            "--slice",
-            "2",
             "--evidence-dir",
             str(evidence),
         ],
