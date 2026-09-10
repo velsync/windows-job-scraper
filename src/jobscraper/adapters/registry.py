@@ -16,11 +16,13 @@ from typing import Any, Mapping
 
 from jobscraper.adapters.ashby import AshbyAdapter
 from jobscraper.adapters.feed_api import FeedApiAdapter
+from jobscraper.adapters.generic_discovery import GenericDiscoveryAdapter
 from jobscraper.adapters.greenhouse import GreenhouseAdapter
 from jobscraper.adapters.lever import LeverAdapter
 
 BUILTIN_ADAPTERS = {
     "json_api_feed": FeedApiAdapter,
+    "generic_discovery": GenericDiscoveryAdapter,
     "greenhouse": GreenhouseAdapter,
     "lever": LeverAdapter,
     "ashby": AshbyAdapter,
