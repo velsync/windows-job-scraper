@@ -18,12 +18,11 @@ from jobscraper.acquisition.failures import FailureKind, FailureRecord
 from jobscraper.acquisition.pagevalidity import PageClass
 from jobscraper.acquisition.result import ResultEnvelope
 
-#: Versioned cross-component data contracts (02 ACQ-09).  Slice 2 bumped this
-#: additively: PlanningContext/ParseContext became concrete, and
-#: ValidatedResult gained the §11.3/ACQ-09 reference fields plus a hard gate
-#: that refuses an unvalidated page class.  Readers must accept every version
-#: they claim.
-CONTRACT_VERSION = 2
+#: Versioned cross-component data contracts (02 ACQ-09). Slice 3 S3.0 bumps
+#: this additively to v3: ParseContext now exposes the explicit normative
+#: parser/recipe + normalization-contract identity and DiscoveredTask carries
+#: its optional parent reference. Existing Slice-2 call sites remain valid.
+CONTRACT_VERSION = 3
 PARSE_CONTRACT_VERSION = CONTRACT_VERSION
 
 _KNOWN_CAPABILITIES = frozenset(
@@ -122,7 +121,7 @@ class AdapterTask:
 #: Durable acquisition request type → adapter task kind (02 ACQ-02).
 #:
 #: The mapping is explicit data owned by the adapter contract, so a host can
-#: never dispatch a durable request type through an unstated task kind.  The
+#: never dispatch a durable request type through an unstated task kind. The
 #: pipeline request types (`NORMALIZE`, `RECONCILE`, `ENRICH`, `ELIGIBILITY`,
 #: `SCORE`, `EXPORT`) are host-native durable tasks and are deliberately
 #: absent: they are not dispatched through the source-adapter protocol.
@@ -232,16 +231,35 @@ class PlanningContext:
 
 @dataclass(frozen=True)
 class ParseContext:
-    """Host-owned parse input (02 ACQ-09) with the request-scoped
-    idempotency namespace the parser must key deterministic child work on."""
+    """Host-owned parse input (02 ACQ-09).
+
+    v3 exposes the normative recipe/parser and normalization-contract
+    identities explicitly. ``normalization_version`` remains a compatibility
+    alias for accepted Slice-2 callers; two supplied values must agree.
+    """
 
     contract_version: int = PARSE_CONTRACT_VERSION
     request_id: str | None = None
     attempt_id: str | None = None
     run_source_plan_id: str | None = None
     parser_version: str | None = None
+    recipe_version_id: str | None = None
+    normalization_contract_version: str | None = None
     normalization_version: str | None = None
     idempotency_namespace: str | None = None
+
+    def __post_init__(self) -> None:
+        canonical = self.normalization_contract_version
+        legacy = self.normalization_version
+        if canonical is not None and legacy is not None and canonical != legacy:
+            raise ValueError(
+                "normalization_contract_version and normalization_version "
+                "must identify the same contract"
+            )
+        if canonical is None and legacy is not None:
+            object.__setattr__(self, "normalization_contract_version", legacy)
+        elif legacy is None and canonical is not None:
+            object.__setattr__(self, "normalization_version", canonical)
 
 
 @dataclass(frozen=True)
@@ -315,6 +333,7 @@ class DiscoveredTask:
     target_reference: str
     priority: int = 0
     depth: int = 0
+    parent_reference: str | None = None
 
 
 @dataclass(frozen=True)
