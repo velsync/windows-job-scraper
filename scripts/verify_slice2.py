@@ -11,6 +11,12 @@ logic is duplicated here beyond what the gate itself owns:
                             slice's E2E gate (fingerprint → route → provision
                             → acquire → observation → company/location/
                             provenance → cleaned/indexed searchable result)
+       + discovery boundary tests/integration/test_slice2_discovery_durability.py
+                            and test_slice2_discovery_boundary_audit.py — the
+                            02 §12.1 durable first-probe boundary the E2E chain
+                            now exercises (durable identity before I/O,
+                            restart resume, hostile/invalid refusal, budget
+                            denial evidence, probe-history preservation).
     3. full regression      tests/unit tests/contract tests/integration
                             (includes the Slice 0/1 acceptance suites and the
                             Slice-2 E2E gate above)
@@ -417,7 +423,13 @@ def main() -> int:
     )
     results["slice2_e2e"] = run_gate(
         "slice2-e2e-acceptance",
-        [sys.executable, "-m", "pytest", "tests/integration/test_slice2_acceptance.py", "-q"],
+        [
+            sys.executable, "-m", "pytest",
+            "tests/integration/test_slice2_acceptance.py",
+            "tests/integration/test_slice2_discovery_durability.py",
+            "tests/integration/test_slice2_discovery_boundary_audit.py",
+            "-q",
+        ],
         env=env,
     )
     results["tests"] = run_gate(
