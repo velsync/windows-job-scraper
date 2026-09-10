@@ -15,11 +15,11 @@ coordinator. For each claimed acquisition request it:
    proposes one;
 6. drains host-native obligations and aggregates the run (RUN-01).
 
-Destination policy is host-owned: the allowed host set is derived from
-the source's own entry URL. A narrow loopback grant is issued ONLY when
-the source's entry host is itself a loopback literal — a host rule in
-this driver, constructible by neither imported configuration nor
-scraped content (04 §5.1).
+Destination policy is host-owned. The Source entry host is always the base
+allow-host. For a pinned, graduated provider adapter, the host may also add
+that provider's reviewed API hosts from the versioned endpoint table; imported
+or scraped configuration cannot widen this set. A narrow loopback grant is
+issued ONLY when the Source entry host is itself a loopback literal (04 §5.1).
 """
 
 from __future__ import annotations
@@ -102,10 +102,10 @@ _DETAIL_REQUEST_TYPES = frozenset({"DETAIL_FETCH"})
 _CLOSURE_CLASSES = frozenset({PageClass.NOT_FOUND, PageClass.JOB_CLOSED})
 _OPEN_REQUEST_STATUSES = ("PENDING", "RUNNING", "RETRY_WAIT")
 
-#: Provider-native built-ins whose Source entry host may be widened to the
-#: provider's reviewed API hosts (04 §5.1).  Host-owned reviewed data: a
-#: provider is listed here only once its adapter has graduated into the
-#: registry, and the hosts themselves come from the versioned endpoint table.
+#: Provider-native built-ins whose pinned identity may authorize that
+#: provider's reviewed API hosts (04 §5.1). The adapter identity comes from an
+#: immutable binding revision; the hosts themselves come only from the
+#: versioned endpoint table. Config and scraped content are not inputs.
 _PROVIDER_NATIVE_ADAPTERS: dict[str, str] = {
     "greenhouse": "GREENHOUSE",
     "lever": "LEVER",
@@ -118,10 +118,12 @@ def source_policy(
 ) -> DestinationPolicy:
     """Host-owned destination policy for one source (04 §5.1).
 
-    A provider adapter may add only hosts from the reviewed, versioned ATS
-    endpoint table, and only when the Source entry host itself is a reviewed
-    host for that provider. Adapter config is deliberately not an input, so
-    imported/scraped data cannot widen network authority.
+    The operator-recorded Source entry host is always authorized. A graduated
+    provider adapter may additionally authorize only that provider's reviewed
+    API hosts from the immutable endpoint table. This is keyed by the pinned
+    adapter identity, not by page content and not by adapter config, so a real
+    employer-owned careers URL can route to its provider API without granting
+    arbitrary cross-host authority.
     """
     try:
         normalized = normalize_url(source_row["entry_url"])
@@ -131,10 +133,9 @@ def source_policy(
 
     allowed_hosts: set[str] = {host} if host else set()
     provider = _PROVIDER_NATIVE_ADAPTERS.get(adapter_id or "")
-    if provider is not None and host:
+    if provider is not None:
         spec = spec_for_provider(provider)
-        if host in {*spec.hosted_hosts, *spec.api_hosts}:
-            allowed_hosts.update(spec.api_hosts)
+        allowed_hosts.update(spec.api_hosts)
 
     grant = None
     try:
@@ -208,7 +209,7 @@ def _save_cursor(
         (
             new_id("cur"),
             cursor.source_id or plan_row["source_id"],
-            cursor.binding_id or plan_row["binding_id"],
+            plan_row["binding_id"],
             cursor.adapter_id,
             cursor.adapter_version,
             cursor.cursor_schema_version,
