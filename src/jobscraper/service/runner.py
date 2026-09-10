@@ -100,20 +100,24 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
         return 3
     port = int(sock.getsockname()[1])
 
+    # Restart recovery (03 RUN-07/RUN-09, §18/§50): open the fresh service
+    # epoch FIRST (recording any still-open epoch as ended by
+    # SERVICE_RESTART). The service app requires a live service epoch —
+    # fail-closed (§50) — so the epoch must precede create_service_app;
+    # the guard minted there then covers every service claim for the
+    # lifetime of this process.
+    from jobscraper.runtime.clock import begin_service_epoch
+    from jobscraper.runtime.recovery import recover_interrupted_requests
+
+    service_epoch = begin_service_epoch(db.conn)
+
     app, state = create_service_app(config, db, port=port, secret=secret)
     lifespan = ServiceLifespan(config, db, secret)
     app.state.lifespan = lifespan
 
-    # Restart recovery (03 RUN-07/RUN-09, §18/§50): open the fresh service
-    # epoch FIRST (recording any still-open epoch as ended by
-    # SERVICE_RESTART), then reclaim the orphaned RUNNING requests and
-    # finalize any cancellation the crash interrupted. Runs before the
-    # listener serves.
-    from jobscraper.runtime.clock import begin_service_epoch
-    from jobscraper.runtime.recovery import recover_interrupted_requests
-
+    # Then reclaim the orphaned RUNNING requests and finalize any
+    # cancellation the crash interrupted. Runs before the listener serves.
     try:
-        service_epoch = begin_service_epoch(db.conn)
         recovered = recover_interrupted_requests(db.conn)
         if recovered["reclaimed"] or recovered["finalized_cancelled_runs"]:
             append_event(

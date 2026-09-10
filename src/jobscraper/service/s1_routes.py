@@ -197,7 +197,9 @@ def install_slice1_routes(app, state) -> None:
                 target_identity=plan.get("entry_url") or f"source:{plan['source_id']}",
                 logical_key='{"page": 1}',
             )
-        status = execute_run(conn(), run_id)
+        # Production claims run through the service-lifetime clock guard
+        # (§50): anomaly detection cannot be bypassed on the run path.
+        status = execute_run(conn(), run_id, guard=state.clock_guard)
         counts = conn().execute(
             "SELECT jobs_saved, jobs_updated, requests_total, requests_failed"
             " FROM scrape_runs WHERE id = ?",

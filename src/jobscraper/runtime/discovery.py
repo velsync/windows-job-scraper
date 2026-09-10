@@ -398,6 +398,7 @@ def execute_source_discovery(
     *,
     worker_id: str = "source-discovery",
     now: str | None = None,
+    guard: "ServiceClockGuard | None" = None,
 ) -> DiscoveryOutcome:
     """Claim and execute one already-durable first probe.
 
@@ -425,6 +426,7 @@ def execute_source_discovery(
         now=claim_ts,
         types=frozenset({"SOURCE_DISCOVERY"}),
         run_source_plan_id=queued.run_source_plan_id,
+        guard=guard,
     )
     if claim is None or claim.request_id != queued.request_id:
         raise DiscoveryError("durable SOURCE_DISCOVERY request is not claimable")

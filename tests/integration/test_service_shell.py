@@ -41,6 +41,10 @@ def app_state(data_root):
     config = AppConfig(data_root=data_root)
     db = Database(build_app_paths(data_root).database_file)
     migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
+    # service lifetime: open the epoch before the app exists (03 §50)
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(db.conn)
     app, state = create_service_app(
         config, db, port=PORT, secret=SECRET, now_fn=lambda: 1000.0
     )

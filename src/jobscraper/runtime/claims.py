@@ -78,10 +78,6 @@ class StaleOwnership(Exception):
         self.reason = reason
 
 
-class ClaimsHalted(Exception):
-    """New claims are halted (material clock anomaly pending safe reclaim)."""
-
-
 @dataclass(frozen=True)
 class Claim:
     request_id: str
@@ -188,29 +184,42 @@ def claim_next_request(
     """Atomically claim the next eligible request (single winner).
 
     The claim mints a fresh ``attempt_id`` and binds it to the current
-    service epoch. When a :class:`ServiceClockGuard` is supplied it is
-    observed first: a material wall-clock anomaly rotates the epoch and
-    halts new claims (:class:`ClaimsHalted`) until the coordinator reclaims
-    the invalidated epoch's work and clears the halt (§50). No network or
-    file I/O occurs while the claim transaction is held.
+    service epoch. When a :class:`ServiceClockGuard` is supplied, every claim
+    first observes the database clock through it: a material wall-clock
+    anomaly rotates the epoch (rotation runs its own serialized write
+    transaction before the claim transaction begins), and the guarded claim
+    then performs the §50 recovery inline — reclaiming the ORIGINAL
+    invalidated epoch's orphaned RUNNING work and resuming only after that
+    recovery completes, inside the same serialized claim write transaction —
+    so the production claim path can never bypass anomaly detection. No
+    network or file I/O occurs while the claim transaction is held.
     """
     ts = now or db_utc_now(conn)
     if guard is not None:
+        # Guarded claim (§50): observe BEFORE opening the claim transaction,
+        # because anomaly rotation ends the live epoch and opens the next
+        # one in its own BEGIN IMMEDIATE.
         guard.observe(conn, db_now=ts)
-        if guard.claims_halted:
-            halt = guard.halt
-            detail = (
-                f" after {halt.direction} clock anomaly; epoch"
-                f" {halt.invalidated_epoch_id} invalidated"
-                if halt is not None
-                else ""
-            )
-            raise ClaimsHalted(f"new claims halted{detail} (§50)")
     attempt_id = new_id("att")
     selection_sql, selection_params = _claim_selection_sql(types, run_source_plan_id)
     selection_params[0] = ts  # RETRY_WAIT due comparison uses DB time (RUN-20)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if guard is not None:
+            if guard.claims_halted:
+                # §50, inside the same serialized write transaction: recover
+                # BEFORE any new claim can proceed — reclaim the ORIGINAL
+                # invalidated epoch's orphaned RUNNING work (rotation ended
+                # it durably), then resume. Claims therefore halt only until
+                # recovery is complete, and no coordinator can bypass the
+                # anomaly on the guarded production path.
+                halt = guard.halt
+                if halt is not None:
+                    _reclaim_epoch_orphans(
+                        conn, halt.invalidated_epoch_id, ts,
+                        failure_detail="attempt budget exhausted (clock anomaly)",
+                    )
+                guard.clear_halt()
         bound_epoch = _resolve_binding_epoch(conn, epoch)
         chosen = conn.execute(selection_sql, selection_params).fetchone()
         if chosen is None:
@@ -487,30 +496,40 @@ def reclaim_expired(conn: sqlite3.Connection, *, now: str | None = None) -> list
     return reclaimed
 
 
-def reclaim_orphaned_epoch_work(
-    conn: sqlite3.Connection, epoch_id: str, *, now: str | None = None
-) -> list[str]:
-    """Reclaim RUNNING work whose attempts were bound to an invalidated epoch.
-
-    Unlike lease-expiry reclaim the lease deadline is irrelevant: once the
-    service epoch is invalidated (clock anomaly or rotation, §50) every
-    ownership token minted under it is already lost and must not be
-    extended. Prior attempts are recorded ABANDONED (``CLOCK_ANOMALY``);
-    requests requeue within the attempt budget and fail terminally once it
-    is exhausted.
-
-    The current live/open epoch can never be reclaimed this way — its
-    attempts may still have live owners, and abandoning them would bypass
-    the lease contract. Only ended/invalidated non-current epochs are
-    accepted; the live epoch is refused with :class:`ValueError`.
-    """
+def _validate_reclaimable_epoch(conn: sqlite3.Connection, epoch_id: str) -> None:
+    """Only an existing, durably ended/invalidated, non-current epoch may be
+    reclaimed (§50). The live epoch and unknown/open epochs are refused."""
     current = current_service_epoch(conn)
     if current is not None and current.epoch_id == epoch_id:
         raise ValueError(
             f"refusing to reclaim the current live service epoch {epoch_id}:"
             " only ended/invalidated epochs may be reclaimed (§50)"
         )
-    ts = now or db_utc_now(conn)
+    row = conn.execute(
+        "SELECT ended_at FROM service_clock_epochs WHERE id = ?", (epoch_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"refusing to reclaim unknown service epoch {epoch_id}: only"
+            " existing, durably ended epochs may be reclaimed (§50)"
+        )
+    if row["ended_at"] is None:
+        raise ValueError(
+            f"refusing to reclaim service epoch {epoch_id}: it is not durably"
+            " ended/invalidated (ended_at IS NULL); only ended epochs may be"
+            " reclaimed (§50)"
+        )
+
+
+def _reclaim_epoch_orphans(
+    conn: sqlite3.Connection,
+    epoch_id: str,
+    ts: str,
+    *,
+    failure_detail: str = "attempt budget exhausted (clock anomaly)",
+) -> list[str]:
+    """Abandon/requeue the RUNNING work bound to ``epoch_id``. The caller
+    owns the enclosing write transaction (single serialized boundary)."""
     orphans = conn.execute(
         """
         SELECT req.id, req.current_attempt_id
@@ -523,43 +542,66 @@ def reclaim_orphaned_epoch_work(
     ).fetchall()
     reclaimed: list[str] = []
     for row in orphans:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            current = conn.execute(
-                "SELECT id, status, current_attempt_id, attempt_count, max_attempts"
-                " FROM scrape_requests WHERE id = ?",
-                (row["id"],),
+        current = conn.execute(
+            "SELECT id, status, current_attempt_id, attempt_count, max_attempts"
+            " FROM scrape_requests WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+        att = (
+            conn.execute(
+                "SELECT service_epoch_id FROM request_attempts"
+                " WHERE attempt_id = ?",
+                (row["current_attempt_id"],),
             ).fetchone()
-            att = (
-                conn.execute(
-                    "SELECT service_epoch_id FROM request_attempts"
-                    " WHERE attempt_id = ?",
-                    (row["current_attempt_id"],),
-                ).fetchone()
-                if current is not None and current["current_attempt_id"]
-                else None
-            )
-            if (
-                current is None
-                or current["status"] != "RUNNING"
-                or current["current_attempt_id"] != row["current_attempt_id"]
-                or att is None
-                or att["service_epoch_id"] != epoch_id
-            ):
-                conn.execute("COMMIT")
-                continue
-            _abandon_and_requeue(
-                conn,
-                current,
-                ts=ts,
-                abandoned_reason=ABANDONED_CLOCK_ANOMALY,
-                failure_detail="attempt budget exhausted (clock anomaly)",
-            )
-            conn.execute("COMMIT")
-            reclaimed.append(row["id"])
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+            if current is not None and current["current_attempt_id"]
+            else None
+        )
+        if (
+            current is None
+            or current["status"] != "RUNNING"
+            or current["current_attempt_id"] != row["current_attempt_id"]
+            or att is None
+            or att["service_epoch_id"] != epoch_id
+        ):
+            continue
+        _abandon_and_requeue(
+            conn,
+            current,
+            ts=ts,
+            abandoned_reason=ABANDONED_CLOCK_ANOMALY,
+            failure_detail=failure_detail,
+        )
+        reclaimed.append(row["id"])
+    return reclaimed
+
+
+def reclaim_orphaned_epoch_work(
+    conn: sqlite3.Connection, epoch_id: str, *, now: str | None = None
+) -> list[str]:
+    """Reclaim RUNNING work whose attempts were bound to an invalidated epoch.
+
+    Unlike lease-expiry reclaim the lease deadline is irrelevant: once the
+    service epoch is invalidated (clock anomaly or rotation, §50) every
+    ownership token minted under it is already lost and must not be
+    extended. Prior attempts are recorded ABANDONED (``CLOCK_ANOMALY``);
+    requests requeue within the attempt budget and fail terminally once it
+    is exhausted.
+
+    Only an existing epoch with ``ended_at IS NOT NULL`` may be reclaimed:
+    the current live epoch, unknown ids and not-yet-ended epochs are refused
+    with :class:`ValueError`. Guarded claims perform this same recovery
+    inline inside their serialized transaction after a clock-anomaly
+    rotation (§50).
+    """
+    _validate_reclaimable_epoch(conn, epoch_id)
+    ts = now or db_utc_now(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        reclaimed = _reclaim_epoch_orphans(conn, epoch_id, ts)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
     return reclaimed
 
 
@@ -624,7 +666,6 @@ __all__ = [
     "ABANDONED_LEASE_EXPIRED",
     "ABANDONED_SERVICE_RESTART",
     "Claim",
-    "ClaimsHalted",
     "StaleOwnership",
     "claim_next_request",
     "heartbeat",

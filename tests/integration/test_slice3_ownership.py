@@ -35,7 +35,6 @@ from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
 from jobscraper.runtime.cancellation import request_run_cancellation
 from jobscraper.runtime.claims import (
     Claim,
-    ClaimsHalted,
     StaleOwnership,
     claim_next_request,
     heartbeat,
@@ -434,20 +433,30 @@ def test_forward_clock_anomaly_stops_claims_rotates_epoch_and_reclaims(db):
     assert rows[0]["end_reason"] == "CLOCK_ANOMALY_FORWARD"
     assert rows[1]["ended_at"] is None and rows[1]["id"] == anomaly.new_epoch_id
 
-    # new claims stop while halted
-    with pytest.raises(ClaimsHalted):
-        claim_next_request(db.conn, "worker-2", now=FUTURE, guard=guard)
-
-    # the stale attempt cannot heartbeat; recovery never revives it
+    # the stale attempt can never heartbeat again; recovery never revives it
     with pytest.raises(StaleOwnership):
         heartbeat(db.conn, rid, claim.attempt_id, now=FUTURE)
 
-    # safe reclaim/retry under the budget (post-jump DB time stays at/after
-    # FUTURE; going back below it would itself be a backward anomaly)
+    # new claims pass through the guard: the guarded claim performs the §50
+    # recovery inline — reclaim the original epoch's RUNNING work, then
+    # resume — instead of leaking the halt to the coordinator. At FUTURE the
+    # reclaimed request is still inside its backoff, so no work is due yet.
+    assert claim_next_request(db.conn, "worker-2", now=FUTURE, guard=guard) is None
+    assert not guard.claims_halted
+    row = db.conn.execute(
+        "SELECT status FROM scrape_requests WHERE id = ?", (rid,)
+    ).fetchone()
+    att = db.conn.execute(
+        "SELECT outcome, abandoned_reason FROM request_attempts WHERE attempt_id = ?",
+        (claim.attempt_id,),
+    ).fetchone()
+    assert row["status"] == "RETRY_WAIT"
+    assert att["outcome"] == "ABANDONED" and att["abandoned_reason"] == "CLOCK_ANOMALY"
+    # post-jump DB time stays at/after FUTURE; the epoch reclaim record shows
+    # the recovery already ran inline against the ORIGINAL epoch
     assert reclaim_orphaned_epoch_work(
         db.conn, anomaly.invalidated_epoch_id, now=FUTURE
-    ) == [rid]
-    guard.clear_halt()
+    ) == []
     due = db.conn.execute(
         "SELECT next_retry_at FROM scrape_requests WHERE id = ?", (rid,)
     ).fetchone()["next_retry_at"]
@@ -514,20 +523,25 @@ def test_clock_drift_within_tolerance_keeps_the_epoch(db):
     assert claim_next_request(db.conn, "w", now=T1, guard=guard) is not None
 
 
-def test_repeated_anomaly_without_clear_halt_keeps_claims_stopped(db):
+def test_guarded_claim_clears_the_halt_through_recovery(db):
     epoch1 = begin_service_epoch(db.conn, now=NOW)
     guard = _guard(db, epoch1)
     guard.observe(db.conn, db_now=T1)
     anomaly = guard.observe(db.conn, db_now=FUTURE)
-    assert anomaly is not None
-    with pytest.raises(ClaimsHalted):
-        claim_next_request(db.conn, "w", now=FUTURE, guard=guard)
-    # reclaim happened, but the halt persists until explicitly cleared
-    reclaim_orphaned_epoch_work(db.conn, anomaly.invalidated_epoch_id, now=FUTURE)
-    with pytest.raises(ClaimsHalted):
-        claim_next_request(db.conn, "w", now=FUTURE, guard=guard)
-    guard.clear_halt()
-    assert claim_next_request(db.conn, "w", now=FUTURE, guard=guard) is None  # no work
+    assert anomaly is not None and guard.claims_halted
+    # the guarded claim performs recovery and clears the halt itself; with no
+    # due work at FUTURE it simply yields nothing
+    assert claim_next_request(db.conn, "w", now=FUTURE, guard=guard) is None
+    assert not guard.claims_halted
+    # recovery re-baselines the guard: the first post-recovery observation
+    # starts a fresh comparison window instead of judging drift against the
+    # pre-anomaly sample
+    assert guard.observe(db.conn, db_now="2026-09-08T12:00:00.000000Z") is None
+    # and the guard stays anomaly-sensitive afterwards: a further material
+    # jump rotates again from the post-recovery epoch
+    later = guard.observe(db.conn, db_now="2026-09-08T15:00:00.000000Z")
+    assert later is not None and later.direction == "FORWARD"
+    assert later.invalidated_epoch_id == anomaly.new_epoch_id
 
 
 # --------------------------------------------- RUN-09/§18 restart recovery
@@ -879,14 +893,16 @@ def test_repeated_anomaly_while_halted_keeps_original_invalidated_epoch(db):
     assert guard.claims_halted
     assert guard.halt.invalidated_epoch_id == epoch1.epoch_id
     assert len(_epoch_rows(db)) == halted_epoch_count
-    with pytest.raises(ClaimsHalted):
-        claim_next_request(db.conn, "worker-2", now=T1, guard=guard)
 
-    # recovery completes against the ORIGINAL epoch, then work resumes
-    assert reclaim_orphaned_epoch_work(
-        db.conn, epoch1.epoch_id, now=FUTURE
-    ) == [rid]
-    guard.clear_halt()
+    # the next guarded claim recovers the ORIGINAL epoch inline and resumes
+    # (nothing is due at T1, so it yields no work)
+    assert claim_next_request(db.conn, "worker-2", now=T1, guard=guard) is None
+    assert not guard.claims_halted
+    assert reclaim_orphaned_epoch_work(db.conn, epoch1.epoch_id, now=FUTURE) == []
+    row = db.conn.execute(
+        "SELECT status FROM scrape_requests WHERE id = ?", (rid,)
+    ).fetchone()
+    assert row["status"] == "RETRY_WAIT"
     due = db.conn.execute(
         "SELECT next_retry_at FROM scrape_requests WHERE id = ?", (rid,)
     ).fetchone()["next_retry_at"]
@@ -921,3 +937,104 @@ def test_reclaim_refuses_the_current_live_service_epoch(db):
     # once the epoch is ended (rotation), reclaiming it is allowed
     begin_service_epoch(db.conn, now=T1)
     assert reclaim_orphaned_epoch_work(db.conn, epoch1.epoch_id, now=T1) == [rid]
+
+
+# ---------- S3.1 corrective round 2: reclaim validation hardening (issue 2)
+
+
+def test_reclaim_unknown_epoch_is_refused(db):
+    begin_service_epoch(db.conn, now=NOW)
+    with pytest.raises(ValueError, match="unknown"):
+        reclaim_orphaned_epoch_work(db.conn, "epoch-does-not-exist", now=NOW)
+
+
+def test_reclaim_open_non_current_epoch_is_refused(db):
+    epoch1 = begin_service_epoch(db.conn, now=NOW)
+    # a second epoch row that was never durably ended (superseded-but-open
+    # residue is still not reclaimable: only ended/invalidated epochs qualify)
+    db.conn.execute(
+        "INSERT INTO service_clock_epochs (id, started_at, created_at)"
+        " VALUES ('epoch-open-residue', ?, ?)",
+        (T1, T1),
+    )
+    db.conn.execute(
+        "INSERT INTO service_clock_epochs (id, started_at, created_at)"
+        " VALUES ('epoch-current', ?, ?)",
+        (T2, T2),
+    )
+    db.conn.commit()
+    assert current_service_epoch(db.conn).epoch_id == "epoch-current"
+    with pytest.raises(ValueError, match="ended"):
+        reclaim_orphaned_epoch_work(db.conn, "epoch-open-residue", now=T2)
+    with pytest.raises(ValueError, match="live"):
+        reclaim_orphaned_epoch_work(db.conn, "epoch-current", now=T2)
+    # once the original epoch is durably ended it becomes reclaimable
+    from jobscraper.runtime.clock import end_service_epoch
+
+    assert end_service_epoch(db.conn, epoch1.epoch_id, reason="TEST_END", now=T2)
+    assert reclaim_orphaned_epoch_work(db.conn, epoch1.epoch_id, now=T2) == []
+
+
+# ----- S3.1 corrective round 2: guarded claims perform §50 recovery inline
+
+
+def test_guarded_claim_recovers_halted_epoch_before_resuming(db):
+    epoch1 = begin_service_epoch(db.conn, now=NOW)
+    guard = _guard(db, epoch1)
+    guard.observe(db.conn, db_now=T1)
+    _run_id, _plan_id, rid = _enqueue(db)
+    claim = claim_next_request(db.conn, "worker-1", now=T1, guard=guard)
+    assert claim is not None and claim.service_epoch_id == epoch1.epoch_id
+
+    # material forward anomaly with the attempt still RUNNING: rotation + halt
+    anomaly = guard.observe(db.conn, db_now=FUTURE)
+    assert anomaly is not None and guard.claims_halted
+
+    # the guarded claim path must not leak the halt to the coordinator: it
+    # performs the §50 recovery inline (reclaim the ORIGINAL invalidated
+    # epoch's RUNNING work), clears the halt, and only then resumes
+    # selection — all inside one serialized write transaction. The requeued
+    # work is still inside its retry backoff at FUTURE, so this first claim
+    # yields nothing but the recovery is already complete.
+    assert claim_next_request(db.conn, "worker-2", now=FUTURE, guard=guard) is None
+    assert not guard.claims_halted
+    old_att = db.conn.execute(
+        "SELECT outcome, abandoned_reason FROM request_attempts WHERE attempt_id = ?",
+        (claim.attempt_id,),
+    ).fetchone()
+    assert old_att["outcome"] == "ABANDONED"
+    assert old_att["abandoned_reason"] == "CLOCK_ANOMALY"
+    # the invalidated epoch was the one recovered, and it stays ended
+    rows = {r["id"]: r for r in _epoch_rows(db)}
+    assert rows[epoch1.epoch_id]["end_reason"] == "CLOCK_ANOMALY_FORWARD"
+    assert len(rows) == 2
+
+    # once the retry backoff elapses the recovered request is claimable
+    # again, bound to the post-anomaly epoch
+    retry_at = "2026-09-08T09:00:06.000000Z"  # FUTURE + 5s backoff + 1s
+    next_claim = claim_next_request(db.conn, "worker-2", now=retry_at, guard=guard)
+    assert next_claim is not None and next_claim.request_id == rid
+    assert next_claim.attempt_id != claim.attempt_id
+    assert next_claim.service_epoch_id == anomaly.new_epoch_id
+
+
+def test_manual_halt_flow_still_recovers_the_original_epoch(db):
+    epoch1 = begin_service_epoch(db.conn, now=NOW)
+    guard = _guard(db, epoch1)
+    guard.observe(db.conn, db_now=T1)
+    _run_id, _plan_id, rid = _enqueue(db)
+    claim_next_request(db.conn, "worker-1", now=T1, guard=guard)
+    anomaly = guard.observe(db.conn, db_now=FUTURE)
+    assert anomaly is not None and guard.claims_halted
+    # a second anomaly while halted keeps the original epoch for recovery
+    again = guard.observe(db.conn, db_now="2026-09-08T12:00:00.000000Z")
+    assert again.invalidated_epoch_id == epoch1.epoch_id
+    assert len(_epoch_rows(db)) == 2
+    # explicit coordinator recovery (reclaim + clear) remains supported
+    assert reclaim_orphaned_epoch_work(db.conn, epoch1.epoch_id, now=FUTURE) == [rid]
+    guard.clear_halt()
+    due = db.conn.execute(
+        "SELECT next_retry_at FROM scrape_requests WHERE id = ?", (rid,)
+    ).fetchone()["next_retry_at"]
+    retry = claim_next_request(db.conn, "worker-2", now=due, guard=guard)
+    assert retry is not None and retry.service_epoch_id == anomaly.new_epoch_id

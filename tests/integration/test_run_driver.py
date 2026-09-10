@@ -456,3 +456,79 @@ def test_driver_redirect_denied_is_partial_and_grants_no_absence_authority(db, s
         "SELECT group_outcome FROM run_source_plans WHERE run_id = ?", (run_id,)
     ).fetchone()
     assert group["group_outcome"] == "SATISFIED_PARTIAL"
+
+
+def test_execute_run_claim_path_cannot_bypass_clock_anomaly_detection(db):
+    """S3.1 corrective round 2: the real service run path claims through the
+    service-lifetime clock guard. A material forward wall-clock anomaly
+    mid-run must rotate the epoch, reclaim RUNNING work bound to the
+    invalidated ORIGINAL epoch, and resume — ``execute_run`` cannot bypass
+    detection (03 §50, R2-F11 seam)."""
+    from jobscraper.runtime.claims import claim_next_request
+    from jobscraper.runtime.clock import (
+        ServiceClockGuard,
+        current_service_epoch,
+        db_utc_now,
+    )
+
+    run_id = _start_run(db)
+
+    # an orphaned RUNNING attempt bound to the current epoch in a separate
+    # run (worker claimed, then died before commit): anomaly recovery inside
+    # the claim path must abandon and requeue it
+    orphan_plan = dict(
+        source_id="src-1", source_plan_group_id="grp-orphan", fallback_rank=0,
+        binding_id="bnd-1", binding_revision_id="bndrev-1",
+        adapter_id="json_api_feed", adapter_version="1.0.0", adapter_api_version="1",
+        strategy="FEED_OR_PUBLIC_STRUCTURED_ENDPOINT", execution_class="HTTP",
+        permission_profile_id="perm-1", permission_profile_revision=1,
+    )
+    orphan_run, orphan_plans = create_run(
+        db.conn, profile_id=None, plans=[orphan_plan], now=NOW
+    )
+    orphan_req, _ = enqueue_request(
+        db.conn, run_id=orphan_run, run_source_plan_id=orphan_plans[0],
+        source_id="src-1", binding_id="bnd-1", request_type="DETAIL_FETCH",
+        target_identity="http://127.0.0.1/jobs/orphan",
+        logical_key='{"orphan": true}',
+    )
+    orphan_claim = claim_next_request(
+        db.conn, "dead-worker", now=db_utc_now(db.conn),
+        run_source_plan_id=orphan_plans[0],
+    )
+    assert orphan_claim is not None and orphan_claim.request_id == orphan_req
+
+    epoch = current_service_epoch(db.conn)
+    # deterministic seam: real database clock vs a frozen monotonic baseline
+    # at zero tolerance, so the real elapsed time between claims is a
+    # material forward drift
+    guard = ServiceClockGuard(epoch, tolerance_s=0.0, monotonic=lambda: 0.0)
+
+    status = execute_run(db.conn, run_id, guard=guard)
+    assert status == "SUCCEEDED"
+
+    # detection is durable: at least one epoch ended by a clock anomaly
+    anomalies = db.conn.execute(
+        "SELECT COUNT(*) FROM service_clock_epochs"
+        " WHERE end_reason LIKE 'CLOCK_ANOMALY%'"
+    ).fetchone()[0]
+    assert anomalies >= 1
+
+    # recovery reclaimed the original epoch's orphaned RUNNING work
+    att = db.conn.execute(
+        "SELECT outcome, abandoned_reason FROM request_attempts WHERE attempt_id = ?",
+        (orphan_claim.attempt_id,),
+    ).fetchone()
+    assert att["outcome"] == "ABANDONED"
+    assert att["abandoned_reason"] == "CLOCK_ANOMALY"
+    row = db.conn.execute(
+        "SELECT status FROM scrape_requests WHERE id = ?", (orphan_req,)
+    ).fetchone()
+    assert row["status"] == "RETRY_WAIT"
+    # the run's own work completed under the post-anomaly epoch(es)
+    pages = db.conn.execute(
+        "SELECT status FROM scrape_requests WHERE run_id = ? AND request_type = 'LIST_FETCH'"
+        " ORDER BY created_at",
+        (run_id,),
+    ).fetchall()
+    assert len(pages) == 2 and all(p["status"] == "SUCCEEDED" for p in pages)

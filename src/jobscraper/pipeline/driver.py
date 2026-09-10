@@ -27,6 +27,10 @@ from __future__ import annotations
 import ipaddress
 import json
 import sqlite3
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from jobscraper.runtime.clock import ServiceClockGuard
 
 from jobscraper.acquisition.atsendpoints import spec_for_provider
 from jobscraper.acquisition.envelope import (
@@ -224,8 +228,14 @@ def execute_run(
     *,
     worker_id: str = "service",
     now: str | None = None,
+    guard: "ServiceClockGuard | None" = None,
 ) -> str:
-    """Drive one run to completion (bounded) and return its aggregate status."""
+    """Drive one run to completion (bounded) and return its aggregate status.
+
+    ``guard`` is the service-lifetime wall-clock anomaly guard (§50): the
+    service passes its own guard so every claim on the run path observes the
+    database clock and performs anomaly recovery inline.
+    """
     from jobscraper.runtime.clock import db_utc_now
 
     ts = now or db_utc_now(conn)
@@ -236,7 +246,7 @@ def execute_run(
     ).fetchall()
 
     for plan_row in plan_rows:
-        _execute_plan(conn, run_id, plan_row, worker_id=worker_id, now=ts)
+        _execute_plan(conn, run_id, plan_row, worker_id=worker_id, now=ts, guard=guard)
 
     # Host-native obligations drain before the run finalizes (a run must
     # not report finished while accepted observations are unprocessed).
@@ -446,6 +456,7 @@ def _execute_plan(
     *,
     worker_id: str,
     now: str,
+    guard: "ServiceClockGuard | None" = None,
 ) -> None:
     """Drive one immutable RunSourcePlan to an honest terminal state.
 
@@ -545,7 +556,7 @@ def _execute_plan(
             break
         claim = claim_next_request(
             conn, worker_id, now=db_utc_now(conn), types=frozenset(allowed),
-            run_source_plan_id=plan_id,
+            run_source_plan_id=plan_id, guard=guard,
         )
         if claim is None:
             break

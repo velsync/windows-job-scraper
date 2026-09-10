@@ -379,3 +379,59 @@ def test_application_crud_via_api(service):
     assert client.post(
         "/api/applications", json={"job_id": "missing", "profile_id": profile["id"]}
     ).status_code == 404
+
+
+def test_run_create_claims_pass_through_the_service_clock_guard(service):
+    """S3.1 corrective round 2: POST /api/runs drives claims through the
+    service-lifetime clock guard. With the deterministic zero-tolerance seam
+    (R2-F11) the run still succeeds and leaves durable clock-anomaly epoch
+    evidence — the real service claim path cannot bypass detection."""
+    from jobscraper.runtime.clock import ServiceClockGuard, current_service_epoch
+
+    db = service["db"]
+    state = service["state"]
+    # the app wires one service-lifetime guard for the run/claim path
+    assert state.clock_guard is not None
+    assert state.clock_guard.epoch.epoch_id == current_service_epoch(db.conn).epoch_id
+    state.clock_guard = ServiceClockGuard(
+        current_service_epoch(db.conn), tolerance_s=0.0, monotonic=lambda: 0.0
+    )
+
+    client = _client(service)
+    profile = client.post(
+        "/api/profiles",
+        json={"name": "P", "keywords": ["backend"], "eligible_countries": ["DE"],
+              "remote_rules": {"remote_ok": True}, "min_score_inbox": 0},
+    ).json()
+    result = client.post("/api/runs", json={"profile_id": profile["id"]})
+    assert result.status_code == 200
+    assert result.json()["status"] == "SUCCEEDED"
+    anomalies = db.conn.execute(
+        "SELECT COUNT(*) FROM service_clock_epochs"
+        " WHERE end_reason LIKE 'CLOCK_ANOMALY%'"
+    ).fetchone()[0]
+    assert anomalies >= 1
+
+
+def test_service_app_requires_an_active_service_epoch(tmp_path, feed_server):
+    """Fail closed: a service app cannot be created over a database with no
+    active service epoch (03 §50)."""
+    from jobscraper.config import AppConfig
+    from jobscraper.paths import build_app_paths, ensure_app_directories
+    from jobscraper.runtime.clock import NoActiveServiceEpoch
+    from jobscraper.security.install_secret import load_or_create_install_secret
+    from jobscraper.service.app import create_service_app
+
+    root = tmp_path / "no-epoch-root"
+    paths = build_app_paths(root)
+    ensure_app_directories(paths)
+    secret = load_or_create_install_secret(paths)
+    database = Database(paths.database_file)
+    migrate_schema(database.conn, LATEST_SCHEMA_VERSION)
+    try:
+        with pytest.raises(NoActiveServiceEpoch):
+            create_service_app(
+                AppConfig(data_root=root), database, port=8765, secret=secret
+            )
+    finally:
+        database.close()

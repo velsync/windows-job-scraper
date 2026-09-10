@@ -186,6 +186,10 @@ class ServiceState:
         # create a session before the S0.7 bootstrap endpoints exist).
         self.sessions = sessions or SessionRegistry(self.instance_id, now_fn=now_fn)
         self.tickets = tickets or BootstrapTicketStore()
+        # Service-lifetime wall-clock anomaly guard (§50): created by
+        # create_service_app over the active service epoch; every production
+        # claim runs through it (see install_slice1_routes / the driver).
+        self.clock_guard = None
         self._used_nonces: set[str] = set()
         self._nonce_lock = threading.Lock()
         self.templates = Jinja2Templates(directory=str(_WEB_DIR / "templates"))
@@ -244,6 +248,23 @@ def create_service_app(
         tickets=tickets,
         now_fn=now_fn,
     )
+    # §50: the service app lives inside one service epoch. Fail closed if the
+    # epoch was never opened — run_service opens it before restart recovery,
+    # and any in-process service harness must model the same lifetime.
+    from jobscraper.runtime.clock import (
+        NoActiveServiceEpoch,
+        ServiceClockGuard,
+        current_service_epoch,
+    )
+
+    epoch = current_service_epoch(db.conn)
+    if epoch is None:
+        raise NoActiveServiceEpoch(
+            "service app requires an active service epoch (§50): open it"
+            " before creating the app (run_service does this before restart"
+            " recovery)"
+        )
+    state.clock_guard = ServiceClockGuard(epoch)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.state.service = state
     # add_middleware wraps in reverse: the LAST added is OUTERMOST. The
