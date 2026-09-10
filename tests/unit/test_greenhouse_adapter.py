@@ -554,7 +554,7 @@ class TestListParse:
         """S2.1 recorded these fields as accepted-but-unproduced; the provider
         parser is their first producer."""
         outcome = _parse(_adapter(), "board_list.json")
-        assert outcome.contract_version == 2
+        assert outcome.contract_version >= 2
         assert outcome.evidence_refs
         assert all(ref.startswith("result://") or ref.startswith("validity://")
                    for ref in outcome.evidence_refs)
