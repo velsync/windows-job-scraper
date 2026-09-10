@@ -11,6 +11,8 @@ import json
 from dataclasses import fields
 from pathlib import Path
 
+import pytest
+
 from jobscraper.acquisition.pagevalidity import PageClass
 from jobscraper.acquisition.result import ResultEnvelope
 from jobscraper.adapters.contract import (
@@ -89,6 +91,26 @@ def test_contract_v3_is_frozen_before_cross_component_slice3_work():
 
     child = DiscoveredTask(**FIXTURE["discovered_task"])
     assert child.parent_reference == "observation://obs-42"
+
+
+def test_parse_context_v3_is_additive_for_legacy_callers_and_fail_closed_on_conflict():
+    # Preserve the complete v2 positional constructor prefix. New v3 fields
+    # append rather than shifting normalization_version/idempotency_namespace.
+    legacy = ParseContext(3, "req", "att", "rsp", "parser", "norm-v1", "req")
+    assert legacy.normalization_version == "norm-v1"
+    assert legacy.normalization_contract_version == "norm-v1"
+    assert legacy.recipe_version_id is None
+    assert legacy.idempotency_namespace == "req"
+
+    canonical = ParseContext(normalization_contract_version="norm-v2")
+    assert canonical.normalization_contract_version == "norm-v2"
+    assert canonical.normalization_version == "norm-v2"
+
+    with pytest.raises(ValueError, match="must identify the same contract"):
+        ParseContext(
+            normalization_version="norm-v1",
+            normalization_contract_version="norm-v2",
+        )
 
 
 def test_all_acquisition_task_kinds_are_fixture_locked_and_host_native_is_non_network():
