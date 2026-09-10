@@ -17,7 +17,11 @@ import pytest
 
 from jobscraper.db.connection import Database
 from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
-from jobscraper.runtime.discovery import execute_source_discovery, queue_source_discovery
+from jobscraper.runtime.discovery import (
+    execute_source_discovery,
+    load_queued_discovery,
+    queue_source_discovery,
+)
 
 NOW = "2026-09-10T06:30:00.000000Z"
 
@@ -171,6 +175,13 @@ def test_discovery_identity_is_durable_before_first_network_probe(tmp_path, serv
 
 
 def test_queued_discovery_survives_process_restart_before_claim(tmp_path, server):
+    """A real restart: the continuation is re-derived from durable rows only.
+
+    02 §12.1 requires that "crash/restart resumes from that durable identity".
+    The in-memory ``QueuedDiscovery`` value is therefore deliberately dropped
+    (it cannot survive a process death) and the continuation is loaded back
+    from the committed Source/plan/request rows.
+    """
     path = tmp_path / "restart.db"
     db = _database(path)
     url = f"http://127.0.0.1:{server.server_address[1]}/careers/generic"
@@ -182,12 +193,19 @@ def test_queued_discovery_survives_process_restart_before_claim(tmp_path, server
         now=NOW,
     )
     assert _Handler.hits == 0
+    request_id = queued.request_id
     db.close()
+    del queued  # the dead process's Python objects are gone
 
     reopened = Database(path)
     try:
+        resumed = load_queued_discovery(reopened.conn, request_id=request_id)
+        assert resumed.request_id == request_id
+        assert resumed.source_id == load_queued_discovery(
+            reopened.conn, run_id=resumed.run_id
+        ).source_id
         outcome = execute_source_discovery(
-            reopened.conn, queued, worker_id="restart-worker", now=NOW
+            reopened.conn, resumed, worker_id="restart-worker", now=NOW
         )
         assert _Handler.hits == 1
         assert outcome.run_status == "SUCCEEDED"
@@ -196,7 +214,7 @@ def test_queued_discovery_survives_process_restart_before_claim(tmp_path, server
         assert outcome.decision is not None
         assert outcome.decision.outcome.value == "GENERIC_DISCOVERY_FALLBACK"
         assert reopened.conn.execute(
-            "SELECT status FROM scrape_requests WHERE id = ?", (queued.request_id,)
+            "SELECT status FROM scrape_requests WHERE id = ?", (request_id,)
         ).fetchone()["status"] == "SUCCEEDED"
     finally:
         reopened.close()

@@ -191,6 +191,86 @@ def queue_source_discovery(
     )
 
 
+_DISCOVERY_RESUME_SQL = """
+SELECT req.id AS request_id, req.run_id AS run_id,
+       req.run_source_plan_id AS run_source_plan_id,
+       req.source_id AS source_id, req.binding_id AS request_binding_id,
+       req.status AS status,
+       plan.binding_id AS plan_binding_id,
+       plan.binding_revision_id AS binding_revision_id,
+       plan.source_id AS plan_source_id
+FROM scrape_requests req
+JOIN run_source_plans plan
+  ON plan.id = req.run_source_plan_id AND plan.run_id = req.run_id
+WHERE req.request_type = 'SOURCE_DISCOVERY'
+"""
+
+# A resumed probe must still be claimable. RUNNING is refused rather than
+# silently retried: 03 §18/RUN-07 makes restart reclamation
+# (`recover_interrupted_requests`) the single authority for orphaned
+# ownership, and it must run under the fresh service epoch before any
+# continuation is attempted.
+_CLAIMABLE_DISCOVERY_STATUSES = frozenset({"PENDING", "RETRY_WAIT"})
+
+
+def load_queued_discovery(
+    conn: sqlite3.Connection,
+    *,
+    request_id: str | None = None,
+    run_id: str | None = None,
+) -> QueuedDiscovery:
+    """Re-derive a durable first-probe continuation from committed rows.
+
+    02 §12.1 requires that "crash/restart resumes from that durable identity".
+    A dead process holds no Python objects, so the continuation must be
+    reconstructible from what was committed. Exactly one of ``request_id`` or
+    ``run_id`` identifies the work; the pinned plan, the provisional Source and
+    the binding revision are re-validated against the request before any I/O is
+    planned, so a half-written or crossed identity is refused rather than
+    executed against the wrong source.
+    """
+    if (request_id is None) == (run_id is None):
+        raise DiscoveryError("exactly one of request_id or run_id is required")
+    if request_id is not None:
+        row = conn.execute(
+            _DISCOVERY_RESUME_SQL + " AND req.id = ?", (request_id,)
+        ).fetchone()
+    else:
+        rows = conn.execute(
+            _DISCOVERY_RESUME_SQL + " AND req.run_id = ?", (run_id,)
+        ).fetchall()
+        if len(rows) != 1:
+            raise DiscoveryError(
+                f"run {run_id!r} does not hold exactly one SOURCE_DISCOVERY request"
+            )
+        row = rows[0]
+    if row is None:
+        raise DiscoveryError("no durable SOURCE_DISCOVERY request matches")
+    if row["status"] not in _CLAIMABLE_DISCOVERY_STATUSES:
+        raise DiscoveryError(
+            f"SOURCE_DISCOVERY request {row['request_id']!r} is {row['status']};"
+            " a restart must run recovery before resuming"
+        )
+    if (
+        row["request_binding_id"] != row["plan_binding_id"]
+        or row["source_id"] != row["plan_source_id"]
+    ):
+        raise DiscoveryError(
+            "SOURCE_DISCOVERY request and pinned plan disagree on binding/source"
+        )
+    revision = _revision_plan(conn, row["binding_revision_id"])
+    if revision["adapter_id"] != _DISCOVERY_ADAPTER_ID:
+        raise DiscoveryError("resumed discovery revision changed adapter identity")
+    return QueuedDiscovery(
+        run_id=row["run_id"],
+        run_source_plan_id=row["run_source_plan_id"],
+        request_id=row["request_id"],
+        source_id=row["source_id"],
+        binding_id=row["plan_binding_id"],
+        binding_revision_id=row["binding_revision_id"],
+    )
+
+
 def _plan_request(
     conn: sqlite3.Connection,
     queued: QueuedDiscovery,
@@ -402,5 +482,6 @@ __all__ = [
     "DiscoveryOutcome",
     "QueuedDiscovery",
     "execute_source_discovery",
+    "load_queued_discovery",
     "queue_source_discovery",
 ]
