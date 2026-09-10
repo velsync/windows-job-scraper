@@ -116,8 +116,10 @@ def queue_source_discovery(
 
     A successful return is the §12.1 precondition for a network probe: Source,
     immutable binding revision, pinned run plan and SOURCE_DISCOVERY request are
-    already committed. Invalid URLs/configuration fail during provisioning;
-    this function never calls the network executor.
+    already committed. The run, plan and request are committed as one durable
+    creation boundary, so a crash cannot expose a QUEUED discovery run without
+    its work item. Invalid URLs/configuration fail during provisioning; this
+    function never calls the network executor.
     """
     definition = ensure_builtin_adapter_definition(
         conn, _DISCOVERY_ADAPTER_ID, now=now
@@ -157,24 +159,33 @@ def queue_source_discovery(
         "permission_profile_revision": revision["permission_profile_revision"],
         "cursor_schema_version": 1,
     }
-    run_id, plan_ids = create_run(conn, profile_id=None, plans=[plan], now=now)
-    plan_id = plan_ids[0]
-    request_id, created = enqueue_request(
-        conn,
-        run_id=run_id,
-        run_source_plan_id=plan_id,
-        source_id=provisioned.source_id,
-        binding_id=provisioned.binding_id,
-        request_type="SOURCE_DISCOVERY",
-        target_identity=entry_url,
-        payload={"target_reference": entry_url},
-        strategy=_DISCOVERY_STRATEGY,
-        execution_class=_DISCOVERY_EXECUTION_CLASS,
-        max_attempts=3,
-        now=now,
-    )
-    if not created:
-        raise DiscoveryError("new discovery run unexpectedly reused a request")
+    try:
+        run_id, plan_ids = create_run(
+            conn, profile_id=None, plans=[plan], now=now, commit=False
+        )
+        plan_id = plan_ids[0]
+        request_id, created = enqueue_request(
+            conn,
+            run_id=run_id,
+            run_source_plan_id=plan_id,
+            source_id=provisioned.source_id,
+            binding_id=provisioned.binding_id,
+            request_type="SOURCE_DISCOVERY",
+            target_identity=entry_url,
+            payload={"target_reference": entry_url},
+            strategy=_DISCOVERY_STRATEGY,
+            execution_class=_DISCOVERY_EXECUTION_CLASS,
+            max_attempts=3,
+            now=now,
+            commit=False,
+        )
+        if not created:
+            raise DiscoveryError("new discovery run unexpectedly reused a request")
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
     return QueuedDiscovery(
         run_id=run_id,
         run_source_plan_id=plan_id,
