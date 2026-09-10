@@ -720,6 +720,18 @@ class TestCancellationAndCrashRecovery:
             "SELECT COUNT(*) FROM events WHERE kind = 'SERVICE_RECOVERY'"
         ).fetchone()[0]
         assert recovery_event >= 1
+        # S3.1 (03 §50): the restart opened a fresh service epoch and the
+        # crashed lifetime's epoch is durably recorded as ended
+        epochs = db.execute(
+            "SELECT ended_at, end_reason FROM service_clock_epochs"
+            " ORDER BY started_at, id"
+        ).fetchall()
+        assert len(epochs) >= 2
+        assert epochs[-1]["ended_at"] is None  # the fresh epoch is open
+        assert any(
+            row["ended_at"] is not None and row["end_reason"] == "SERVICE_RESTART"
+            for row in epochs[:-1]
+        )
 
         # profiles survived the crash+restart (PROD-08)
         status, profiles = _api(state, auth, "GET", "/api/profiles")

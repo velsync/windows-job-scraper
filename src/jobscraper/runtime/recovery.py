@@ -4,7 +4,9 @@ The service process is the single-machine claim/capacity coordinator
 (RUN-09): request ownership lives inside that one process.  A service
 restart therefore orphans every ``RUNNING`` request — no worker can
 exist to finish or abandon it — and recovery runs under the fresh
-service epoch:
+service epoch opened by ``clock.begin_service_epoch`` (which records any
+still-open epoch as ended by ``SERVICE_RESTART``; ownership from prior
+epochs is invalid from that moment on):
 
 * each orphaned RUNNING request is reclaimed with the RUN-07
   transitions (prior attempt ABANDONED; RETRY_WAIT while the attempt
@@ -29,9 +31,8 @@ import sqlite3
 
 from jobscraper.runtime.cancellation import request_run_cancellation
 from jobscraper.runtime.claims import (
-    RETRY_BACKOFF_BASE_S,
-    RETRY_BACKOFF_CAP_S,
-    _add_seconds,
+    ABANDONED_SERVICE_RESTART,
+    _abandon_and_requeue,
 )
 from jobscraper.runtime.clock import db_utc_now
 from jobscraper.runtime.runs import aggregate_run
@@ -61,47 +62,20 @@ def recover_interrupted_requests(
             # Re-check under the write lock: a live worker may have
             # committed between the scan and this transaction.
             current = conn.execute(
-                "SELECT status, current_attempt_id, attempt_count, max_attempts"
+                "SELECT id, status, current_attempt_id, attempt_count, max_attempts"
                 " FROM scrape_requests WHERE id = ?",
                 (row["id"],),
             ).fetchone()
             if current is None or current["status"] != "RUNNING":
                 conn.execute("COMMIT")
                 continue
-            if current["current_attempt_id"]:
-                conn.execute(
-                    "UPDATE request_attempts SET outcome = 'ABANDONED',"
-                    " abandoned_reason = 'SERVICE_RESTART', finished_at = ?"
-                    " WHERE attempt_id = ?",
-                    (ts, current["current_attempt_id"]),
-                )
-            if current["attempt_count"] >= current["max_attempts"]:
-                conn.execute(
-                    "UPDATE scrape_requests SET status = 'FAILED',"
-                    " last_failure_kind = 'LEASE_LOST', last_failure_json = ?,"
-                    " current_worker_id = NULL, current_attempt_id = NULL,"
-                    " lease_until = NULL, finished_at = ?, updated_at = ?"
-                    " WHERE id = ?",
-                    (
-                        '{"kind": "LEASE_LOST",'
-                        ' "detail": "attempt budget exhausted (service restart)"}',
-                        ts,
-                        ts,
-                        row["id"],
-                    ),
-                )
-            else:
-                backoff = min(
-                    RETRY_BACKOFF_BASE_S * max(1, current["attempt_count"]),
-                    RETRY_BACKOFF_CAP_S,
-                )
-                conn.execute(
-                    "UPDATE scrape_requests SET status = 'RETRY_WAIT',"
-                    " next_retry_at = ?, current_worker_id = NULL,"
-                    " current_attempt_id = NULL, lease_until = NULL, updated_at = ?"
-                    " WHERE id = ?",
-                    (_add_seconds(ts, backoff), ts, row["id"]),
-                )
+            _abandon_and_requeue(
+                conn,
+                current,
+                ts=ts,
+                abandoned_reason=ABANDONED_SERVICE_RESTART,
+                failure_detail="attempt budget exhausted (service restart)",
+            )
             conn.execute("COMMIT")
         except BaseException:
             try:
