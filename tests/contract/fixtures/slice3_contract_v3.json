@@ -13,6 +13,13 @@
     "budget_snapshot_ref": "budget://s3",
     "cursor_schema_version": 2
   },
+  "validated_result_envelope": {
+    "contract_version": 3,
+    "validated_page_class": "EMPTY",
+    "validation_evidence": {"recognized_empty": true},
+    "security_policy_result": "ALLOWED",
+    "cache_representation_ref": null
+  },
   "parse_context": {
     "contract_version": 3,
     "request_id": "req-s3",
