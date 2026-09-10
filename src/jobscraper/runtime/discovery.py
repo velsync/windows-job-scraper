@@ -10,8 +10,8 @@ Slice 2:
 * claim the request with the normal lease machinery;
 * plan through the manifest-validated discovery adapter and execute under the
   host-owned destination policy;
-* atomically fence fetch/result/page-validity evidence together with the pure
-  fingerprint + route decision when the page is valid.
+* atomically fence fetch/result/page-validity evidence, the pure fingerprint +
+  route decision, and the discovery plan/run terminal state.
 
 This is source classification only. It deliberately creates no enumeration
 coverage, parse attempt, job observation or generic HTML crawl.
@@ -36,7 +36,6 @@ from jobscraper.ids import new_id
 from jobscraper.pipeline.driver import (
     _persist_fetch_attempt,
     _record_evidence,
-    _update_run_counters,
     source_policy,
 )
 from jobscraper.runtime.claims import StaleOwnership, claim_next_request
@@ -49,12 +48,7 @@ from jobscraper.runtime.provisioning import (
     record_route_decision,
 )
 from jobscraper.runtime.requests import enqueue_request
-from jobscraper.runtime.runs import (
-    aggregate_run,
-    create_run,
-    mark_run_started,
-    set_group_outcome,
-)
+from jobscraper.runtime.runs import create_run, mark_run_started
 
 _DISCOVERY_ADAPTER_ID = "generic_discovery"
 _DISCOVERY_STRATEGY = "GENERIC_DISCOVERY"
@@ -328,6 +322,65 @@ def _plan_request(
     return plan_row, source, request_plan, envelope
 
 
+def _finalize_discovery_run_under_fence(
+    conn: sqlite3.Connection,
+    queued: QueuedDiscovery,
+    *,
+    has_fingerprint: bool,
+    now: str,
+) -> str:
+    """Persist the one-probe plan/run terminal state without committing.
+
+    The caller is the request ownership fence.  A discovery run is intentionally
+    one immutable plan plus one ``SOURCE_DISCOVERY`` request; if that shape has
+    changed, refuse the terminalization so the entire fenced transaction rolls
+    back rather than guessing an aggregate for unexpected work.
+
+    Keeping these writes inside the same transaction as the request terminal
+    transition closes the crash window where the request could be ``SUCCEEDED``
+    but its plan/run still be open and therefore no longer resumable.
+    """
+    shape = conn.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM run_source_plans WHERE run_id = ?) AS plans,
+          (SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?) AS requests,
+          (SELECT COUNT(*) FROM scrape_requests
+             WHERE run_id = ? AND request_type = 'SOURCE_DISCOVERY') AS discoveries
+        """,
+        (queued.run_id, queued.run_id, queued.run_id),
+    ).fetchone()
+    if shape is None or tuple(shape) != (1, 1, 1):
+        raise DiscoveryError("discovery run shape changed before fenced terminalization")
+
+    group_outcome = "SATISFIED" if has_fingerprint else "SATISFIED_PARTIAL"
+    run_status = "SUCCEEDED" if has_fingerprint else "PARTIAL"
+
+    plan_update = conn.execute(
+        "UPDATE run_source_plans SET group_outcome = ?"
+        " WHERE id = ? AND run_id = ? AND group_outcome IS NULL",
+        (group_outcome, queued.run_source_plan_id, queued.run_id),
+    )
+    if plan_update.rowcount != 1:
+        raise DiscoveryError("discovery plan could not be terminalized under fence")
+
+    run_update = conn.execute(
+        """
+        UPDATE scrape_runs
+        SET status = ?,
+            finished_at = COALESCE(finished_at, ?),
+            requests_total = (SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?),
+            requests_failed = (SELECT COUNT(*) FROM scrape_requests
+                               WHERE run_id = ? AND status = 'FAILED')
+        WHERE id = ? AND status = 'RUNNING'
+        """,
+        (run_status, now, queued.run_id, queued.run_id, queued.run_id),
+    )
+    if run_update.rowcount != 1:
+        raise DiscoveryError("discovery run could not be terminalized under fence")
+    return run_status
+
+
 def execute_source_discovery(
     conn: sqlite3.Connection,
     queued: QueuedDiscovery,
@@ -338,9 +391,9 @@ def execute_source_discovery(
     """Claim and execute one already-durable first probe.
 
     Network I/O occurs only after the request claim exists. All outputs that
-    assert what the probe saw — fetch attempt, result/page evidence, fingerprint
-    and route decision — commit under the same ownership fence. If ownership
-    is stale, none of those request-owned outputs are committed.
+    assert what the probe saw — fetch attempt, result/page evidence, fingerprint,
+    route decision and discovery plan/run terminal state — commit under the same
+    ownership fence. If ownership is stale, none of those outputs are committed.
     """
     claim_ts = now or db_utc_now(conn)
     mark_run_started(conn, queued.run_id, now=claim_ts)
@@ -445,6 +498,12 @@ def execute_source_discovery(
                 now=commit_ts,
                 commit=False,
             )
+        stored["run_status"] = _finalize_discovery_run_under_fence(
+            cursor_conn,
+            queued,
+            has_fingerprint=fingerprint is not None,
+            now=commit_ts,
+        )
 
     try:
         with fenced_commit(
@@ -458,12 +517,9 @@ def execute_source_discovery(
     except StaleOwnership as exc:
         raise DiscoveryError("discovery ownership was lost before evidence commit") from exc
 
-    group_outcome = "SATISFIED" if fingerprint is not None else "SATISFIED_PARTIAL"
-    set_group_outcome(conn, queued.run_source_plan_id, group_outcome, now=commit_ts)
-    _update_run_counters(conn, queued.run_id)
-    run_status = aggregate_run(conn, queued.run_id, now=commit_ts)
+    run_status = stored.get("run_status")
     if run_status is None:
-        raise DiscoveryError("discovery run remained open after its only request completed")
+        raise DiscoveryError("discovery fenced commit omitted terminal run state")
 
     return DiscoveryOutcome(
         queued=queued,
