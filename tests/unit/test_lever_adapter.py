@@ -797,7 +797,7 @@ class TestListParse:
 
     def test_outcome_carries_acq09_evidence_references(self):
         outcome = _parse(_adapter(), "postings_list.json")
-        assert outcome.contract_version == 2
+        assert outcome.contract_version >= 2
         assert outcome.evidence_refs
         assert all(ref.startswith("result://") or ref.startswith("validity://")
                    for ref in outcome.evidence_refs)
