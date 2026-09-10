@@ -1,6 +1,6 @@
 """Durable first-probe source discovery (02 §12.1 corrective).
 
-The authoritative acquisition spec forbids discovery as pre-queue I/O.  This
+The authoritative acquisition spec forbids discovery as pre-queue I/O. This
 module gives the first careers-page probe the same durable authority boundary
 as ordinary acquisition work without pulling ROAD-04 generic crawling into
 Slice 2:
@@ -10,10 +10,10 @@ Slice 2:
 * claim the request with the normal lease machinery;
 * plan through the manifest-validated discovery adapter and execute under the
   host-owned destination policy;
-* atomically fence the fetch/result/page-validity evidence together with the
-  pure fingerprint + route decision when the page is valid.
+* atomically fence fetch/result/page-validity evidence together with the pure
+  fingerprint + route decision when the page is valid.
 
-This is source classification only.  It deliberately creates no enumeration
+This is source classification only. It deliberately creates no enumeration
 coverage, parse attempt, job observation or generic HTML crawl.
 """
 
@@ -26,8 +26,7 @@ from typing import Any
 
 from jobscraper.acquisition.envelope import ExecutionPlanEnvelope, RequestPlan
 from jobscraper.acquisition.httpexec import execute_request
-from jobscraper.acquisition.pagevalidity import NORMAL_PARSE_CLASSES if False else PageClass
-from jobscraper.acquisition.pagevalidity import classify_page
+from jobscraper.acquisition.pagevalidity import PageClass, classify_page
 from jobscraper.acquisition.result import ResultEnvelope
 from jobscraper.adapters.contract import AdapterTask, AdapterTaskKind, PlanningContext
 from jobscraper.adapters.fingerprint import AtsFingerprint, classify_content
@@ -41,6 +40,7 @@ from jobscraper.pipeline.driver import (
     source_policy,
 )
 from jobscraper.runtime.claims import StaleOwnership, claim_next_request
+from jobscraper.runtime.clock import db_utc_now
 from jobscraper.runtime.fence import fenced_commit
 from jobscraper.runtime.provisioning import (
     ensure_builtin_adapter_definition,
@@ -59,7 +59,9 @@ from jobscraper.runtime.runs import (
 _DISCOVERY_ADAPTER_ID = "generic_discovery"
 _DISCOVERY_STRATEGY = "GENERIC_DISCOVERY"
 _DISCOVERY_EXECUTION_CLASS = "HTTP"
-_VALID_DISCOVERY_CLASSES = frozenset({PageClass.VALID_LIST, PageClass.VALID_JOB, PageClass.EMPTY})
+_VALID_DISCOVERY_CLASSES = frozenset(
+    {PageClass.VALID_LIST, PageClass.VALID_JOB, PageClass.EMPTY}
+)
 
 
 class DiscoveryError(RuntimeError):
@@ -120,7 +122,7 @@ def queue_source_discovery(
 
     A successful return is the §12.1 precondition for a network probe: Source,
     immutable binding revision, pinned run plan and SOURCE_DISCOVERY request are
-    already committed.  Invalid URLs/configuration fail during provisioning;
+    already committed. Invalid URLs/configuration fail during provisioning;
     this function never calls the network executor.
     """
     definition = ensure_builtin_adapter_definition(
@@ -255,16 +257,17 @@ def execute_source_discovery(
 ) -> DiscoveryOutcome:
     """Claim and execute one already-durable first probe.
 
-    Network I/O occurs only after the request claim exists.  All outputs that
+    Network I/O occurs only after the request claim exists. All outputs that
     assert what the probe saw — fetch attempt, result/page evidence, fingerprint
-    and route decision — commit under the same ownership fence.  If ownership
+    and route decision — commit under the same ownership fence. If ownership
     is stale, none of those request-owned outputs are committed.
     """
-    mark_run_started(conn, queued.run_id, now=now)
+    claim_ts = now or db_utc_now(conn)
+    mark_run_started(conn, queued.run_id, now=claim_ts)
     claim = claim_next_request(
         conn,
         worker_id,
-        now=now,
+        now=claim_ts,
         types=frozenset({"SOURCE_DISCOVERY"}),
         run_source_plan_id=queued.run_source_plan_id,
     )
@@ -276,6 +279,7 @@ def execute_source_discovery(
         envelope, source_policy(source, adapter_id=_DISCOVERY_ADAPTER_ID)
     )
     classification = classify_page(result, expect="LIST")
+    commit_ts = now or db_utc_now(conn)
 
     fingerprint: AtsFingerprint | None = None
     decision: RouteDecision | None = None
@@ -293,7 +297,9 @@ def execute_source_discovery(
     stored: dict[str, str] = {}
 
     def mutate(cursor_conn: sqlite3.Connection) -> None:
-        fetch_attempt_id = _persist_fetch_attempt(cursor_conn, envelope, result, now or claim.lease_until)
+        fetch_attempt_id = _persist_fetch_attempt(
+            cursor_conn, envelope, result, commit_ts
+        )
         stored["fetch_attempt_id"] = fetch_attempt_id
         _record_evidence(
             cursor_conn,
@@ -304,7 +310,7 @@ def execute_source_discovery(
             ref=result.body_ref,
             detail=result.as_evidence(),
             content_hash=result.normalized_content_hash,
-            now=now or claim.lease_until,
+            now=commit_ts,
         )
         if result.security_policy_result != "ALLOWED":
             _record_evidence(
@@ -319,7 +325,7 @@ def execute_source_discovery(
                     "requested_url": result.requested_url,
                 },
                 content_hash=None,
-                now=now or claim.lease_until,
+                now=commit_ts,
             )
         cursor_conn.execute(
             "UPDATE scrape_requests SET page_class = ?, last_failure_kind = ?,"
@@ -340,7 +346,7 @@ def execute_source_discovery(
             ref=f"validity://{classification.state.value}",
             detail=dict(classification.evidence),
             content_hash=result.normalized_content_hash,
-            now=now or claim.lease_until,
+            now=commit_ts,
         )
         if fingerprint is not None and decision is not None:
             stored["fingerprint_id"] = record_fingerprint(
@@ -348,7 +354,7 @@ def execute_source_discovery(
                 source_id=queued.source_id,
                 url=result.final_url or result.requested_url,
                 fingerprint=fingerprint,
-                now=now or claim.lease_until,
+                now=commit_ts,
                 commit=False,
             )
             stored["route_decision_id"] = record_route_decision(
@@ -356,7 +362,7 @@ def execute_source_discovery(
                 source_id=queued.source_id,
                 fingerprint=fingerprint,
                 decision=decision,
-                now=now or claim.lease_until,
+                now=commit_ts,
                 commit=False,
             )
 
@@ -365,7 +371,7 @@ def execute_source_discovery(
             conn,
             claim.request_id,
             claim.attempt_id,
-            now=now,
+            now=commit_ts,
             mutate=mutate,
         ):
             pass
@@ -373,9 +379,9 @@ def execute_source_discovery(
         raise DiscoveryError("discovery ownership was lost before evidence commit") from exc
 
     group_outcome = "SATISFIED" if fingerprint is not None else "SATISFIED_PARTIAL"
-    set_group_outcome(conn, queued.run_source_plan_id, group_outcome, now=now)
+    set_group_outcome(conn, queued.run_source_plan_id, group_outcome, now=commit_ts)
     _update_run_counters(conn, queued.run_id)
-    run_status = aggregate_run(conn, queued.run_id, now=now)
+    run_status = aggregate_run(conn, queued.run_id, now=commit_ts)
     if run_status is None:
         raise DiscoveryError("discovery run remained open after its only request completed")
 
