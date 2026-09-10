@@ -1,8 +1,9 @@
 """Slice 3 S3.0 schema gate — append-only v15 runtime foundation.
 
-The promoted Slice-2 schema ends at v14.  S3.0 may append exactly one runtime
-foundation migration and must not pre-create crawler/coverage/fallback schema
-owned by later S3 packages.
+The promoted Slice-2 schema ends at v14. S3.0 appends the first Slice-3
+runtime-foundation migration and must not pre-create crawler/coverage/fallback
+schema owned by later S3 packages. Later packages may append new versions but
+must never edit v15.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from jobscraper.version import SCHEMA_VERSION
 PROMOTED_SLICE2_SCHEMA_VERSION = 14
 NOW = "2026-09-10T15:00:00.000000Z"
 
-# Exact released bytes through the promoted Slice-2 candidate.  S3.0 must not
+# Exact released bytes through the promoted Slice-2 candidate. S3.0 must not
 # edit any of them; future Slice-3 packages append new versions instead.
 PROMOTED_STEP_SHA256 = {
     1: "a9d335d680150958aee9d8169034721c24d171696b42c6260052e5c62ba87550",
@@ -44,7 +45,7 @@ PROMOTED_STEP_SHA256 = {
     14: "eeffc8fe0178518b9b8129fe7739579f94084db3fe72c4389fbfab5146c0f18f",
 }
 
-# S3.0 freezes the first Slice-3 migration at package completion.  This digest
+# S3.0 freezes the first Slice-3 migration at package completion. This digest
 # is over schema_sql.MIGRATION_STEPS' stripped SQL text.
 S3_0_STEP_SHA256 = {
     15: "1848e82890da89863de913cee74a039485bf0939ba4536b607e2f94b58a902bc",
@@ -66,10 +67,11 @@ def test_promoted_v1_through_v14_bytes_are_untouched():
         assert _digest(sql) == pinned, f"promoted migration {version} was edited"
 
 
-def test_s30_appends_exactly_v15_and_pins_its_bytes():
+def test_s30_v15_is_sequential_and_pinned():
     versions = [version for version, _name, _sql in MIGRATION_STEPS]
-    assert versions == list(range(1, 16))
-    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 15
+    assert versions == list(range(1, max(versions) + 1))
+    assert 15 in versions
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == max(versions)
     name, sql = _step(15)
     assert name == "s3_0_runtime_foundation"
     assert _digest(sql) == S3_0_STEP_SHA256[15]
@@ -160,7 +162,10 @@ def test_v15_service_epoch_is_durable_and_request_attempts_reference_it(tmp_path
     }
     assert "service_epoch_id" in columns
     fks = db.conn.execute("PRAGMA foreign_key_list(request_attempts)").fetchall()
-    assert any(row[2] == "service_clock_epochs" and row[3] == "service_epoch_id" for row in fks)
+    assert any(
+        row[2] == "service_clock_epochs" and row[3] == "service_epoch_id"
+        for row in fks
+    )
     db.close()
 
 
