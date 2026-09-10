@@ -605,7 +605,7 @@ class AshbyAdapter:
         return self._parse_board(payload, result)
 
     def _parse_probe(self, result: ValidatedResult) -> ParseOutcome:
-        """HEALTH/SMOKE: recognize the board shape, never emit observations."""
+        """HEALTH/SMOKE: recognize board shape and contract version only."""
         payload, error = _json_object(result.envelope.body)
         jobs = payload.get("jobs") if payload is not None else None
         if payload is None or not isinstance(jobs, list):
@@ -614,6 +614,19 @@ class AshbyAdapter:
                 FailureKind.PARSE_MARKER_MISSING,
                 error or "health probe did not find a 'jobs' array",
             )
+
+        if not _is_recognized_version(payload.get("apiVersion")):
+            return ParseOutcome(
+                kind=ParseOutcomeKind.PARTIAL,
+                review_evidence=(
+                    {
+                        "reason": "UNRECOGNIZED_API_VERSION",
+                        "api_version": _api_version(payload.get("apiVersion")),
+                    },
+                ),
+                evidence_refs=_evidence_refs(result),
+            )
+
         return ParseOutcome(
             kind=ParseOutcomeKind.SUCCESS_EMPTY,
             # The probe is recognition-only, but every number it records must

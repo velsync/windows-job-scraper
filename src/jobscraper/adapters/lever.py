@@ -714,7 +714,14 @@ class LeverAdapter:
         return self._parse_detail(payload, result, task)
 
     def _parse_probe(self, result: ValidatedResult) -> ParseOutcome:
-        """HEALTH/SMOKE: recognize the postings shape, never emit observations."""
+        """HEALTH/SMOKE: recognize the minimum postings contract, no extraction.
+
+        A top-level array is necessary but not sufficient evidence that the
+        provider parser still recognizes the response.  For non-empty arrays
+        the probe checks the same two required membership fields used by
+        enumeration — source-native ``id`` and non-empty ``text`` — without
+        extracting observations or proposing child work.
+        """
         payload, error = _json_payload(result.envelope.body)
         if error is not None or not isinstance(payload, list):
             return self._failure(
@@ -722,11 +729,38 @@ class LeverAdapter:
                 FailureKind.PARSE_MARKER_MISSING,
                 error or "health probe did not find a postings array",
             )
-        return ParseOutcome(
-            kind=ParseOutcomeKind.SUCCESS_EMPTY,
-            review_evidence=(
-                {"reason": "HEALTH_PROBE_RECOGNIZED", "listed_postings": len(payload)},
+
+        recognized = 0
+        for item in payload:
+            if (
+                isinstance(item, Mapping)
+                and _posting_id(item.get("id")) is not None
+                and _text(item.get("text")) is not None
+            ):
+                recognized += 1
+        rejected = len(payload) - recognized
+        summary = {
+            "reason": (
+                "HEALTH_PROBE_PARTIAL_RECOGNITION"
+                if rejected
+                else "HEALTH_PROBE_RECOGNIZED"
             ),
+            "listed_postings": len(payload),
+            "recognized_postings": recognized,
+            "rejected_postings": rejected,
+        }
+
+        if payload and recognized == 0:
+            return self._failure(
+                result,
+                FailureKind.PARSE_MARKER_MISSING,
+                f"all {len(payload)} health-probe postings failed required-field validation",
+                review=(summary,),
+            )
+
+        return ParseOutcome(
+            kind=(ParseOutcomeKind.PARTIAL if rejected else ParseOutcomeKind.SUCCESS_EMPTY),
+            review_evidence=(summary,),
             evidence_refs=_evidence_refs(result),
         )
 
