@@ -27,8 +27,13 @@ This repository is the authoritative implementation workspace for Windows Job Sc
    - later F5–F7 corrective commits on the reconciled Slice-2 lineage, culminating in behavior-bearing head `62915d637cd116bc9157dddc53f5039ebed9d752`.
 7. Final Slice 2 packaged/native promotion authority:
    - `docs/reviews/slice-2-native-promotion-closure-2026-09-10.md`
+8. Slice 3 planning/corrective authority (implementation not yet started by these documents):
+   - `docs/plans/slice-3-worker-implementation-plan-v0313.md`
+   - `docs/plans/slice-3-windows-acceptance-strategy-v0313.md`
+   - `docs/reviews/slice-3-planning-corrective-review-r2-2026-09-10.md` (**controlling corrective record**)
+   - `docs/reviews/slice-3-planning-audit-2026-09-10.md` (historical first planning audit; superseded by R2 where they differ)
 
-Later authority controls where an earlier plan/status note conflicts with an explicit corrective or promotion record. In particular, old Slice-2 records that say a later S2.x package is blocked, has not started, or packaged/native promotion is pending are historical snapshots, not current execution authority. Do not rewrite sealed historical review records to erase those earlier states; update living authority documents instead.
+Later authority controls where an earlier plan/status note conflicts with an explicit corrective or promotion record. In particular, old Slice-2 records that say a later S2.x package is blocked, has not started, or packaged/native promotion is pending are historical snapshots, not current execution authority. For Slice 3 planning, the R2 corrective review controls where it changes or narrows the base worker plan, Windows acceptance strategy, or first planning audit. Do not rewrite sealed historical review records to erase earlier states; update living authority documents or add a later controlling corrective record instead.
 
 Do not redesign the architecture unless a genuine contradiction or implementation blocker is proven and explicitly adjudicated by the architecture reviewer.
 
@@ -45,13 +50,15 @@ Do not redesign the architecture unless a genuine contradiction or implementatio
 - Slice-2 native result: W0 18/18 PASS + W1 7/7 PASS + W2 6/6 PASS = **31/31 PASS**, zero FAIL, zero NOT_RUN.
 - GitHub Actions run `34474624862` at the exact frozen candidate passed on Ubuntu and Windows. Ubuntu: 1331 passed / 5 skipped. Windows: 1336 passed, dependency consistency clean, pywin32 primitives importable, Chromium installation PASS, inert browser smoke PASS.
 - The controlling promotion decision is `docs/reviews/slice-2-native-promotion-closure-2026-09-10.md`.
-- **Slice 3 has not been started or authorized. Do not begin Slice 3 unless it is explicitly approved in a later instruction.**
+- Slice 3 planning is complete as **14 bounded packages (S3.0–S3.13)** with an intermediate N3-A checkpoint after S3.4 and final W3 packaged/native acceptance after S3.13. The R2 planning corrective review above is controlling for the corrected handoff details.
+- **Slice 3 implementation has not been started or authorized by the planning documents themselves. Do not begin S3.0 or any later Slice-3 package without explicit user authorization.**
 - Do not import, cherry-pick, or count divergent experimental-branch future-slice code as accepted implementation authority unless it is explicitly reviewed and reconciled.
 
 ## Worker boundary
 
 - Implement or correct one explicitly approved bounded work package at a time.
 - Read the owning v0.3.1.3 normative module(s) and the applicable slice plan/status/corrective/promotion record before editing.
+- For Slice 3, read `docs/reviews/slice-3-planning-corrective-review-r2-2026-09-10.md` together with the base Slice-3 worker plan and Windows acceptance strategy; the R2 review controls on conflict.
 - Use tests first for behavior-bearing code.
 - Do not begin a later slice/package without explicit review/authorization.
 - Do not make unrelated cleanup/refactors.
