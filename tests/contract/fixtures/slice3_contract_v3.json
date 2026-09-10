@@ -1,0 +1,61 @@
+{
+  "contract_version": 3,
+  "task_kinds": ["HEALTH", "DISCOVER", "ENUMERATE", "CRAWL", "DETAIL", "SMOKE"],
+  "planning_context": {
+    "contract_version": 3,
+    "run_id": "run-s3",
+    "run_source_plan_id": "rsp-s3",
+    "source_snapshot_ref": "snapshot://source/s3",
+    "binding_revision_id": "bndrev-s3",
+    "permission_profile_revision": 4,
+    "policy_snapshot_ref": "snapshot://policy/s3",
+    "query_revision_ref": "queryrev://s3",
+    "budget_snapshot_ref": "budget://s3",
+    "cursor_schema_version": 2
+  },
+  "parse_context": {
+    "contract_version": 3,
+    "request_id": "req-s3",
+    "attempt_id": "att-s3",
+    "run_source_plan_id": "rsp-s3",
+    "parser_version": "3.0.0",
+    "recipe_version_id": null,
+    "normalization_contract_version": "norm-v1",
+    "normalization_version": "norm-v1",
+    "idempotency_namespace": "req-s3"
+  },
+  "discovered_task": {
+    "kind": "DETAIL",
+    "logical_key": "job-42",
+    "target_reference": "https://jobs.example.test/jobs/42",
+    "priority": 10,
+    "depth": 1,
+    "parent_reference": "observation://obs-42"
+  },
+  "coverage_proposal": {
+    "scope_key": "full",
+    "generation_key": "generation-s3",
+    "coverage_authority": "AUTHORITATIVE_FULL_SOURCE"
+  },
+  "terminal_no_work": {
+    "kind": "SUCCESS_EMPTY",
+    "continuation_required": false
+  },
+  "partial": {
+    "kind": "PARTIAL",
+    "continuation_required": true
+  },
+  "closure_or_missing_evidence": [
+    {
+      "kind": "JOB_CLOSED",
+      "source_job_id": "42",
+      "evidence_ref": "result://att-s3/body/deadbeef"
+    },
+    {
+      "kind": "NOT_FOUND",
+      "source_job_id": "43",
+      "evidence_ref": "result://att-s3/body/feedface"
+    }
+  ],
+  "host_native_request_types": ["NORMALIZE", "RECONCILE", "ENRICH", "ELIGIBILITY", "SCORE", "EXPORT"]
+}
