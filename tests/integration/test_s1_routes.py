@@ -77,6 +77,11 @@ def service(tmp_path, feed_server):
     secret = load_or_create_install_secret(paths)
     db = Database(paths.database_file)
     migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
+    # service lifetime: open the epoch before any claiming (03 §50); the
+    # production runner does this in run_service before restart recovery
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(db.conn)
     port = feed_server.server_address[1]
     feed_config = json.dumps(
         {

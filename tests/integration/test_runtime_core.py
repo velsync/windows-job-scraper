@@ -113,6 +113,11 @@ def db(tmp_path):
     database = Database(tmp_path / "runtime.db")
     migrate_schema(database.conn, LATEST_SCHEMA_VERSION)
     _family(database)
+    # Model the service lifetime: the coordinator opens its service epoch
+    # before any claiming (03 §50; claims fail closed without one).
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(database.conn)
     yield database
     database.close()
 
@@ -247,9 +252,12 @@ def test_claim_skips_cancelled_runs_quarantined_bindings_and_disabled_sources(db
     assert claim is not None and claim.request_id == rid2
 
     # quarantined binding blocks new claims
+    from jobscraper.runtime.clock import begin_service_epoch
+
     db2 = Database(tmp_path / "q.db")
     migrate_schema(db2.conn, LATEST_SCHEMA_VERSION)
     _family(db2, binding_admin_state="QUARANTINED")
+    begin_service_epoch(db2.conn, now=NOW)
     run2, plans2 = create_run(db2.conn, profile_id=None, plans=[_plan()], now=NOW)
     enqueue_request(
         db2.conn, run_id=run2, run_source_plan_id=plans2[0], source_id="src-1",

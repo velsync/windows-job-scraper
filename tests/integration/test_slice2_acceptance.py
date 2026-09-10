@@ -433,6 +433,11 @@ def db(tmp_path, server):
     database = Database(tmp_path / "slice2-acceptance.db")
     migrate_schema(database.conn, LATEST_SCHEMA_VERSION)
     provision_search(database.conn, now=NOW)
+    # Model the service lifetime: the coordinator opens its service epoch
+    # before any claiming (03 §50; claims fail closed without one).
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(database.conn)
     yield database
     database.close()
 
@@ -1318,6 +1323,10 @@ def test_search_capability_is_reported_truthfully_in_both_modes(
     fallback_db = Database(tmp_path / "slice2-acceptance-substring.db")
     try:
         migrate_schema(fallback_db.conn, LATEST_SCHEMA_VERSION)
+        # service lifetime: open the epoch before any claiming (03 §50)
+        from jobscraper.runtime.clock import begin_service_epoch
+
+        begin_service_epoch(fallback_db.conn, now=NOW)
         provisioned = provision_search(fallback_db.conn, now=NOW)
         assert provisioned["mode"] == SEARCH_MODE_SUBSTRING
         assert provisioned["fts5_detected"] is False

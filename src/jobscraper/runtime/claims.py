@@ -2,10 +2,23 @@
 
 Single-winner claims via ``BEGIN IMMEDIATE``; a claim mints a fresh
 attempt identity, binds it to the current service epoch, and opens a
-lease. An expired lease is *already lost ownership* even if the reclaimer
-has not yet executed — a worker MUST NOT revive it (heartbeat/commit refuse
-stale tokens). Reclaim records the prior attempt as ABANDONED and requeues
-within the attempt budget; budget exhaustion is terminal failure.
+lease. New claims fail closed when no service epoch is open
+(:class:`NoActiveServiceEpoch`): every newly created attempt carries a
+non-NULL ``service_epoch_id`` (nullable storage remains only for
+historical/pre-S3.1 rows, which heartbeat/ownership never treat as valid
+current ownership). An expired lease is *already lost ownership* even if
+the reclaimer has not yet executed — a worker MUST NOT revive it
+(heartbeat/commit refuse stale tokens). Reclaim records the prior attempt
+as ABANDONED and requeues within the attempt budget; budget exhaustion is
+terminal failure.
+
+Claim selection is fully evaluated in the selection query: an eligible
+request can never be hidden behind blocked/cancelled/disabled/quarantined
+or not-yet-due rows, and ``RETRY_WAIT`` is claimable only with a valid
+durable ``next_retry_at`` that is due (NULL/empty retry timestamps fail
+closed rather than meaning "immediately runnable"). Deterministic order
+(priority DESC, created_at ASC, id ASC) and atomic single-winner
+transition are preserved.
 
 Claim/heartbeat authorization is task-class aware (R2-F3):
 
@@ -22,9 +35,10 @@ Claim/heartbeat authorization is task-class aware (R2-F3):
 Wall-clock anomalies (§50) are handled through service epochs: when the
 clock guard rotates the epoch, claim/heartbeat reject stale-epoch ownership
 and :func:`reclaim_orphaned_epoch_work` abandons/requeues the invalidated
-epoch's RUNNING work regardless of lease deadline. Claim and heartbeat
-transactions run against the database only — no network/browser/file I/O
-while holding them (§50).
+epoch's RUNNING work regardless of lease deadline — but it refuses to
+reclaim the current live epoch. Claim and heartbeat transactions run
+against the database only — no network/browser/file I/O while holding
+them (§50).
 """
 
 from __future__ import annotations
@@ -34,13 +48,17 @@ from dataclasses import dataclass
 
 from jobscraper.ids import new_id
 from jobscraper.runtime.clock import (
+    NoActiveServiceEpoch,
     ServiceClockGuard,
     ServiceEpoch,
     StaleServiceEpoch,
     current_service_epoch,
     db_utc_now,
 )
-from jobscraper.runtime.requests import ACQUISITION_REQUEST_TYPES
+from jobscraper.runtime.requests import (
+    ACQUISITION_REQUEST_TYPES,
+    HOST_NATIVE_REQUEST_TYPES,
+)
 
 DEFAULT_LEASE_WINDOW_S = 120.0
 RETRY_BACKOFF_BASE_S = 5.0
@@ -75,65 +93,85 @@ class Claim:
     strategy: str | None
     execution_class: str | None
     lease_until: str
-    service_epoch_id: str | None = None
+    service_epoch_id: str = ""  # new claims are always epoch-bound (§50)
 
 
-_ELIGIBLE_SQL = """
-    SELECT req.id FROM scrape_requests req
-    JOIN scrape_runs run ON run.id = req.run_id
-    JOIN sources s ON s.id = req.source_id
-    JOIN source_adapter_bindings b ON b.id = req.binding_id
-    WHERE req.status = 'PENDING'
-       OR (req.status = 'RETRY_WAIT' AND req.next_retry_at <= :now)
-    ORDER BY req.priority DESC, req.created_at ASC, req.id ASC
-    LIMIT 50
-"""
-
-
-def _claimable(row: sqlite3.Row, now: str) -> bool:
-    status = row["status"]
-    if status == "PENDING":
-        due = True
-    elif status == "RETRY_WAIT":
-        due = (row["next_retry_at"] or "") <= now  # due only after durable retry time
-    else:
-        due = False
-    if not due:
-        return False
-    if row["request_type"] in ACQUISITION_REQUEST_TYPES:
-        # Acquisition requests require current authority (RUN-02 rule 9):
-        # durable cancellation stops new source-network claims (§18), and a
-        # disabled/quarantined source or binding is not claimable.
-        if row["cancel_requested_at"] is not None:
-            return False
-        if row["s_desired"] != "ENABLED" or row["s_admin"] != "NORMAL":
-            return False
-        if row["b_desired"] != "ENABLED" or row["b_admin"] != "NORMAL":
-            return False
-    # Host-native requests are local evidence-processing obligations: they
-    # never gain source-network authority from being claimable, so the
-    # source-network predicate above must not strand them (R2-F3, §18).
-    return True
-
-
-def _open_epoch_or_stale_check(
+def _resolve_binding_epoch(
     conn: sqlite3.Connection, epoch: ServiceEpoch | None
-) -> ServiceEpoch | None:
-    """Resolve the epoch to bind attempts to inside the claim transaction.
+) -> ServiceEpoch:
+    """Resolve the active service epoch inside the claim transaction.
 
-    With no explicit epoch the current open epoch is used (``None`` before
-    any epoch exists, keeping pre-epoch databases claimable). An explicit
-    epoch must still be the current one, otherwise it is stale.
+    New claims fail closed without an open epoch (:class:`NoActiveServiceEpoch`):
+    attempts must always be bound to the lifetime that minted them. An
+    explicit epoch must still be the current one, otherwise it is stale.
     """
     current = current_service_epoch(conn)
-    if epoch is None:
-        return current
-    if current is None or current.epoch_id != epoch.epoch_id:
+    if current is None:
+        raise NoActiveServiceEpoch(
+            "claim refused: no active service epoch (begin_service_epoch must"
+            " run before claiming; §50)"
+        )
+    if epoch is not None and current.epoch_id != epoch.epoch_id:
         raise StaleServiceEpoch(
             f"service epoch {epoch.epoch_id} is not the current service epoch",
             epoch_id=epoch.epoch_id,
         )
     return current
+
+
+def _claim_selection_sql(
+    types: frozenset[str] | None, run_source_plan_id: str | None
+) -> tuple[str, list]:
+    """Deterministic claimable-request selection, fully evaluated in SQL.
+
+    Eligibility lives in the query itself (never in a bounded post-filter
+    window), so an eligible request cannot be starved by any number of
+    blocked/cancelled/disabled/quarantined or not-yet-due rows ahead of it.
+    """
+    acq_ph = ", ".join("?" for _ in sorted(ACQUISITION_REQUEST_TYPES))
+    native_ph = ", ".join("?" for _ in sorted(HOST_NATIVE_REQUEST_TYPES))
+    sql = f"""
+        SELECT req.id
+        FROM scrape_requests req
+        JOIN scrape_runs run ON run.id = req.run_id
+        JOIN sources s ON s.id = req.source_id
+        JOIN source_adapter_bindings b ON b.id = req.binding_id
+        WHERE req.status IN ('PENDING', 'RETRY_WAIT')
+          AND (
+                req.status = 'PENDING'
+                OR (
+                     req.next_retry_at IS NOT NULL
+                     AND req.next_retry_at <> ''
+                     AND req.next_retry_at <= ?
+                   )
+              )
+          AND (
+                req.request_type IN ({native_ph})
+                OR (
+                     req.request_type IN ({acq_ph})
+                     AND run.cancel_requested_at IS NULL
+                     AND s.desired_state = 'ENABLED'
+                     AND s.administrative_state = 'NORMAL'
+                     AND b.desired_state = 'ENABLED'
+                     AND b.administrative_state = 'NORMAL'
+                   )
+              )
+    """
+    params: list = [None]  # retry-due timestamp bound below
+    params.extend(sorted(HOST_NATIVE_REQUEST_TYPES))
+    params.extend(sorted(ACQUISITION_REQUEST_TYPES))
+    if types:
+        sql += (
+            " AND req.request_type IN ("
+            + ", ".join("?" for _ in sorted(types))
+            + ")"
+        )
+        params.extend(sorted(types))
+    if run_source_plan_id:
+        sql += " AND req.run_source_plan_id = ?"
+        params.append(run_source_plan_id)
+    sql += " ORDER BY req.priority DESC, req.created_at ASC, req.id ASC LIMIT 1"
+    return sql, params
 
 
 def claim_next_request(
@@ -169,39 +207,12 @@ def claim_next_request(
             )
             raise ClaimsHalted(f"new claims halted{detail} (§50)")
     attempt_id = new_id("att")
+    selection_sql, selection_params = _claim_selection_sql(types, run_source_plan_id)
+    selection_params[0] = ts  # RETRY_WAIT due comparison uses DB time (RUN-20)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        bound_epoch = _open_epoch_or_stale_check(conn, epoch)
-        type_filter = ""
-        params: list = []
-        if types:
-            type_filter = (
-                " AND req.request_type IN ("
-                + ", ".join("?" for _ in sorted(types))
-                + ")"
-            )
-            params.extend(sorted(types))
-        if run_source_plan_id:
-            type_filter += " AND req.run_source_plan_id = ?"
-            params.append(run_source_plan_id)
-        candidates = conn.execute(
-            """
-            SELECT req.id, req.status, req.next_retry_at, req.request_type,
-                   run.cancel_requested_at,
-                   s.desired_state AS s_desired, s.administrative_state AS s_admin,
-                   b.desired_state AS b_desired, b.administrative_state AS b_admin
-            FROM scrape_requests req
-            JOIN scrape_runs run ON run.id = req.run_id
-            JOIN sources s ON s.id = req.source_id
-            JOIN source_adapter_bindings b ON b.id = req.binding_id
-            WHERE req.status IN ('PENDING', 'RETRY_WAIT')
-            """ + type_filter + """
-            ORDER BY req.priority DESC, req.created_at ASC, req.id ASC
-            LIMIT 100
-            """,
-            params,
-        ).fetchall()
-        chosen = next((row for row in candidates if _claimable(row, ts)), None)
+        bound_epoch = _resolve_binding_epoch(conn, epoch)
+        chosen = conn.execute(selection_sql, selection_params).fetchone()
         if chosen is None:
             conn.execute("COMMIT")
             return None
@@ -233,7 +244,7 @@ def claim_next_request(
                 worker_id,
                 ts,
                 lease_until,
-                bound_epoch.epoch_id if bound_epoch is not None else None,
+                bound_epoch.epoch_id,
                 ts,
             ),
         )
@@ -256,7 +267,7 @@ def claim_next_request(
         strategy=row["strategy"],
         execution_class=row["execution_class"],
         lease_until=lease_until,
-        service_epoch_id=bound_epoch.epoch_id if bound_epoch is not None else None,
+        service_epoch_id=bound_epoch.epoch_id,
     )
 
 
@@ -272,11 +283,12 @@ def heartbeat(
     """Renew the lease; refused for stale tokens, expired leases or stale epochs.
 
     Accepted only when the request is RUNNING under this exact attempt, the
-    lease is unexpired by database time, the attempt's service epoch is
-    still current, and — for acquisition work — the run is not cancelled
-    and current source/binding authority still holds (RUN-02 rule 9, §18).
-    Host-native heartbeats are independent of the source-network predicate
-    (R2-F3): accepted local obligations keep draining.
+    lease is unexpired by database time, an active service epoch is open and
+    the attempt is bound to it (historical NULL-epoch attempts are never
+    valid current ownership), and — for acquisition work — the run is not
+    cancelled and current source/binding authority still holds (RUN-02 rule
+    9, §18). Host-native heartbeats are independent of the source-network
+    predicate (R2-F3): accepted local obligations keep draining.
     """
     ts = now or db_utc_now(conn)
     if epoch is not None:
@@ -299,6 +311,11 @@ def heartbeat(
             request_row["request_type"] in ACQUISITION_REQUEST_TYPES
         )
         current_epoch = current_service_epoch(conn)
+        if current_epoch is None:
+            # Fail closed: with no active service epoch there is no current
+            # ownership to renew (§50); historical attempts are not revived.
+            conn.execute("ROLLBACK")
+            raise StaleOwnership(request_id, "no active service epoch")
         sql = (
             """
             UPDATE scrape_requests
@@ -308,7 +325,7 @@ def heartbeat(
               AND EXISTS (
                   SELECT 1 FROM request_attempts a
                   WHERE a.attempt_id = scrape_requests.current_attempt_id
-                    AND (a.service_epoch_id IS NULL OR a.service_epoch_id = ?))
+                    AND a.service_epoch_id = ?)
             """
         )
         params: list = [
@@ -318,7 +335,7 @@ def heartbeat(
             request_id,
             attempt_id,
             ts,
-            current_epoch.epoch_id if current_epoch is not None else "",
+            current_epoch.epoch_id,
         ]
         if is_acquisition:
             # Live authorization checkpoint for source-network work (§18,
@@ -386,7 +403,9 @@ def _heartbeat_denial(
     ).fetchone()
     bound_epoch = att["service_epoch_id"] if att is not None else None
     current_id = current_epoch.epoch_id if current_epoch is not None else None
-    if bound_epoch is not None and bound_epoch != current_id:
+    if bound_epoch != current_id:
+        # Includes historical NULL-bound attempts: never valid current
+        # ownership once an epoch discipline exists (§50).
         return StaleOwnership(
             request_id, "service epoch advanced; attempt ownership invalidated"
         )
@@ -479,7 +498,18 @@ def reclaim_orphaned_epoch_work(
     extended. Prior attempts are recorded ABANDONED (``CLOCK_ANOMALY``);
     requests requeue within the attempt budget and fail terminally once it
     is exhausted.
+
+    The current live/open epoch can never be reclaimed this way — its
+    attempts may still have live owners, and abandoning them would bypass
+    the lease contract. Only ended/invalidated non-current epochs are
+    accepted; the live epoch is refused with :class:`ValueError`.
     """
+    current = current_service_epoch(conn)
+    if current is not None and current.epoch_id == epoch_id:
+        raise ValueError(
+            f"refusing to reclaim the current live service epoch {epoch_id}:"
+            " only ended/invalidated epochs may be reclaimed (§50)"
+        )
     ts = now or db_utc_now(conn)
     orphans = conn.execute(
         """

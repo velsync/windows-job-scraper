@@ -156,6 +156,10 @@ def _database(path):
         """
     )
     db.conn.commit()
+    # service lifetime: open the epoch before any claiming (03 §50)
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(db.conn, now=NOW)
     return db
 
 

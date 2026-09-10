@@ -44,6 +44,7 @@ from jobscraper.runtime.claims import (
 )
 from jobscraper.runtime.clock import (
     ClockAnomaly,
+    NoActiveServiceEpoch,
     ServiceClockGuard,
     ServiceEpoch,
     StaleServiceEpoch,
@@ -194,16 +195,54 @@ def test_claim_binds_fresh_attempt_to_current_service_epoch(db):
     assert att["service_epoch_id"] == epoch.epoch_id
 
 
-def test_claim_without_open_epoch_remains_unbound_backcompat(db):
+def test_claim_fails_closed_without_active_service_epoch(db):
+    # S3.1 corrective: new claims must always bind to an active service
+    # epoch; a database with no open epoch refuses claims outright. The
+    # nullable service_epoch_id remains only for historical/pre-S3.1 rows.
     _run_id, _plan_id, rid = _enqueue(db)
-    claim = claim_next_request(db.conn, "worker-1", now=NOW)
-    assert claim is not None and claim.request_id == rid
-    assert claim.service_epoch_id is None
-    att = db.conn.execute(
-        "SELECT service_epoch_id FROM request_attempts WHERE attempt_id = ?",
-        (claim.attempt_id,),
+    with pytest.raises(NoActiveServiceEpoch):
+        claim_next_request(db.conn, "worker-1", now=NOW)
+    row = db.conn.execute(
+        "SELECT status, current_attempt_id FROM scrape_requests WHERE id = ?",
+        (rid,),
     ).fetchone()
-    assert att["service_epoch_id"] is None
+    assert row["status"] == "PENDING" and row["current_attempt_id"] is None
+    assert db.conn.execute("SELECT COUNT(*) FROM request_attempts").fetchone()[0] == 0
+    # opening the epoch makes the same claim succeed, epoch-bound
+    epoch = begin_service_epoch(db.conn, now=NOW)
+    claim = claim_next_request(db.conn, "worker-1", now=NOW)
+    assert claim is not None and claim.service_epoch_id == epoch.epoch_id
+
+
+def test_null_epoch_attempt_is_not_valid_ownership(db):
+    # Historical/pre-S3.1 attempts carry service_epoch_id NULL. They must
+    # not be treated as valid new ownership: heartbeat refuses them whether
+    # or not an epoch is currently open.
+    _run_id, _plan_id, rid = _enqueue(db)
+    db.conn.execute(
+        "UPDATE scrape_requests SET status = 'RUNNING', current_worker_id = 'old',"
+        " current_attempt_id = 'att-hist', attempt_count = 1, lease_until = ?,"
+        " heartbeat_at = ?, started_at = ? WHERE id = ?",
+        (FUTURE, NOW, NOW, rid),
+    )
+    db.conn.execute(
+        "INSERT INTO request_attempts (attempt_id, request_id, worker_id,"
+        " started_at, lease_expires_at, created_at)"
+        " VALUES ('att-hist', ?, 'old', ?, ?, ?)",
+        (rid, NOW, FUTURE, NOW),
+    )
+    db.conn.commit()
+    # no open epoch: fail closed
+    with pytest.raises(StaleOwnership):
+        heartbeat(db.conn, rid, "att-hist", now=T1)
+    # with an open epoch: the NULL-bound attempt is still not valid ownership
+    epoch = begin_service_epoch(db.conn, now=T1)
+    with pytest.raises(StaleOwnership):
+        heartbeat(db.conn, rid, "att-hist", now=T1, epoch=epoch)
+    row = db.conn.execute(
+        "SELECT current_attempt_id FROM scrape_requests WHERE id = ?", (rid,)
+    ).fetchone()
+    assert row["current_attempt_id"] == "att-hist"  # nothing revived
 
 
 def test_claim_auto_binds_to_open_epoch_without_explicit_argument(db):
@@ -535,6 +574,7 @@ def test_restart_recovery_rotates_epoch_and_reclaims_outstanding_running(db):
 
 
 def test_host_native_claims_are_not_stranded_by_administrative_revocation(db):
+    epoch = begin_service_epoch(db.conn, now=NOW)
     _run_id, _plan_id, rid_acq = _enqueue(db, request_type="LIST_FETCH")
     _r2, _p2, rid_local = _enqueue(db, request_type="ELIGIBILITY", target="obs-1")
     # source/binding lose current authority AFTER accepted evidence exists
@@ -564,11 +604,12 @@ def test_host_native_claims_are_not_stranded_by_administrative_revocation(db):
         " WHERE id = 'bnd-1'"
     )
     db.conn.commit()
-    claim2 = claim_next_request(db.conn, "worker-1", now=NOW)
+    claim2 = claim_next_request(db.conn, "worker-1", now=NOW, epoch=epoch)
     assert claim2 is not None and claim2.request_id == rid_acq
 
 
 def test_host_native_heartbeat_survives_run_cancellation(db):
+    begin_service_epoch(db.conn, now=NOW)
     run_id, _plan_id, rid = _enqueue(db, request_type="NORMALIZE", target="obs-1")
     claim = claim_next_request(db.conn, "worker-1", now=NOW)
     assert claim.request_id == rid
@@ -580,6 +621,7 @@ def test_host_native_heartbeat_survives_run_cancellation(db):
 
 
 def test_host_native_heartbeat_survives_source_disable(db):
+    begin_service_epoch(db.conn, now=NOW)
     _run_id, _plan_id, rid = _enqueue(db, request_type="SCORE", target="obs-1")
     claim = claim_next_request(db.conn, "worker-1", now=NOW)
     assert claim.request_id == rid
@@ -590,6 +632,7 @@ def test_host_native_heartbeat_survives_source_disable(db):
 
 
 def test_acquisition_heartbeat_denied_after_binding_quarantine(db):
+    begin_service_epoch(db.conn, now=NOW)
     _run_id, _plan_id, rid = _enqueue(db, request_type="LIST_FETCH")
     claim = claim_next_request(db.conn, "worker-1", now=NOW)
     db.conn.execute(
@@ -604,6 +647,7 @@ def test_acquisition_heartbeat_denied_after_binding_quarantine(db):
 
 
 def test_acquisition_heartbeat_denied_after_cancellation(db):
+    begin_service_epoch(db.conn, now=NOW)
     run_id, _plan_id, rid = _enqueue(db, request_type="LIST_FETCH")
     claim = claim_next_request(db.conn, "worker-1", now=NOW)
     request_run_cancellation(db.conn, run_id, now=T1)
@@ -687,4 +731,193 @@ def test_claim_and_heartbeat_transactions_perform_no_network_or_file_io(
     )
     db.conn.commit()
     reclaim_expired(db.conn, now=T2)
+    begin_service_epoch(db.conn, now=T2)  # end the epoch before reclaiming it
     reclaim_orphaned_epoch_work(db.conn, epoch.epoch_id, now=T2)
+
+
+# ------------------------------- S3.1 corrective: claim starvation (issue 2)
+
+
+def test_eligible_request_beyond_a_blocked_window_is_not_starved(db):
+    begin_service_epoch(db.conn, now=NOW)
+    run_id, plans = create_run(db.conn, profile_id=None, plans=[_plan()], now=NOW)
+    # 120 acquisition requests ahead in deterministic order, all blocked by a
+    # quarantine that lands after enqueue
+    for i in range(120):
+        enqueue_request(
+            db.conn, run_id=run_id, run_source_plan_id=plans[0], source_id="src-1",
+            binding_id="bnd-1", request_type="LIST_FETCH",
+            target_identity=f"https://example.test/feed?page={i}",
+            logical_key=f"page={i}",
+        )
+    db.conn.execute(
+        "UPDATE source_adapter_bindings SET administrative_state = 'QUARANTINED'"
+        " WHERE id = 'bnd-1'"
+    )
+    db.conn.commit()
+    # one eligible host-native obligation enqueued LAST (row 121)
+    rid_local, _created = enqueue_request(
+        db.conn, run_id=run_id, run_source_plan_id=plans[0], source_id="src-1",
+        binding_id="bnd-1", request_type="ELIGIBILITY", target_identity="obs-1",
+    )
+    claim = claim_next_request(db.conn, "worker-1", now=NOW)
+    assert claim is not None, (
+        "eligible request hidden behind >100 blocked rows (claim starvation)"
+    )
+    assert claim.request_id == rid_local and claim.request_type == "ELIGIBILITY"
+    # the blocked acquisition rows remain PENDING — visible, not lost
+    pending = db.conn.execute(
+        "SELECT COUNT(*) FROM scrape_requests WHERE status = 'PENDING'"
+    ).fetchone()[0]
+    assert pending == 120
+
+
+def test_eligible_request_beyond_due_retry_wait_window_is_not_starved(db):
+    begin_service_epoch(db.conn, now=NOW)
+    run_id, plans = create_run(db.conn, profile_id=None, plans=[_plan()], now=NOW)
+    for i in range(120):
+        enqueue_request(
+            db.conn, run_id=run_id, run_source_plan_id=plans[0], source_id="src-1",
+            binding_id="bnd-1", request_type="LIST_FETCH",
+            target_identity=f"https://example.test/feed?page={i}",
+            logical_key=f"page={i}",
+        )
+    # everything ahead sits in RETRY_WAIT far in the future
+    db.conn.execute(
+        "UPDATE scrape_requests SET status = 'RETRY_WAIT', next_retry_at = ?",
+        (FUTURE,),
+    )
+    db.conn.commit()
+    rid_due, _created = enqueue_request(
+        db.conn, run_id=run_id, run_source_plan_id=plans[0], source_id="src-1",
+        binding_id="bnd-1", request_type="NORMALIZE", target_identity="obs-1",
+    )
+    claim = claim_next_request(db.conn, "worker-1", now=NOW)
+    assert claim is not None and claim.request_id == rid_due
+
+
+def test_claim_selection_stays_deterministic_under_priority_and_age(db):
+    epoch = begin_service_epoch(db.conn, now=NOW)
+    run_id, plans = create_run(db.conn, profile_id=None, plans=[_plan()], now=NOW)
+    ids = {}
+    for name, priority in (("a-low", 0), ("b-high", 5), ("c-mid", 1)):
+        rid, _c = enqueue_request(
+            db.conn, run_id=run_id, run_source_plan_id=plans[0], source_id="src-1",
+            binding_id="bnd-1", request_type="NORMALIZE", target_identity=f"obs-{name}",
+            priority=priority,
+        )
+        ids[name] = rid
+    order = [
+        claim_next_request(db.conn, "w", now=NOW, epoch=epoch).request_id
+        for _ in range(3)
+    ]
+    assert order == [ids["b-high"], ids["c-mid"], ids["a-low"]]
+
+
+# --------------------- S3.1 corrective: malformed RETRY_WAIT (issue 3)
+
+
+def test_malformed_retry_wait_is_never_immediately_claimable(db):
+    epoch = begin_service_epoch(db.conn, now=NOW)
+    _run_id, _plan_id, rid_null = _enqueue(db, logical_key="null-retry")
+    _r2, _p2, rid_empty = _enqueue(db, logical_key="empty-retry")
+    db.conn.execute(
+        "UPDATE scrape_requests SET status = 'RETRY_WAIT', next_retry_at = NULL"
+        " WHERE id = ?",
+        (rid_null,),
+    )
+    db.conn.execute(
+        "UPDATE scrape_requests SET status = 'RETRY_WAIT', next_retry_at = ''"
+        " WHERE id = ?",
+        (rid_empty,),
+    )
+    db.conn.commit()
+    # NULL/empty durable retry time must fail closed, not mean "runnable now"
+    assert claim_next_request(db.conn, "worker-1", now=FUTURE, epoch=epoch) is None
+    rows = db.conn.execute(
+        "SELECT status FROM scrape_requests WHERE id IN (?, ?)", (rid_null, rid_empty)
+    ).fetchall()
+    assert all(r["status"] == "RETRY_WAIT" for r in rows)
+    # a repaired durable retry time restores claimability exactly when due
+    db.conn.execute(
+        "UPDATE scrape_requests SET next_retry_at = ? WHERE id = ?", (T2, rid_null)
+    )
+    db.conn.commit()
+    assert claim_next_request(db.conn, "worker-1", now=T1, epoch=epoch) is None
+    claim = claim_next_request(db.conn, "worker-1", now=T2, epoch=epoch)
+    assert claim is not None and claim.request_id == rid_null
+
+
+# ------------------ S3.1 corrective: repeated anomaly while halted (issue 4)
+
+
+def test_repeated_anomaly_while_halted_keeps_original_invalidated_epoch(db):
+    epoch1 = begin_service_epoch(db.conn, now=NOW)
+    guard = _guard(db, epoch1)
+    guard.observe(db.conn, db_now=T1)
+    _run_id, _plan_id, rid = _enqueue(db)
+    claim = claim_next_request(db.conn, "worker-1", now=T1, guard=guard)
+    assert claim is not None and claim.service_epoch_id == epoch1.epoch_id
+
+    first = guard.observe(db.conn, db_now=FUTURE)  # FORWARD anomaly, halt
+    assert first is not None and first.invalidated_epoch_id == epoch1.epoch_id
+    halted_epoch_count = len(_epoch_rows(db))
+    assert halted_epoch_count == 2
+
+    # further forward jumps while halted: the original invalidated epoch must
+    # survive for recovery; no further rotation may overwrite it
+    again = guard.observe(db.conn, db_now="2026-09-08T12:00:00.000000Z")
+    assert again is not None
+    assert again.invalidated_epoch_id == epoch1.epoch_id
+    assert again.new_epoch_id == first.new_epoch_id
+    assert guard.claims_halted
+    assert guard.epoch.epoch_id == first.new_epoch_id
+    assert len(_epoch_rows(db)) == halted_epoch_count  # no third epoch
+
+    # a backward swing while halted is preserved the same way
+    guard.observe(db.conn, db_now=T1)
+    assert guard.claims_halted
+    assert guard.halt.invalidated_epoch_id == epoch1.epoch_id
+    assert len(_epoch_rows(db)) == halted_epoch_count
+    with pytest.raises(ClaimsHalted):
+        claim_next_request(db.conn, "worker-2", now=T1, guard=guard)
+
+    # recovery completes against the ORIGINAL epoch, then work resumes
+    assert reclaim_orphaned_epoch_work(
+        db.conn, epoch1.epoch_id, now=FUTURE
+    ) == [rid]
+    guard.clear_halt()
+    due = db.conn.execute(
+        "SELECT next_retry_at FROM scrape_requests WHERE id = ?", (rid,)
+    ).fetchone()["next_retry_at"]
+    retry = claim_next_request(db.conn, "worker-2", now=due, guard=guard)
+    assert retry is not None and retry.service_epoch_id == first.new_epoch_id
+    # the re-baselined guard did not fabricate a new anomaly on resume
+    assert not guard.claims_halted and len(_epoch_rows(db)) == halted_epoch_count
+
+
+# ---------------------- S3.1 corrective: live-epoch reclaim guard (issue 5)
+
+
+def test_reclaim_refuses_the_current_live_service_epoch(db):
+    epoch1 = begin_service_epoch(db.conn, now=NOW)
+    _run_id, _plan_id, rid = _enqueue(db)
+    claim = claim_next_request(db.conn, "worker-1", now=NOW, epoch=epoch1)
+    assert claim is not None
+    # epoch1 is still the open/live epoch: reclaiming it would abandon an
+    # owner that may still be working — refused
+    with pytest.raises(ValueError, match="current"):
+        reclaim_orphaned_epoch_work(db.conn, epoch1.epoch_id, now=NOW)
+    row = db.conn.execute(
+        "SELECT status, current_attempt_id FROM scrape_requests WHERE id = ?",
+        (rid,),
+    ).fetchone()
+    assert row["status"] == "RUNNING" and row["current_attempt_id"] == claim.attempt_id
+    att = db.conn.execute(
+        "SELECT outcome FROM request_attempts WHERE attempt_id = ?",
+        (claim.attempt_id,),
+    ).fetchone()
+    assert att["outcome"] is None  # untouched
+    # once the epoch is ended (rotation), reclaiming it is allowed
+    begin_service_epoch(db.conn, now=T1)
+    assert reclaim_orphaned_epoch_work(db.conn, epoch1.epoch_id, now=T1) == [rid]

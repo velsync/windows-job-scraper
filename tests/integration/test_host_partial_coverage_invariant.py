@@ -229,6 +229,11 @@ def db(tmp_path, server, probe_registry):
         VALUES ('bnd-1','src-1','probe','{NOW}');
         """
     )
+    # Model the service lifetime: the coordinator opens its service epoch
+    # before any claiming (03 §50; claims fail closed without one).
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(database.conn)
     yield database
     database.close()
 

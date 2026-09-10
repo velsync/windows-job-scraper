@@ -52,6 +52,11 @@ def db(tmp_path, server):
     database = Database(tmp_path / "s25-runtime-correctives.db")
     migrate_schema(database.conn, LATEST_SCHEMA_VERSION)
     provision_search(database.conn, now=_gh.NOW)
+    # Model the service lifetime: the coordinator opens its service epoch
+    # before any claiming (03 §50; claims fail closed without one).
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(database.conn)
     yield database
     database.close()
 

@@ -140,6 +140,11 @@ def db(tmp_path, server):
     database = Database(tmp_path / "greenhouse-e2e.db")
     migrate_schema(database.conn, LATEST_SCHEMA_VERSION)
     provision_search(database.conn, now=NOW)
+    # Model the service lifetime: the coordinator opens its service epoch
+    # before any claiming (03 §50; claims fail closed without one).
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(database.conn)
     yield database
     database.close()
 
@@ -1006,6 +1011,11 @@ def service(tmp_path, server):
     secret = load_or_create_install_secret(paths)
     database = Database(paths.database_file)
     migrate_schema(database.conn, LATEST_SCHEMA_VERSION)
+    # service lifetime: open the epoch before any claiming (03 §50); the
+    # production runner does this in run_service before restart recovery
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(database.conn)
     provision_search(database.conn, now=NOW)
     app, state = create_service_app(
         AppConfig(data_root=root), database, port=8766, secret=secret

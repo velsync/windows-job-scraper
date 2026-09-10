@@ -66,6 +66,17 @@ class StaleServiceEpoch(Exception):
         self.epoch_id = epoch_id
 
 
+class NoActiveServiceEpoch(Exception):
+    """No service epoch is currently open; ownership operations fail closed.
+
+    New claims must always bind to an active service epoch (§50). A
+    database with no open epoch has had no ``begin_service_epoch`` for this
+    service lifetime, so claim/heartbeat refuse rather than mint unbound
+    ownership. Nullable ``request_attempts.service_epoch_id`` remains only
+    for historical/pre-S3.1 rows, never for newly created attempts.
+    """
+
+
 @dataclass(frozen=True)
 class ClockAnomaly:
     """A material wall-clock anomaly detected by ``ServiceClockGuard``."""
@@ -182,6 +193,10 @@ class ServiceClockGuard:
       the old epoch are stale from the guard's perspective and durably
       rejected by the epoch gate in claim/heartbeat.
 
+    While halted, further anomalies do NOT rotate again: the original
+    invalidated epoch is retained until its recovery/reclaim completes, so
+    repeated anomalies cannot overwrite the epoch still requiring recovery.
+
     The injected ``monotonic`` source governs only the live elapsed
     comparison; durable lease/scheduling comparisons remain database UTC
     (RUN-20).
@@ -215,8 +230,16 @@ class ServiceClockGuard:
         return self._halt is not None
 
     def clear_halt(self) -> None:
-        """Re-enable claims after the coordinator reclaimed orphaned work."""
+        """Re-enable claims after the coordinator reclaimed orphaned work.
+
+        Also re-baselines the clock checkpoint: across a halt/reclaim the
+        wall-clock baseline is unreliable, so the next observation starts a
+        fresh comparison window instead of judging drift against a
+        pre-anomaly sample.
+        """
         self._halt = None
+        self._last_db_now = None
+        self._last_monotonic = None
 
     def monotonic_elapsed_since_observation(self) -> float | None:
         """Live (non-durable) seconds since the last checkpoint, or ``None``
@@ -247,6 +270,13 @@ class ServiceClockGuard:
         self._last_db_now, self._last_monotonic = now, mono
         if direction is None:
             return None
+        if self._halt is not None:
+            # Already halted on an earlier anomaly whose recovery/reclaim may
+            # still be pending: retain the ORIGINAL invalidated epoch and do
+            # not rotate a new one over it. Claims stay halted; the anomaly
+            # checkpoint keeps re-baselining so post-halt observations are
+            # judged from fresh samples (§50).
+            return self._halt
         return self._rotate(conn, direction, drift, now)
 
     def _rotate(
@@ -292,6 +322,7 @@ __all__ = [
     "END_REASON_CLOCK_ANOMALY_FORWARD",
     "END_REASON_SERVICE_RESTART",
     "ClockAnomaly",
+    "NoActiveServiceEpoch",
     "ServiceClockGuard",
     "ServiceEpoch",
     "StaleServiceEpoch",
