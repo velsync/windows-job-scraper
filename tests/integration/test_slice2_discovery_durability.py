@@ -363,3 +363,34 @@ def test_private_discovery_target_is_denied_with_durable_attempt_evidence(tmp_pa
         assert db.conn.execute("SELECT COUNT(*) FROM ats_fingerprints").fetchone()[0] == 0
     finally:
         db.close()
+
+
+def test_discovery_run_and_request_creation_is_atomic_on_enqueue_failure(
+    tmp_path, monkeypatch
+):
+    """A crash between plan creation and enqueue must leave no orphan run."""
+
+    class SimulatedCrash(RuntimeError):
+        pass
+
+    def crash_before_request_insert(*args, **kwargs):
+        raise SimulatedCrash("process died before SOURCE_DISCOVERY request insert")
+
+    monkeypatch.setattr(discovery_runtime, "enqueue_request", crash_before_request_insert)
+
+    db = _database(tmp_path / "enqueue-crash.db")
+    try:
+        with pytest.raises(SimulatedCrash):
+            queue_source_discovery(
+                db.conn,
+                display_name="Crash-before-enqueue careers",
+                entry_url="https://example.com/careers",
+                source_family="EMPLOYER_CAREERS",
+                now=NOW,
+            )
+
+        assert db.conn.execute("SELECT COUNT(*) FROM scrape_runs").fetchone()[0] == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM run_source_plans").fetchone()[0] == 0
+        assert db.conn.execute("SELECT COUNT(*) FROM scrape_requests").fetchone()[0] == 0
+    finally:
+        db.close()
