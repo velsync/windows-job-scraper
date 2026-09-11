@@ -1598,6 +1598,92 @@ CREATE INDEX idx_coverage_presence_application_presence
     return sql
 
 
+# ------------------------------ v19 S3.9 durable logical fallback-group state
+@_step(19, "s3_9_logical_fallback_group_state")
+def _(sql: str = '''
+-- S3.9 durable logical fallback-group state.
+-- RunSourcePlan identity remains immutable; this table owns mutable group truth.
+
+CREATE TABLE source_plan_group_state (
+    run_id TEXT NOT NULL REFERENCES scrape_runs(id) ON DELETE CASCADE,
+    source_plan_group_id TEXT NOT NULL,
+    active_fallback_rank INTEGER NOT NULL CHECK (active_fallback_rank >= 0),
+    group_outcome TEXT
+        CHECK (group_outcome IS NULL OR group_outcome IN (
+            'SATISFIED', 'SATISFIED_PARTIAL', 'FAILED',
+            'CANCELLED', 'POLICY_DENIED', 'SKIPPED_NOT_NEEDED'
+        )),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, source_plan_group_id),
+    FOREIGN KEY (run_id, source_plan_group_id, active_fallback_rank)
+        REFERENCES run_source_plans(run_id, source_plan_group_id, fallback_rank)
+);
+CREATE INDEX idx_source_plan_group_state_open
+    ON source_plan_group_state(run_id, group_outcome, active_fallback_rank);
+
+-- Preserve pre-S3.9 diagnostic plan outcomes while deriving the least
+-- surprising logical group truth. A successful/accepted-partial historical
+-- rank wins over unused later rows; otherwise the first still-open rank is
+-- resumed. This migration never consults mutable current binding state.
+INSERT INTO source_plan_group_state (
+    run_id, source_plan_group_id, active_fallback_rank,
+    group_outcome, created_at, updated_at)
+SELECT
+    p.run_id,
+    p.source_plan_group_id,
+    CASE
+        WHEN MAX(CASE WHEN p.group_outcome = 'SATISFIED' THEN 1 ELSE 0 END) = 1
+            THEN MIN(CASE WHEN p.group_outcome = 'SATISFIED' THEN p.fallback_rank END)
+        WHEN MAX(CASE WHEN p.group_outcome = 'SATISFIED_PARTIAL' THEN 1 ELSE 0 END) = 1
+            THEN MIN(CASE WHEN p.group_outcome = 'SATISFIED_PARTIAL' THEN p.fallback_rank END)
+        WHEN MAX(CASE WHEN p.group_outcome = 'CANCELLED' THEN 1 ELSE 0 END) = 1
+            THEN MIN(CASE WHEN p.group_outcome = 'CANCELLED' THEN p.fallback_rank END)
+        WHEN MAX(CASE WHEN p.group_outcome IS NULL THEN 1 ELSE 0 END) = 1
+            THEN MIN(CASE WHEN p.group_outcome IS NULL THEN p.fallback_rank END)
+        ELSE MAX(p.fallback_rank)
+    END,
+    CASE
+        WHEN MAX(CASE WHEN p.group_outcome = 'SATISFIED' THEN 1 ELSE 0 END) = 1
+            THEN 'SATISFIED'
+        WHEN MAX(CASE WHEN p.group_outcome = 'SATISFIED_PARTIAL' THEN 1 ELSE 0 END) = 1
+            THEN 'SATISFIED_PARTIAL'
+        WHEN MAX(CASE WHEN p.group_outcome = 'CANCELLED' THEN 1 ELSE 0 END) = 1
+            THEN 'CANCELLED'
+        WHEN MAX(CASE WHEN p.group_outcome IS NULL THEN 1 ELSE 0 END) = 1
+            THEN NULL
+        WHEN SUM(CASE WHEN p.group_outcome NOT IN ('POLICY_DENIED', 'SKIPPED_NOT_NEEDED') THEN 1 ELSE 0 END) = 0
+             AND MAX(CASE WHEN p.group_outcome = 'POLICY_DENIED' THEN 1 ELSE 0 END) = 1
+            THEN 'POLICY_DENIED'
+        WHEN MAX(CASE WHEN p.group_outcome IN ('FAILED', 'POLICY_DENIED') THEN 1 ELSE 0 END) = 1
+            THEN 'FAILED'
+        ELSE 'SKIPPED_NOT_NEEDED'
+    END,
+    MIN(p.created_at),
+    MAX(p.created_at)
+FROM run_source_plans p
+GROUP BY p.run_id, p.source_plan_group_id;
+
+-- Pre-S3.9 orchestration executed every fallback row, so a later rank could
+-- already be terminally successful/partial/cancelled while an earlier or later
+-- rank was still NULL. Once the logical group is terminal, every remaining
+-- NULL rank is explicitly unused. Accepted host-native work remains durable and
+-- is still counted by the S3.9 run-finalization barrier.
+UPDATE run_source_plans
+   SET group_outcome = 'SKIPPED_NOT_NEEDED'
+ WHERE group_outcome IS NULL
+   AND EXISTS (
+       SELECT 1
+         FROM source_plan_group_state g
+        WHERE g.run_id = run_source_plans.run_id
+          AND g.source_plan_group_id = run_source_plans.source_plan_group_id
+          AND g.group_outcome IS NOT NULL
+   );
+'''
+) -> None:
+    return sql
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1612,6 +1698,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10, 16})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 18, (
-    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18"
+assert LATEST_SCHEMA_VERSION == 19, (
+    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18; S3.9 appends v19"
 )

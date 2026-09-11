@@ -149,6 +149,8 @@ from jobscraper.runtime.runs import (
     TERMINAL_GROUP_OUTCOMES,
     aggregate_run,
     mark_run_started,
+    plan_actionable_open_work,
+    plan_is_active,
     set_group_outcome,
 )
 from jobscraper.runtime.retry import RetryAction, decide_retry
@@ -318,6 +320,42 @@ def _claim_target_reference(claim) -> str | None:
     payload = dict(claim.payload or {})
     value = payload.get("target_reference") or payload.get("url")
     return value if isinstance(value, str) and value else None
+
+
+def _plan_needs_redrive(
+    conn: sqlite3.Connection, plan_row: sqlite3.Row, *, now: str
+) -> bool:
+    """Whether a non-active plan must still be driven (restart recovery).
+
+    Dormant fallback ranks never start new work, but two accepted shapes
+    still need the driver:
+
+    * no recorded outcome: close from durable evidence when nothing is
+      open, or repair a plan diagnostic lost after its group verdict
+      committed.  Open work owned by a dormant rank cannot proceed
+      (claims stay rank-bound), so it does not justify driving.
+    * partial verdict: accepted children may still drain, but only while
+      this rank still owns a partial group.
+
+    Any other recorded verdict stands.
+    """
+    outcome = plan_row["group_outcome"]
+    if outcome is None:
+        return plan_actionable_open_work(conn, plan_row["id"], now=now) == 0
+    if outcome != "SATISFIED_PARTIAL":
+        return False
+    if plan_actionable_open_work(conn, plan_row["id"], now=now) == 0:
+        return False
+    state = conn.execute(
+        "SELECT active_fallback_rank, group_outcome FROM source_plan_group_state"
+        " WHERE run_id = ? AND source_plan_group_id = ?",
+        (plan_row["run_id"], plan_row["source_plan_group_id"]),
+    ).fetchone()
+    return (
+        state is not None
+        and int(state["active_fallback_rank"]) == int(plan_row["fallback_rank"])
+        and state["group_outcome"] == "SATISFIED_PARTIAL"
+    )
 
 
 def _open_acquisition_requests(conn: sqlite3.Connection, run_source_plan_id: str) -> int:
@@ -595,14 +633,25 @@ def _execute_plan(
       through the registry — the host special-cases no adapter identity;
     * request type -> task kind is durable data, so enumeration pages and the
       typed detail children they produce are planned by the same adapter;
-    * a plan is never terminalized while its own accepted child work is open,
-      and re-driving a finished plan is an idempotent no-op;
+    * a plan is never terminalized around claimable-or-inflight child work,
+      except by an explicitly partial verdict; a partial rank keeps owning
+      its accepted children across passes until they drain (completion
+      upgrade) or fail, and re-driving a finally-terminal plan is an
+      idempotent no-op;
     * host budgets bound enumeration pages and detail requests separately, and
       hitting one yields BUDGET_EXHAUSTED — never absence authority.
     """
     from jobscraper.runtime.clock import db_utc_now
 
     plan_id = plan_row["id"]
+    # S3.9: dormant fallback ranks cannot start new work through
+    # direct/internal calls, but restart recovery still re-drives a rank
+    # that never recorded an outcome (close/repair) or that still owns
+    # open claimable-or-inflight work under a partial verdict.
+    if not plan_is_active(conn, plan_id) and not _plan_needs_redrive(
+        conn, plan_row, now=now
+    ):
+        return
     open_work = _open_acquisition_requests(conn, plan_id)
     if plan_row["group_outcome"] in TERMINAL_GROUP_OUTCOMES and open_work == 0:
         return

@@ -65,6 +65,7 @@ from jobscraper.runtime.requests import (
     ACQUISITION_REQUEST_TYPES,
     HOST_NATIVE_REQUEST_TYPES,
 )
+from jobscraper.runtime.runs import active_plan_sql_predicate
 
 DEFAULT_LEASE_WINDOW_S = 120.0
 RETRY_BACKOFF_BASE_S = 5.0
@@ -133,6 +134,7 @@ def _claim_selection_sql(
     acq_ph = ", ".join("?" for _ in sorted(ACQUISITION_REQUEST_TYPES))
     native_ph = ", ".join("?" for _ in sorted(HOST_NATIVE_REQUEST_TYPES))
     live_acq = acquisition_claim_sql_predicate()
+    active_plan = active_plan_sql_predicate("req")
     sql = f"""
         SELECT req.id
         FROM scrape_requests req
@@ -153,6 +155,7 @@ def _claim_selection_sql(
                 OR (
                      req.request_type IN ({acq_ph})
                      {live_acq}
+                     {active_plan}
                    )
               )
     """

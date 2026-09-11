@@ -13,6 +13,7 @@ import sqlite3
 
 from jobscraper.runtime.clock import current_service_epoch, db_utc_now
 from jobscraper.runtime.requests import ACQUISITION_REQUEST_TYPES
+from jobscraper.runtime.runs import cancel_open_groups
 
 
 def request_run_cancellation(
@@ -45,17 +46,7 @@ def request_run_cancellation(
             """,
             (ts, ts, detail, run_id, *sorted(ACQUISITION_REQUEST_TYPES)),
         )
-        conn.execute(
-            """
-            UPDATE run_source_plans SET group_outcome = 'CANCELLED'
-             WHERE run_id = ? AND group_outcome IS NULL
-               AND NOT EXISTS (
-                   SELECT 1 FROM scrape_requests r
-                    WHERE r.run_source_plan_id = run_source_plans.id
-                      AND r.status NOT IN ('CANCELLED', 'FAILED', 'SUCCEEDED'))
-            """,
-            (run_id,),
-        )
+        cancel_open_groups(conn, run_id, now=ts, commit=False)
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")

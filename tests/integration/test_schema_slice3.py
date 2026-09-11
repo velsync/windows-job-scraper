@@ -106,14 +106,23 @@ def test_s37_v17_is_frozen_after_later_slice3_migrations():
     assert _digest(_step(16)[1]) == S3_5_STEP_SHA256[16]
 
 
-def test_s38_v18_is_next_unused_sequential_and_pinned():
+def test_s38_v18_is_frozen_after_s39_append():
     versions = [version for version, _name, _sql in MIGRATION_STEPS]
-    assert versions == list(range(1, 19))
-    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 18
+    assert versions[:18] == list(range(1, 19))
     name, sql = _step(18)
     assert name == "s3_8_coverage_authority_and_scope_membership"
     assert _digest(sql) == "6075470c2667d581472d8c47ef1baaa8e30fda87d05dbfe996c2c948d4e2c3cf"
     assert _digest(_step(17)[1]) == S3_7_STEP_SHA256[17]
+
+
+def test_s39_v19_is_next_unused_sequential_and_pinned():
+    versions = [version for version, _name, _sql in MIGRATION_STEPS]
+    assert versions == list(range(1, 20))
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 19
+    name, sql = _step(19)
+    assert name == "s3_9_logical_fallback_group_state"
+    assert _digest(sql) == "e7028ec8fd11ba751bfc3a3e0145d3f1df31f34bb257c38f6fa00979f671ff68"
+    assert _digest(_step(18)[1]) == "6075470c2667d581472d8c47ef1baaa8e30fda87d05dbfe996c2c948d4e2c3cf"
 
 
 def test_v16_rebuild_preserves_legacy_cursor_without_guessing_provenance(tmp_path):
