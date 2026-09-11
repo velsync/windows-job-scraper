@@ -47,6 +47,12 @@ import sqlite3
 from dataclasses import dataclass
 
 from jobscraper.ids import new_id
+from jobscraper.runtime.authorization import (
+    AuthorizationDenied,
+    acquisition_claim_sql_predicate,
+    evaluate_request_authorization,
+    require_request_authorized,
+)
 from jobscraper.runtime.clock import (
     NoActiveServiceEpoch,
     ServiceClockGuard,
@@ -126,6 +132,7 @@ def _claim_selection_sql(
     """
     acq_ph = ", ".join("?" for _ in sorted(ACQUISITION_REQUEST_TYPES))
     native_ph = ", ".join("?" for _ in sorted(HOST_NATIVE_REQUEST_TYPES))
+    live_acq = acquisition_claim_sql_predicate()
     sql = f"""
         SELECT req.id
         FROM scrape_requests req
@@ -145,11 +152,7 @@ def _claim_selection_sql(
                 req.request_type IN ({native_ph})
                 OR (
                      req.request_type IN ({acq_ph})
-                     AND run.cancel_requested_at IS NULL
-                     AND s.desired_state = 'ENABLED'
-                     AND s.administrative_state = 'NORMAL'
-                     AND b.desired_state = 'ENABLED'
-                     AND b.administrative_state = 'NORMAL'
+                     {live_acq}
                    )
               )
     """
@@ -338,6 +341,20 @@ def heartbeat(
             # ownership to renew (§50); historical attempts are not revived.
             conn.execute("ROLLBACK")
             raise StaleOwnership(request_id, "no active service epoch")
+        if is_acquisition:
+            try:
+                require_request_authorized(
+                    conn,
+                    request_id,
+                    attempt_id=attempt_id,
+                    require_running=True,
+                )
+            except AuthorizationDenied as exc:
+                conn.execute("ROLLBACK")
+                raise StaleOwnership(
+                    request_id,
+                    f"current acquisition authority revoked: {exc.decision.reason.value}",
+                ) from exc
         sql = (
             """
             UPDATE scrape_requests
@@ -432,6 +449,17 @@ def _heartbeat_denial(
             request_id, "service epoch advanced; attempt ownership invalidated"
         )
     if row["request_type"] in ACQUISITION_REQUEST_TYPES:
+        decision = evaluate_request_authorization(
+            conn,
+            request_id,
+            attempt_id=attempt_id,
+            require_running=True,
+        )
+        if not decision.allowed:
+            return StaleOwnership(
+                request_id,
+                f"current acquisition authority revoked: {decision.reason.value}",
+            )
         run = conn.execute(
             "SELECT cancel_requested_at FROM scrape_runs WHERE id = ?", (row["run_id"],)
         ).fetchone()

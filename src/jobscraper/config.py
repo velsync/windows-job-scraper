@@ -38,6 +38,13 @@ class AppConfig:
     http_max_redirects: int = 5
     http_max_concurrency: int = 8
     browser_max_concurrency: int = 1
+    browser_interactive_max_concurrency: int = 1
+    source_max_concurrency: int = 2
+    host_max_concurrency: int = 4
+    # Optional host-approved egress participates only as a capacity/rate
+    # dimension.  Direct remains the default and Slice 3 creates no proxy
+    # discovery/rotation/evasion behavior (R2-F6).
+    egress_max_concurrency: int | None = None
 
     # Scheduler policy.
     scheduler_enabled: bool = True

@@ -36,10 +36,10 @@ from jobscraper.acquisition.atsendpoints import spec_for_provider
 from jobscraper.acquisition.envelope import (
     ExecutionPlanEnvelope,
     RequestPlan,
+    policy_snapshot_reference,
     validate_envelope,
 )
-from jobscraper.acquisition.failures import FailureKind
-from jobscraper.acquisition.httpexec import execute_request
+from jobscraper.acquisition.failures import FailureKind, FailureRecord
 from jobscraper.acquisition.origin import resolve_origin
 from jobscraper.acquisition.pagevalidity import PageClass, classify_page
 from jobscraper.adapters.contract import (
@@ -75,8 +75,24 @@ from jobscraper.runtime.cancellation import (
     abandon_request_for_cancellation,
     run_is_cancelled,
 )
+from jobscraper.runtime.authorization import (
+    AuthorizationDenied,
+    AuthorizationReason,
+    finalize_authorization_denial,
+)
+from jobscraper.runtime.capacity import CapacityUnavailable
+from jobscraper.runtime.claim_control import yield_unstarted_claim
+from jobscraper.runtime.dispatch import (
+    DispatchDeferred,
+    DispatchExecutionError,
+    DispatchRejected,
+    UnsupportedExecutionClass,
+    dispatch_http,
+)
 from jobscraper.runtime.claims import StaleOwnership, claim_next_request, reclaim_expired
-from jobscraper.runtime.fence import fenced_commit
+from jobscraper.runtime.fence import FenceTransition, fenced_commit
+from jobscraper.runtime.rate import record_failure as record_rate_failure
+from jobscraper.runtime.rate import record_success as record_rate_success
 from jobscraper.runtime.requests import (
     ACQUISITION_REQUEST_TYPES,
     enqueue_request,
@@ -87,6 +103,7 @@ from jobscraper.runtime.runs import (
     mark_run_started,
     set_group_outcome,
 )
+from jobscraper.runtime.retry import RetryAction, decide_retry
 
 #: Host-side budget on enumeration pages per plan per run (RUN-09: bounded).
 MAX_PAGES_PER_RUN = 50
@@ -154,7 +171,9 @@ def source_policy(
             purpose="loopback-source-entry", allowed_hosts=frozenset({host})
         )
     return DestinationPolicy(
-        allowed_hosts=frozenset(allowed_hosts) if allowed_hosts else None,
+        # An invalid/missing source host is a fail-closed empty allowlist, not
+        # ``None`` (which means unrestricted public hosts to DestinationPolicy).
+        allowed_hosts=frozenset(allowed_hosts),
         internal_grant=grant,
         max_redirects=3,
         timeout_s=30.0,
@@ -420,32 +439,73 @@ def _outcome_from_durable_state(conn: sqlite3.Connection, plan_id: str) -> str:
     return "SATISFIED" if complete else "SATISFIED_PARTIAL"
 
 
-def _commit_fenced(conn, run_id, claim, *, ts, mutate) -> str:
+def _commit_fenced(
+    conn,
+    run_id,
+    claim,
+    *,
+    ts,
+    mutate,
+    transition: FenceTransition | None = None,
+    transition_resolver=None,
+) -> str:
     """One fenced commit for one claim; report ownership loss honestly.
 
-    Returns ``COMMITTED`` / ``CANCELLED`` / ``STALE``.  The fence owns the
-    claim-and-commit contract (RUN-07, 03 §18): a refused late commit rolls
-    back everything this attempt wrote, and the driver must not count it as a
-    completed page.
+    Returns ``COMMITTED`` / ``CANCELLED`` / ``DENIED`` / ``STALE``.  The
+    fence owns the claim-and-commit contract (RUN-07, 03 §18): a refused late
+    commit rolls back every request-owned output.  ``transition_resolver`` may
+    refine the terminal transition only after the caller mutation has derived
+    parse outcome, while still inside the same serialized fence.
     """
     from jobscraper.runtime.clock import db_utc_now
 
+    selected = transition or FenceTransition()
     try:
-        with fenced_commit(conn, claim.request_id, claim.attempt_id, now=ts, mutate=mutate):
+        # Lease/service-epoch ownership is evaluated at commit time, not at the
+        # earlier claim/dispatch timestamp.  A long network request must never
+        # revive an ownership token whose lease expired while I/O was in flight.
+        fence_now = db_utc_now(conn)
+        with fenced_commit(
+            conn,
+            claim.request_id,
+            claim.attempt_id,
+            now=fence_now,
+            outcome=selected.outcome,
+            retry_delay_s=selected.retry_delay_s,
+            failure_kind=selected.failure_kind,
+            failure_json=selected.failure_json,
+            mutate=mutate,
+            transition_resolver=transition_resolver,
+        ):
             pass
         return "COMMITTED"
-    except StaleOwnership:
-        if run_is_cancelled(conn, run_id):
-            # §18: the fence refused a late acquisition commit; this page's
-            # outputs were rolled back, the worker cooperatively abandons the
-            # request, and the plan ends CANCELLED.
-            abandon_request_for_cancellation(conn, claim.request_id, now=db_utc_now(conn))
+    except AuthorizationDenied as exc:
+        current = db_utc_now(conn)
+        if exc.decision.reason is AuthorizationReason.RUN_CANCELLED:
+            abandon_request_for_cancellation(
+                conn, claim.request_id, attempt_id=claim.attempt_id, now=current
+            )
             return "CANCELLED"
-        # Ownership lost without cancellation (expired lease): an expired lease
-        # is already lost ownership (RUN-07), so the expired request is
-        # reclaimed for retry and the driver stops claiming this plan rather
-        # than reviving the dead lease.
-        reclaim_expired(conn)
+        finalized = finalize_authorization_denial(
+            conn,
+            claim.request_id,
+            claim.attempt_id,
+            decision=exc.decision,
+            now=current,
+        )
+        return "DENIED" if finalized else "STALE"
+    except StaleOwnership:
+        current = db_utc_now(conn)
+        if run_is_cancelled(conn, run_id):
+            # §18: the fence refused a late acquisition commit; outputs were
+            # rolled back before this exact-attempt cancellation transition.
+            abandon_request_for_cancellation(
+                conn, claim.request_id, attempt_id=claim.attempt_id, now=current
+            )
+            return "CANCELLED"
+        # Lease expiry can be reclaimed immediately.  Epoch-stale ownership is
+        # recovered by the service-epoch coordinator on the next claim/startup.
+        reclaim_expired(conn, now=current)
         return "STALE"
 
 
@@ -538,6 +598,8 @@ def _execute_plan(
     # the coverage is, not from what this process happened to witness.
     run_degraded = coverage_degraded
     cancelled = False
+    deferred = False
+    ownership_lost = False
     pages = 0
     details = 0
     while True:
@@ -633,14 +695,24 @@ def _execute_plan(
                 )
                 signal["value"] = "REFUSED"
 
-            if _commit_fenced(conn, run_id, claim, ts=ts, mutate=mutate) != "COMMITTED":
-                if run_is_cancelled(conn, run_id):
+            refusal_status = _commit_fenced(
+                conn, run_id, claim, ts=ts, mutate=mutate,
+                transition=FenceTransition(
+                    outcome="FAILED",
+                    failure_kind=FailureKind.INVALID_JOB_RECORD.value,
+                    failure_json=bounded_json({
+                        "reason": "ADAPTER_PLAN_REFUSED",
+                        "detail": (plan_refusal or "")[:500],
+                    }),
+                ),
+            )
+            if refusal_status != "COMMITTED":
+                if refusal_status == "CANCELLED" or run_is_cancelled(conn, run_id):
                     cancelled = True
+                elif refusal_status == "STALE":
+                    deferred = True
                 break
-            if is_enumeration:
-                pages += 1
-            else:
-                details += 1
+            # No executor ran; a refused plan is not a completed page/detail.
             run_degraded = True
             if is_enumeration or not listing_identity_sufficient:
                 coverage_degraded = True
@@ -659,7 +731,7 @@ def _execute_plan(
             adapter_version=plan_row["adapter_version"],
             strategy=plan_row["strategy"],
             execution_class=plan_row["execution_class"],
-            policy_snapshot_ref=None,
+            policy_snapshot_ref=policy_snapshot_reference(plan_row),
             permission_profile_id=plan_row["permission_profile_id"],
             permission_profile_revision=plan_row["permission_profile_revision"],
             payload_kind="REQUEST",
@@ -671,13 +743,233 @@ def _execute_plan(
                 timeout_s=request_plan.timeout_s,
                 max_bytes=request_plan.max_bytes,
                 purpose=claim.request_type,
+                allowed_redirects=policy.max_redirects,
+                egress_requirement=None,
+                expected_operation_class="READ",
             ),
         )
-
-        result = execute_request(envelope, policy)  # NO transaction held
-        classification = classify_page(
-            result, expect="JOB" if task_kind is AdapterTaskKind.DETAIL else "LIST"
+        budget = conn.execute(
+            "SELECT attempt_count, max_attempts FROM scrape_requests WHERE id = ?",
+            (claim.request_id,),
+        ).fetchone()
+        try:
+            dispatched = dispatch_http(
+                conn,
+                envelope,
+                policy,
+                attempt_count=int(budget["attempt_count"]),
+                max_attempts=int(budget["max_attempts"]),
+                expect="JOB" if task_kind is AdapterTaskKind.DETAIL else "LIST",
+                detail_closure_allowed=(task_kind is AdapterTaskKind.DETAIL),
+            )
+        except CapacityUnavailable:
+            # No executor ran and execution_plan_id was not bound.  Return the
+            # durable claim without consuming provider attempt budget.
+            yield_unstarted_claim(
+                conn, claim.request_id, claim.attempt_id,
+                reason="CAPACITY_UNAVAILABLE",
+            )
+            deferred = True
+            break
+        except UnsupportedExecutionClass as exc:
+            status = _commit_fenced(
+                conn, run_id, claim, ts=ts, mutate=lambda _conn: None,
+                transition=FenceTransition(
+                    outcome="FAILED",
+                    failure_kind="POLICY_REJECTED",
+                    failure_json=bounded_json({
+                        "reason": "UNSUPPORTED_EXECUTION_CLASS",
+                        "execution_class": exc.execution_class,
+                    }),
+                ),
+            )
+            if status == "STALE":
+                deferred = True
+            elif status == "CANCELLED":
+                cancelled = True
+            else:
+                run_degraded = True
+            break
+        except DispatchDeferred as exc:
+            if exc.next_retry_at is not None:
+                yield_unstarted_claim(
+                    conn, claim.request_id, claim.attempt_id,
+                    reason="RATE_COOLDOWN", next_retry_at=exc.next_retry_at,
+                )
+                deferred = True
+                break
+            status = _commit_fenced(
+                conn, run_id, claim, ts=ts, mutate=lambda _conn: None,
+                transition=FenceTransition(
+                    outcome="FAILED",
+                    failure_kind=exc.failure_kind or "BLOCKED",
+                    failure_json=bounded_json({"reason": exc.reason}),
+                ),
+            )
+            if status == "STALE":
+                deferred = True
+            elif status == "CANCELLED":
+                cancelled = True
+            else:
+                run_degraded = True
+            break
+        except DispatchRejected as exc:
+            status = _commit_fenced(
+                conn,
+                run_id,
+                claim,
+                ts=ts,
+                mutate=lambda cursor_conn: _record_evidence(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    kind="SECURITY_POLICY",
+                    ref="DENIED:DISPATCH_PLAN_INVALID",
+                    detail={"reason": exc.reason},
+                    content_hash=None,
+                    now=db_utc_now(cursor_conn),
+                ),
+                transition=FenceTransition(
+                    outcome="FAILED",
+                    failure_kind=FailureKind.POLICY_REJECTED.value,
+                    failure_json=bounded_json({
+                        "kind": FailureKind.POLICY_REJECTED.value,
+                        "reason": "DISPATCH_PLAN_INVALID",
+                        "error_type": exc.reason,
+                    }),
+                ),
+            )
+            if status == "STALE":
+                deferred = True
+            elif status == "CANCELLED":
+                cancelled = True
+            else:
+                run_degraded = True
+            break
+        except DispatchExecutionError as exc:
+            # Expected source/network failures are normalized by the executor.
+            # An escaped exception is local infrastructure and must not poison
+            # source health.  It still consumes this dispatch attempt.
+            local_failure = FailureRecord(
+                kind=FailureKind.WORKER_CRASH,
+                retryable=True,
+                source_health_impact="NONE",
+                source_id=plan_row["source_id"],
+                binding_id=plan_row["binding_id"],
+                adapter_id=plan_row["adapter_id"],
+                adapter_version=plan_row["adapter_version"],
+                run_id=run_id,
+                request_id=claim.request_id,
+                attempt_id=claim.attempt_id,
+                details_redacted={"error_type": exc.error_type},
+                observed_at=db_utc_now(conn),
+            )
+            local_retry = decide_retry(
+                local_failure,
+                page_class=None,
+                attempt_count=int(budget["attempt_count"]),
+                max_attempts=int(budget["max_attempts"]),
+                headers={},
+            )
+            status = _commit_fenced(
+                conn,
+                run_id,
+                claim,
+                ts=ts,
+                mutate=lambda cursor_conn: _record_evidence(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    kind="FAILURE",
+                    ref="DISPATCH_EXECUTOR_ERROR",
+                    detail={"error_type": exc.error_type},
+                    content_hash=None,
+                    now=db_utc_now(cursor_conn),
+                ),
+                transition=FenceTransition(
+                    outcome=(
+                        "RETRY_WAIT"
+                        if local_retry.action is RetryAction.RETRY
+                        else "FAILED"
+                    ),
+                    retry_delay_s=local_retry.delay_s,
+                    failure_kind=FailureKind.WORKER_CRASH.value,
+                    failure_json=bounded_json({
+                        "kind": FailureKind.WORKER_CRASH.value,
+                        "error_type": exc.error_type,
+                        "retry_reason": local_retry.reason,
+                        "retry_delay_s": local_retry.delay_s,
+                        "budget_exhausted": local_retry.budget_exhausted,
+                    }),
+                ),
+            )
+            if status == "STALE":
+                deferred = True
+            elif status == "CANCELLED":
+                cancelled = True
+            else:
+                run_degraded = True
+            break
+        except AuthorizationDenied as exc:
+            if exc.decision.reason is AuthorizationReason.RUN_CANCELLED:
+                abandon_request_for_cancellation(
+                    conn, claim.request_id, attempt_id=claim.attempt_id,
+                    now=db_utc_now(conn),
+                )
+                cancelled = True
+            else:
+                finalized = finalize_authorization_denial(
+                    conn, claim.request_id, claim.attempt_id,
+                    decision=exc.decision, now=db_utc_now(conn),
+                )
+                if finalized:
+                    run_degraded = True
+                else:
+                    deferred = True
+            break
+        except StaleOwnership:
+            # Plan binding is the last ownership checkpoint before I/O.  If it
+            # fails, no network request has started — but the attempt itself
+            # was consumed (reclaimed for retry below), so the pass must still
+            # terminalize honestly instead of leaving the group open.
+            reclaim_expired(conn)
+            deferred = True
+            ownership_lost = True
+            break
+        # Post-I/O durable evidence/cooldown time is sampled after the
+        # network wait; claim-time timestamps must not shorten Retry-After or
+        # source-protection cooldowns.
+        ts = db_utc_now(conn)
+        result = dispatched.result
+        classification = dispatched.classification
+        retry_decision = dispatched.retry
+        network_failure_json = (
+            bounded_json({
+                "kind": retry_decision.failure_kind,
+                "reason": retry_decision.reason,
+                "retry_after": retry_decision.retry_after_raw,
+                "retry_delay_s": retry_decision.delay_s,
+                "budget_exhausted": retry_decision.budget_exhausted,
+            }) if retry_decision.failure_kind else None
         )
+        transition_box = {
+            "value": FenceTransition(
+                # A fetch that produced durable evidence is a definitive
+                # answer: the owning request commits SUCCEEDED and any
+                # degradation rides the parsed signals into the run/group
+                # outcome (sealed Slice-2 behavior). Only a retryable
+                # transient with budget left stays open as RETRY_WAIT; the
+                # durable retry/cooldown state is recorded in the mutate
+                # below regardless of the terminal mapping.
+                outcome=(
+                    "RETRY_WAIT" if retry_decision.action is RetryAction.RETRY
+                    else "SUCCEEDED"
+                ),
+                retry_delay_s=retry_decision.delay_s,
+                failure_kind=retry_decision.failure_kind,
+                failure_json=network_failure_json,
+            )
+        }
 
         def mutate(cursor_conn):
             fetch_attempt_id = _persist_fetch_attempt(cursor_conn, envelope, result, ts)
@@ -722,6 +1014,42 @@ def _execute_plan(
                 content_hash=result.normalized_content_hash,
                 now=ts,
             )
+            if retry_decision.action is not RetryAction.SUCCEED:
+                cursor_conn.execute(
+                    "UPDATE scrape_requests SET last_failure_kind = ?,"
+                    " last_failure_json = ? WHERE id = ?",
+                    (retry_decision.failure_kind, network_failure_json, claim.request_id),
+                )
+                rate_delay = retry_decision.delay_s
+                if rate_delay is None and retry_decision.failure_kind in {
+                    "RATE_LIMIT", "CHALLENGE", "BLOCKED"
+                }:
+                    rate_delay = 300.0
+                record_rate_failure(
+                    cursor_conn,
+                    dispatched.rate_key,
+                    failure_kind=retry_decision.failure_kind or "SOURCE_CHANGED",
+                    delay_s=rate_delay,
+                    retry_after_raw=retry_decision.retry_after_raw,
+                    now=ts,
+                    commit=False,
+                )
+                signal["value"] = (
+                    "RETRY" if retry_decision.action is RetryAction.RETRY else "FAILURE"
+                )
+                return
+
+            clean_rate_success = (
+                classification.state in NORMAL_PARSE_CLASSES
+                or (
+                    task_kind is AdapterTaskKind.DETAIL
+                    and classification.state in _CLOSURE_CLASSES
+                )
+            )
+            if clean_rate_success:
+                record_rate_success(
+                    cursor_conn, dispatched.rate_key, now=ts, commit=False
+                )
             if classification.state in NORMAL_PARSE_CLASSES:
                 # EMPTY is a recognized non-job outcome (§21): the adapter parse
                 # yields SUCCESS_EMPTY, which terminates the enumeration
@@ -747,9 +1075,7 @@ def _execute_plan(
                 )
                 if outcome_obj.failure is not None:
                     # A typed adapter failure (02 ACQ-02 FailureRecord) is
-                    # durable on the request as well as on the parse attempt:
-                    # an operator scanning scrape_requests must see *why* a
-                    # completed request produced nothing, without a join.
+                    # durable on the request as well as on the parse attempt.
                     cursor_conn.execute(
                         "UPDATE scrape_requests SET last_failure_kind = ?,"
                         " last_failure_json = ? WHERE id = ?",
@@ -759,6 +1085,12 @@ def _execute_plan(
                             claim.request_id,
                         ),
                     )
+
+                # Definitive parse answers — including PARTIAL and FAILURE kinds —
+                # commit with the owning request SUCCEEDED. Degradation is
+                # expressed through the parsed signals into the run/group
+                # outcome below (sealed Slice-2 behavior); the request itself
+                # carries the evidence, not a failure verdict.
                 for observation in outcome_obj.observations:
                     # 02 §32 origin resolution — host-owned and network-inert:
                     # it consumes the recorded redirect chain plus the
@@ -896,9 +1228,29 @@ def _execute_plan(
                 return
             signal["value"] = "INVALID"
 
-        if _commit_fenced(conn, run_id, claim, ts=ts, mutate=mutate) != "COMMITTED":
-            if run_is_cancelled(conn, run_id):
+        commit_status = _commit_fenced(
+            conn,
+            run_id,
+            claim,
+            ts=ts,
+            mutate=mutate,
+            transition=transition_box["value"],
+            transition_resolver=lambda: transition_box["value"],
+        )
+        if commit_status != "COMMITTED":
+            if commit_status == "CANCELLED" or run_is_cancelled(conn, run_id):
                 cancelled = True
+            elif commit_status == "STALE":
+                deferred = True
+                # STALE conflates two cases: a reclaimed (consumed) attempt
+                # versus a still-live one.  Only a consumed attempt lets the
+                # pass terminalize; a live attempt stays open for redrive.
+                live = conn.execute(
+                    "SELECT 1 FROM scrape_requests WHERE id = ?"
+                    " AND status = 'RUNNING' AND current_attempt_id = ?",
+                    (claim.request_id, claim.attempt_id),
+                ).fetchone()
+                ownership_lost = live is None
             break
 
         if is_enumeration:
@@ -906,7 +1258,7 @@ def _execute_plan(
         else:
             details += 1
         value = signal.get("value")
-        if value in ("INVALID", "FAILURE", "PARTIAL", "REFUSED"):
+        if value in ("INVALID", "FAILURE", "PARTIAL", "REFUSED", "RETRY"):
             run_degraded = True
             if is_enumeration or not listing_identity_sufficient:
                 coverage_degraded = True
@@ -922,6 +1274,12 @@ def _execute_plan(
             # do.
             terminal = True
 
+    if deferred and not ownership_lost:
+        # No provider I/O happened and no attempt was consumed.  Leave the
+        # durable frontier/group open for a later service pass rather than
+        # manufacturing a terminal outcome.  Ownership loss is excluded: a
+        # reclaimed attempt was consumed, so the pass terminalizes below.
+        return
     open_child_work = _open_acquisition_requests(conn, plan_id)
     if cancelled:
         outcome = "CANCELLED"
@@ -1080,7 +1438,39 @@ def _record_evidence(
 
 
 def _persist_fetch_attempt(conn, envelope, result, ts) -> str:
-    """Durable fetch attempt for one ResultEnvelope (02 §11.3, 03 §30)."""
+    """Durable fetch attempt for one ResultEnvelope (02 §11.3, 03 §30).
+
+    The attempt's pre-dispatch ``execution_plan_id`` and the returned result
+    must describe the same immutable execution identity.  This check runs
+    inside the owning fenced transaction, so an executor/caller bug cannot
+    attach a result from another plan/request/attempt to the current owner.
+    """
+    bound = conn.execute(
+        "SELECT execution_plan_id FROM request_attempts"
+        " WHERE attempt_id = ? AND request_id = ?",
+        (envelope.attempt_id, envelope.request_id),
+    ).fetchone()
+    if bound is None or bound["execution_plan_id"] != envelope.plan_id:
+        raise ValueError("fetch result has no matching bound execution plan")
+    identity_pairs = (
+        ("execution_plan_id", result.execution_plan_id, envelope.plan_id),
+        ("request_id", result.request_id, envelope.request_id),
+        ("attempt_id", result.attempt_id, envelope.attempt_id),
+        ("run_source_plan_id", result.run_source_plan_id, envelope.run_source_plan_id),
+        ("source_id", result.source_id, envelope.source_id),
+        ("binding_id", result.binding_id, envelope.binding_id),
+        ("binding_revision_id", result.binding_revision_id, envelope.binding_revision_id),
+        ("adapter_id", result.adapter_id, envelope.adapter_id),
+        ("adapter_version", result.adapter_version, envelope.adapter_version),
+        ("strategy", result.strategy, envelope.strategy),
+        ("execution_class", result.execution_class, envelope.execution_class),
+    )
+    mismatches = [name for name, actual, expected in identity_pairs if actual != expected]
+    if mismatches:
+        raise ValueError(
+            "ResultEnvelope identity does not match bound execution plan: "
+            + ", ".join(mismatches)
+        )
     fetch_attempt_id = new_id("fa")
     conn.execute(
         """

@@ -326,9 +326,14 @@ def test_no_new_runtime_dependencies():
 
 
 def test_service_never_blocks_event_loop_on_network_in_transaction():
-    # the driver performs the fetch with no transaction held (03 §50)
+    # the fetch runs with no transaction held (03 §50). Since S3.3 the
+    # service-owned dispatch seam (runtime/dispatch.py) owns the single
+    # execute_request call site; the pipeline driver keeps the fenced commit.
+    # The marker must appear verbatim at the call site, wherever it lives.
     driver = (SRC / "pipeline" / "driver.py").read_text(encoding="utf-8")
-    assert "execute_request(envelope, policy)  # NO transaction held" in driver
+    dispatch = (SRC / "runtime" / "dispatch.py").read_text(encoding="utf-8")
+    marker = "execute_request(envelope, policy)  # NO transaction held"
+    assert marker in driver or marker in dispatch
     assert "with fenced_commit(" in driver
 
     # the executor takes no connection/transaction argument: network waits

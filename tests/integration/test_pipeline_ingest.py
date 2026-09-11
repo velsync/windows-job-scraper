@@ -162,7 +162,7 @@ def _obs(
 
 
 def _ingest(db, observation, request_id, attempt_id, now=NOW, run_id=None,
-            outcome="SUCCEEDED", observed_at=None, source_id="src-feed",
+            outcome="SUCCEEDED", retry_delay_s=30.0, observed_at=None, source_id="src-feed",
             binding_id="bnd-feed", strategy="FEED_OR_PUBLIC_STRUCTURED_ENDPOINT"):
     """Ingest inside a fenced commit, exactly as the run driver does."""
 
@@ -183,7 +183,7 @@ def _ingest(db, observation, request_id, attempt_id, now=NOW, run_id=None,
         )
 
     with fenced_commit(db.conn, request_id, attempt_id, now=now, outcome=outcome,
-                       mutate=mutate):
+                       retry_delay_s=retry_delay_s, mutate=mutate):
         pass
 
 

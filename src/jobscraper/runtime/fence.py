@@ -1,33 +1,43 @@
-"""Fenced terminal commit (03 RUN-08).
+"""Fenced request-owned commit (03 RUN-08, Slice 3 S3.2/S3.4).
 
-Output persistence and the request terminal transition are atomic under the
-ownership fence:
-
-    BEGIN IMMEDIATE
-    verify: request RUNNING, current_attempt_id = this attempt,
-            lease_until > now, run not invalidated for terminal commit
-    persist: caller's outputs (observations, evidence, obligations,
-             child work, cursor)
-    transition: SUCCEEDED, or RETRY_WAIT when validated PARTIAL policy
-                requires retry
-    COMMIT
-
-If the ownership verification affects zero rows the worker MUST NOT commit
-request-owned outputs — everything rolls back, including anything the
-caller already wrote inside the fence.
+Request-owned output and the request transition share one serialized boundary.
+The fence verifies exact attempt ownership, an unexpired lease, the current
+service epoch and live authorization *inside* the transaction before any
+caller mutation executes.  A revoked/cancelled/stale worker therefore commits
+zero observations, child work, cursor state or terminal state.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 from contextlib import contextmanager
 
+from jobscraper.runtime.authorization import require_request_authorized
 from jobscraper.runtime.claims import StaleOwnership, _add_seconds
-from jobscraper.runtime.requests import ACQUISITION_REQUEST_TYPES
-from jobscraper.runtime.clock import db_utc_now
+from jobscraper.runtime.clock import current_service_epoch, db_utc_now
 
-_TERMINAL_OUTCOMES = frozenset({"SUCCEEDED", "RETRY_WAIT"})
+_FENCED_OUTCOMES = frozenset({"SUCCEEDED", "FAILED", "RETRY_WAIT"})
+
+@dataclass(frozen=True)
+class FenceTransition:
+    """Terminal request transition selected under the output fence."""
+
+    outcome: str = "SUCCEEDED"
+    retry_delay_s: float | None = None
+    failure_kind: str | None = None
+    failure_json: str | None = None
+
+    def validate(self) -> None:
+        if self.outcome not in _FENCED_OUTCOMES:
+            raise ValueError(
+                f"fenced outcome must be one of {sorted(_FENCED_OUTCOMES)}"
+            )
+        if self.outcome == "RETRY_WAIT" and (
+            self.retry_delay_s is None or self.retry_delay_s < 0
+        ):
+            raise ValueError("RETRY_WAIT requires a non-negative retry_delay_s")
 
 
 @contextmanager
@@ -40,68 +50,113 @@ def fenced_commit(
     outcome: str = "SUCCEEDED",
     retry_delay_s: float | None = None,
     failure_kind: str | None = None,
+    failure_json: str | None = None,
     mutate: Callable[[sqlite3.Connection], None] | None = None,
+    transition_resolver: Callable[[], FenceTransition] | None = None,
 ):
-    """Run ``mutate`` and the terminal transition under one ownership fence.
+    """Run caller mutations and the request transition under one fence."""
 
-    Yields nothing; the caller's ``mutate`` performs request-owned output
-    persistence. A ``StaleOwnership`` raised on entry means nothing was
-    written; the context body is never entered.
-    """
-    if outcome not in _TERMINAL_OUTCOMES:
-        raise ValueError(f"fenced outcome must be one of {sorted(_TERMINAL_OUTCOMES)}")
-    ts = now or db_utc_now(conn)
-    # §18: cancellation invalidates terminal commits for source-network
-    # acquisition work; host-native obligations keep draining locally (they
-    # never initiate source I/O).
-    request_type_row = conn.execute(
-        "SELECT request_type FROM scrape_requests WHERE id = ?", (request_id,)
-    ).fetchone()
-    request_type = request_type_row["request_type"] if request_type_row else ""
-    cancellation_guard = (
-        ""
-        if request_type not in ACQUISITION_REQUEST_TYPES
-        else """
-              AND NOT EXISTS (
-                  SELECT 1 FROM scrape_runs r WHERE r.id = scrape_requests.run_id
-                    AND r.cancel_requested_at IS NOT NULL)"""
+    transition = FenceTransition(
+        outcome=outcome,
+        retry_delay_s=retry_delay_s,
+        failure_kind=failure_kind,
+        failure_json=failure_json,
     )
+    transition.validate()
+
+    ts = now or db_utc_now(conn)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        epoch = current_service_epoch(conn)
+        if epoch is None:
+            raise StaleOwnership(request_id, "no active service epoch")
+
+        # First prove lease/attempt/epoch ownership.  This write also gives the
+        # transaction a concrete single-row fence before output persistence.
         verified = conn.execute(
             """
             UPDATE scrape_requests
-            SET heartbeat_at = ?, updated_at = ?
-            WHERE id = ? AND status = 'RUNNING' AND current_attempt_id = ?
-              AND lease_until > ?
-            """ + cancellation_guard,
-            (ts, ts, request_id, attempt_id, ts),
+               SET heartbeat_at = ?, updated_at = ?
+             WHERE id = ? AND status = 'RUNNING' AND current_attempt_id = ?
+               AND lease_until > ?
+               AND EXISTS (
+                   SELECT 1 FROM request_attempts a
+                    WHERE a.attempt_id = scrape_requests.current_attempt_id
+                      AND a.request_id = scrape_requests.id
+                      AND a.service_epoch_id = ?
+               )
+            """,
+            (ts, ts, request_id, attempt_id, ts, epoch.epoch_id),
         )
         if verified.rowcount != 1:
-            raise StaleOwnership(request_id, "ownership verification affected zero rows")
-        # The with-body (and then the mutate callback) run inside the fence;
-        # an exception from either rolls the whole transaction back.
+            raise StaleOwnership(request_id, "ownership/lease/service-epoch fence failed")
+
+        # Current authority is re-read under the same write transaction.  For
+        # host-native work this intentionally means LOCAL_PROCESSING authority;
+        # source-network cancellation/quarantine does not strand accepted
+        # evidence (R2-F3).
+        require_request_authorized(
+            conn,
+            request_id,
+            attempt_id=attempt_id,
+            require_running=True,
+        )
+
         yield conn
         if mutate is not None:
             mutate(conn)
-        if outcome == "SUCCEEDED":
+        if transition_resolver is not None:
+            transition = transition_resolver()
+            transition.validate()
+
+        if transition.outcome == "SUCCEEDED":
             conn.execute(
-                "UPDATE scrape_requests SET status = 'SUCCEEDED', finished_at = ?,"
-                " current_worker_id = NULL, current_attempt_id = NULL, lease_until = NULL,"
-                " updated_at = ? WHERE id = ?",
+                """
+                UPDATE scrape_requests
+                   SET status = 'SUCCEEDED', finished_at = ?,
+                       next_retry_at = NULL,
+                       current_worker_id = NULL, current_attempt_id = NULL,
+                       lease_until = NULL, updated_at = ?
+                 WHERE id = ?
+                """,
                 (ts, ts, request_id),
             )
-        else:  # RETRY_WAIT: outputs committed, request stays retryable
-            next_retry = _add_seconds(ts, retry_delay_s if retry_delay_s is not None else 5.0)
+        elif transition.outcome == "FAILED":
             conn.execute(
-                "UPDATE scrape_requests SET status = 'RETRY_WAIT', next_retry_at = ?,"
-                " current_worker_id = NULL, current_attempt_id = NULL, lease_until = NULL,"
-                " last_failure_kind = ?, updated_at = ? WHERE id = ?",
-                (next_retry, failure_kind, ts, request_id),
+                """
+                UPDATE scrape_requests
+                   SET status = 'FAILED', finished_at = ?,
+                       next_retry_at = NULL,
+                       current_worker_id = NULL, current_attempt_id = NULL,
+                       lease_until = NULL, last_failure_kind = ?,
+                       last_failure_json = COALESCE(?, last_failure_json),
+                       updated_at = ?
+                 WHERE id = ?
+                """,
+                (ts, transition.failure_kind, transition.failure_json, ts, request_id),
             )
+        else:
+            next_retry = _add_seconds(ts, float(transition.retry_delay_s))
+            conn.execute(
+                """
+                UPDATE scrape_requests
+                   SET status = 'RETRY_WAIT', next_retry_at = ?,
+                       current_worker_id = NULL, current_attempt_id = NULL,
+                       lease_until = NULL, last_failure_kind = ?,
+                       last_failure_json = COALESCE(?, last_failure_json),
+                       updated_at = ?
+                 WHERE id = ?
+                """,
+                (next_retry, transition.failure_kind, transition.failure_json, ts, request_id),
+            )
+
         conn.execute(
-            "UPDATE request_attempts SET outcome = ?, finished_at = ? WHERE attempt_id = ?",
-            (outcome, ts, attempt_id),
+            """
+            UPDATE request_attempts
+               SET outcome = ?, failure_kind = ?, finished_at = ?
+             WHERE attempt_id = ? AND request_id = ?
+            """,
+            (transition.outcome, transition.failure_kind, ts, attempt_id, request_id),
         )
         conn.execute("COMMIT")
     except BaseException:
@@ -112,4 +167,4 @@ def fenced_commit(
         raise
 
 
-__all__ = ["fenced_commit"]
+__all__ = ["FenceTransition", "fenced_commit"]

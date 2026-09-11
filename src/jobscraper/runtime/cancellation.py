@@ -1,31 +1,30 @@
-"""Durable cancellation semantics (03 §18).
+"""Durable cancellation semantics (03 §18, S3.4).
 
-Cancelling a run:
-
-* sets ``cancel_requested_at`` and stops new source-network acquisition
-  claims for that run (enforced in ``claims.claim_next_request``);
-* pending/retry-wait acquisition requests become ``CANCELLED``;
-* running workers observe cancellation at the fence (their commit is
-  refused) and cooperatively abandon via ``abandon_request_for_cancellation``;
-* already accepted observations/evidence remain valid;
-* durable host-native processing obligations already created for accepted
-  observations are NOT cancelled — they keep draining locally and never
-  initiate source I/O;
-* nothing is deleted.
+Cancelling a run stops new source-network acquisition while preserving
+already-accepted evidence and its host-native processing obligations.  Running
+acquisition workers lose terminal-commit authority at the fence; host-native
+obligations remain locally claimable and never gain source-network authority.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from jobscraper.runtime.clock import db_utc_now
 from jobscraper.runtime.requests import ACQUISITION_REQUEST_TYPES
 
 
-def request_run_cancellation(conn: sqlite3.Connection, run_id: str, *, now: str | None = None) -> None:
-    """Durably request cancellation of a run and cancel its pending
-    acquisition work."""
+def request_run_cancellation(
+    conn: sqlite3.Connection, run_id: str, *, now: str | None = None
+) -> None:
+    """Durably request cancellation and close pending network acquisition."""
     ts = now or db_utc_now(conn)
+    detail = json.dumps(
+        {"kind": "CANCELLED", "detail": "run cancellation requested"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
@@ -37,22 +36,23 @@ def request_run_cancellation(conn: sqlite3.Connection, run_id: str, *, now: str 
         conn.execute(
             f"""
             UPDATE scrape_requests
-            SET status = 'CANCELLED', finished_at = ?, updated_at = ?,
-                current_worker_id = NULL, current_attempt_id = NULL, lease_until = NULL
-            WHERE run_id = ? AND status IN ('PENDING', 'RETRY_WAIT')
-              AND request_type IN ({placeholders})
+               SET status = 'CANCELLED', finished_at = ?, updated_at = ?,
+                   next_retry_at = NULL, current_worker_id = NULL, current_attempt_id = NULL,
+                   lease_until = NULL, last_failure_kind = 'CANCELLED',
+                   last_failure_json = ?
+             WHERE run_id = ? AND status IN ('PENDING', 'RETRY_WAIT')
+               AND request_type IN ({placeholders})
             """,
-            (ts, ts, run_id, *sorted(ACQUISITION_REQUEST_TYPES)),
+            (ts, ts, detail, run_id, *sorted(ACQUISITION_REQUEST_TYPES)),
         )
-        # Groups whose work can never run are terminally CANCELLED.
         conn.execute(
             """
             UPDATE run_source_plans SET group_outcome = 'CANCELLED'
-            WHERE run_id = ? AND group_outcome IS NULL
-              AND NOT EXISTS (
-                  SELECT 1 FROM scrape_requests r
-                  WHERE r.run_source_plan_id = run_source_plans.id
-                    AND r.status NOT IN ('CANCELLED', 'FAILED', 'SUCCEEDED'))
+             WHERE run_id = ? AND group_outcome IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM scrape_requests r
+                    WHERE r.run_source_plan_id = run_source_plans.id
+                      AND r.status NOT IN ('CANCELLED', 'FAILED', 'SUCCEEDED'))
             """,
             (run_id,),
         )
@@ -63,30 +63,64 @@ def request_run_cancellation(conn: sqlite3.Connection, run_id: str, *, now: str 
 
 
 def abandon_request_for_cancellation(
-    conn: sqlite3.Connection, request_id: str, *, now: str | None = None
+    conn: sqlite3.Connection,
+    request_id: str,
+    *,
+    attempt_id: str | None = None,
+    now: str | None = None,
 ) -> None:
-    """A running worker that observed the fence refusing its commit ends
-    its request as CANCELLED (its outputs were already rolled back)."""
+    """Close the still-current running acquisition after its fence was denied.
+
+    Request-owned outputs were rolled back before this function is called.
+    Existing observations from earlier accepted attempts are never deleted.
+    """
     ts = now or db_utc_now(conn)
+    detail = json.dumps(
+        {"kind": "CANCELLED", "detail": "current run authority cancelled"},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
-            "SELECT current_attempt_id FROM scrape_requests WHERE id = ?", (request_id,)
+            """
+            SELECT req.current_attempt_id, req.request_type, run.cancel_requested_at
+              FROM scrape_requests req
+              JOIN scrape_runs run ON run.id = req.run_id
+             WHERE req.id = ?
+            """,
+            (request_id,),
         ).fetchone()
-        if row is None:
+        if (
+            row is None
+            or row["request_type"] not in ACQUISITION_REQUEST_TYPES
+            or row["cancel_requested_at"] is None
+            or (attempt_id is not None and row["current_attempt_id"] != attempt_id)
+        ):
+            # R2-F3: this helper can never silently cancel a host-native
+            # obligation or a newer owner that replaced the caller's attempt.
             conn.execute("COMMIT")
             return
         if row["current_attempt_id"]:
             conn.execute(
-                "UPDATE request_attempts SET outcome = 'CANCELLED', finished_at = ?"
-                " WHERE attempt_id = ?",
-                (ts, row["current_attempt_id"]),
+                """
+                UPDATE request_attempts
+                   SET outcome = 'CANCELLED', failure_kind = 'CANCELLED',
+                       finished_at = ?
+                 WHERE attempt_id = ? AND request_id = ?
+                """,
+                (ts, row["current_attempt_id"], request_id),
             )
         conn.execute(
-            "UPDATE scrape_requests SET status = 'CANCELLED', finished_at = ?,"
-            " current_worker_id = NULL, current_attempt_id = NULL, lease_until = NULL,"
-            " updated_at = ? WHERE id = ? AND status = 'RUNNING'",
-            (ts, ts, request_id),
+            """
+            UPDATE scrape_requests
+               SET status = 'CANCELLED', finished_at = ?,
+                   next_retry_at = NULL, current_worker_id = NULL, current_attempt_id = NULL,
+                   lease_until = NULL, last_failure_kind = 'CANCELLED',
+                   last_failure_json = ?, updated_at = ?
+             WHERE id = ? AND status = 'RUNNING'
+            """,
+            (ts, detail, ts, request_id),
         )
         conn.execute("COMMIT")
     except BaseException:

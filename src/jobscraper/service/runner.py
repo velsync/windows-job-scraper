@@ -24,6 +24,7 @@ from jobscraper.db.connection import Database
 from jobscraper.db.migrations import open_database_at_latest
 from jobscraper.diagnostics.events import append_event, event
 from jobscraper.paths import ensure_app_directories
+from jobscraper.runtime.capacity import configure_service_capacity
 from jobscraper.security.install_secret import load_or_create_install_secret
 from jobscraper.service.app import create_service_app
 from jobscraper.service.lifespan import ServiceLifespan
@@ -89,6 +90,11 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
     ensure_app_directories(paths)
     secret = install_secret or load_or_create_install_secret(paths)
 
+    # S3.3: install the one process-lifetime coordinator before opening any
+    # service resource.  A configuration refusal therefore cannot leak an
+    # already-open database connection. Executors receive reservations; they
+    # never own durable claims or capacity policy.
+    configure_service_capacity(config)
     db = open_service_database(config)
     try:
         sock = _bind_loopback_socket(config.loopback_host)

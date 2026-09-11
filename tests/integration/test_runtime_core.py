@@ -36,6 +36,7 @@ from jobscraper.runtime.claims import (
     heartbeat,
     reclaim_expired,
 )
+from jobscraper.runtime.authorization import AuthorizationDenied
 from jobscraper.runtime.fence import fenced_commit
 from jobscraper.runtime.requests import (
     enqueue_request,
@@ -513,8 +514,11 @@ def test_cancellation_semantics(db):
     # running request stays RUNNING until its worker observes the fence
     row = db.conn.execute("SELECT status FROM scrape_requests WHERE id=?", (rid_running,)).fetchone()
     assert row["status"] == "RUNNING"
-    # the running worker loses commit authority at the fence
-    with pytest.raises(StaleOwnership):
+    # the running worker loses commit authority at the fence. Since S3.2 the
+    # fence evaluates live authorization first, so a cancelled run is denied
+    # with AuthorizationDenied rather than StaleOwnership; either way the
+    # fenced body is never entered and nothing is committed.
+    with pytest.raises(AuthorizationDenied):
         with fenced_commit(db.conn, rid_running, claim.attempt_id, now=LATER):
             pass  # pragma: no cover
     # it then cooperatively abandons for cancellation

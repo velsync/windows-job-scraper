@@ -24,7 +24,12 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
-from jobscraper.acquisition.envelope import ExecutionPlanEnvelope, RequestPlan
+from jobscraper.acquisition.envelope import (
+    ExecutionPlanEnvelope,
+    RequestPlan,
+    bind_execution_plan,
+    policy_snapshot_reference,
+)
 from jobscraper.acquisition.httpexec import execute_request
 from jobscraper.acquisition.pagevalidity import PageClass, classify_page
 from jobscraper.acquisition.result import ResultEnvelope
@@ -324,7 +329,7 @@ def _plan_request(
         adapter_version=plan_row["adapter_version"],
         strategy=plan_row["strategy"],
         execution_class=plan_row["execution_class"],
-        policy_snapshot_ref=None,
+        policy_snapshot_ref=policy_snapshot_reference(plan_row),
         permission_profile_id=plan_row["permission_profile_id"],
         permission_profile_revision=plan_row["permission_profile_revision"],
         payload_kind="REQUEST",
@@ -432,6 +437,9 @@ def execute_source_discovery(
         raise DiscoveryError("durable SOURCE_DISCOVERY request is not claimable")
 
     _plan_row, source, _request_plan, envelope = _plan_request(conn, queued, claim)
+    # S3.2: bind the exact claimed/run-plan identity before any network I/O so
+    # the fenced commit can prove result/envelope/attempt identity (CR-07).
+    bind_execution_plan(conn, envelope, now=claim_ts)
     result = execute_request(
         envelope, source_policy(source, adapter_id=_DISCOVERY_ADAPTER_ID)
     )
