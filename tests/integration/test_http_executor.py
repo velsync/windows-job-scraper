@@ -330,12 +330,32 @@ def test_304_revalidation(server):
     assert first.was_304 is False
     etag = first.headers_redacted.get("ETag")
     assert etag
+    # S3.7 (§40): conditional validators are host-owned. The executor test
+    # models the production grant that prepare_revalidation attaches after
+    # exact cache compatibility; ungranted conditional headers stay refused.
     second = execute_request(
-        _envelope(server, "/etag", headers={"Accept": "application/json", "If-None-Match": etag}),
+        _envelope(
+            server,
+            "/etag",
+            headers={"Accept": "application/json", "If-None-Match": etag},
+            revalidation_headers_allowed=True,
+        ),
         _policy(),
     )
     assert second.was_304 is True
     assert second.body == b""
+
+
+def test_ungranted_conditional_headers_are_refused(server):
+    # S3.7 host-ownership invariant at the executor boundary: adapter/caller
+    # supplied If-None-Match without the host grant fails closed.
+    import pytest
+
+    etag_envelope = _envelope(
+        server, "/etag", headers={"Accept": "application/json", "If-None-Match": '"abc123"'}
+    )
+    with pytest.raises(ValueError, match="host-owned"):
+        execute_request(etag_envelope, _policy())
 
 
 def test_plaintext_endpoint_requested_as_https_fails_closed_as_tls_error(server):

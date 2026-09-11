@@ -265,6 +265,33 @@ def test_registry_has_no_dynamic_import_path():
 # ------------------------------------------------- second-write-path guards
 
 
+# S3.7 (§40) narrow exception: a compatible-304 verification may advance
+# verification timestamps without touching canonical state. A non-pipeline
+# module may UPDATE job_sources only if every such statement assigns
+# exclusively to the verification-timestamp columns (monotonic CASE-guarded)
+# and the module never INSERTs into or DELETEs from job_sources.
+_VERIFICATION_TIMESTAMP_ONLY_COLUMNS = frozenset({"last_verified_at", "updated_at"})
+
+
+def _job_sources_writes_are_verification_timestamp_only(text: str) -> bool:
+    if re.search(r"INSERT INTO job_sources\b", text):
+        return False
+    if re.search(r"DELETE FROM job_sources\b", text):
+        return False
+    found = False
+    for match in re.finditer(r"UPDATE job_sources\b(.*?)(?:\bWHERE\b|;|$)", text, re.S):
+        found = True
+        set_match = re.search(r"\bSET\b", match.group(1), re.I)
+        clause = match.group(1)[set_match.end():] if set_match else match.group(1)
+        # Strip CASE..END blocks so column references inside guards do not
+        # count as assignment targets; only top-level SET targets remain.
+        clause = re.sub(r"\bCASE\b.*?\bEND\b", "", clause, flags=re.S | re.I)
+        targets = set(re.findall(r"(\w+)\s*=(?!=)", clause))
+        if not targets or not targets <= _VERIFICATION_TIMESTAMP_ONLY_COLUMNS:
+            return False
+    return found
+
+
 @pytest.mark.parametrize(
     "table", ["jobs", "job_sources", "job_locations", "companies", "job_observations"]
 )
@@ -285,7 +312,12 @@ def test_only_pipeline_writes_canonical_and_observation_state(table: str):
         )
         if any(re.search(pattern, text) for pattern in patterns):
             writers.append(path.relative_to(REPO_ROOT).as_posix())
-    assert all(w.startswith("src/jobscraper/pipeline/") for w in writers), (table, writers)
+    for w in writers:
+        if w.startswith("src/jobscraper/pipeline/"):
+            continue
+        assert table == "job_sources" and _job_sources_writes_are_verification_timestamp_only(
+            (REPO_ROOT / w).read_text(encoding="utf-8")
+        ), (table, w)
 
 
 @pytest.mark.parametrize(

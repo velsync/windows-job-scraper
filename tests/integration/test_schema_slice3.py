@@ -56,6 +56,11 @@ S3_5_STEP_SHA256 = {
     16: "176f8fac243b988bd5bd1180048ec8ee897184a3ceb741f6a7b6ffd2d397acd0",
 }
 
+# S3.7 appends the next unused migration per R2-F1. v16 stays byte-frozen.
+S3_7_STEP_SHA256 = {
+    17: "485d0f05caf5b9b85231e7d5aa9e55890183ee735d0c015d78b0e4507179ed31",
+}
+
 
 def _digest(sql: str) -> str:
     return hashlib.sha256(sql.encode()).hexdigest()
@@ -84,13 +89,22 @@ def test_s30_v15_is_sequential_and_pinned():
 
 def test_s35_v16_is_sequential_and_pinned():
     versions = [version for version, _name, _sql in MIGRATION_STEPS]
-    assert versions == list(range(1, 17))
-    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 16
+    assert versions[:16] == list(range(1, 17))
     name, sql = _step(16)
     assert name == "s3_5_binding_revision_crawl_cursor"
     assert _digest(sql) == S3_5_STEP_SHA256[16]
-    # S3.5 appends. It never edits the accepted S3.0 migration.
+    # Later packages append only; v15/v16 remain exact accepted bytes.
     assert _digest(_step(15)[1]) == S3_0_STEP_SHA256[15]
+
+
+def test_s37_v17_is_next_unused_sequential_and_pinned():
+    versions = [version for version, _name, _sql in MIGRATION_STEPS]
+    assert versions == list(range(1, 18))
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 17
+    name, sql = _step(17)
+    assert name == "s3_7_revalidation_cache"
+    assert _digest(sql) == S3_7_STEP_SHA256[17]
+    assert _digest(_step(16)[1]) == S3_5_STEP_SHA256[16]
 
 
 def test_v16_rebuild_preserves_legacy_cursor_without_guessing_provenance(tmp_path):

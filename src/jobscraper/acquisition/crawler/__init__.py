@@ -46,6 +46,22 @@ from .sitemap import (
     parse_sitemap,
     prioritized_candidates,
 )
+from .revalidation import (
+    CachedMembership,
+    RevalidationCompatibilityError,
+    RevalidationPreparation,
+    RevalidationReuse,
+    acquire_backup_hold,
+    bind_fetch_representation,
+    prepare_revalidation,
+    prune_representation,
+    release_hold,
+    request_variant_key,
+    resolve_304,
+    restore_membership,
+    store_representation,
+    touch_representation,
+)
 from .scope import CrawlScope, ScopeDecision, check_scope, scope_from_plan
 
 __all__ = [
@@ -61,5 +77,9 @@ __all__ = [
     "SitemapEnqueueResult", "SitemapLimits", "SitemapParseResult",
     "build_sitemap_request_plan", "discover_sitemaps_from_robots",
     "enqueue_robots_sitemaps", "enqueue_sitemap_result", "parse_sitemap", "prioritized_candidates",
+    "CachedMembership", "RevalidationCompatibilityError", "RevalidationPreparation", "RevalidationReuse",
+    "acquire_backup_hold", "bind_fetch_representation", "prepare_revalidation", "prune_representation",
+    "release_hold", "request_variant_key", "resolve_304", "restore_membership",
+    "store_representation", "touch_representation",
     "CrawlScope", "ScopeDecision", "check_scope", "scope_from_plan",
 ]

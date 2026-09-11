@@ -74,8 +74,19 @@ from jobscraper.acquisition.crawler.sitemap import (
     enqueue_sitemap_result,
     parse_sitemap,
 )
+from jobscraper.acquisition.crawler.revalidation import (
+    RevalidationCompatibilityError,
+    RevalidationPreparation,
+    bind_fetch_representation,
+    prepare_revalidation,
+    release_hold,
+    resolve_304,
+    restore_membership,
+    store_representation,
+    touch_representation,
+)
 from jobscraper.acquisition.crawler.scope import check_scope, scope_from_plan
-from jobscraper.acquisition.pagevalidity import PageClass, classify_page
+from jobscraper.acquisition.pagevalidity import PageClass, PageClassification, classify_page
 from jobscraper.adapters.contract import (
     NORMAL_PARSE_CLASSES,
     AdapterTask,
@@ -730,6 +741,9 @@ def _execute_plan(
         claim_depth = int(request_meta["depth"] if request_meta is not None else 0)
         claim_priority = int(request_meta["priority"] if request_meta is not None else 0)
         claim_payload = dict(claim.payload or {})
+        host_revalidation_mode = str(
+            claim_payload.pop("_host_revalidation", "") or ""
+        ).upper()
         crawl_role = str(claim_payload.get("role") or "").upper()
         is_robots = (
             claim.request_type == "SOURCE_CRAWL" and crawl_role == "ROBOTS"
@@ -974,6 +988,71 @@ def _execute_plan(
 
             page_robots_decision = robots_decision
 
+        # S3.7: conditional validators are host-owned and can be attached
+        # only after exact cache compatibility. Robots/sitemaps keep their
+        # existing metadata paths and are not revalidated here.
+        eligible_revalidation = (
+            claim.request_type in {"LIST_FETCH", "DETAIL_FETCH", "SOURCE_CRAWL"}
+            and not is_robots
+            and not is_sitemap
+        )
+        revalidation_preparation = RevalidationPreparation(
+            request_plan=request_plan,
+            reason="NOT_ELIGIBLE",
+        )
+        if eligible_revalidation:
+            expected_cache_classes = (
+                ("VALID_JOB",)
+                if task_kind is AdapterTaskKind.DETAIL
+                else ("VALID_LIST", "EMPTY")
+            )
+            try:
+                revalidation_preparation = prepare_revalidation(
+                    conn,
+                    plan_row=plan_row,
+                    request_plan=request_plan,
+                    attempt_id=claim.attempt_id,
+                    expected_page_classes=expected_cache_classes,
+                    require_membership=is_enumeration,
+                    normalization_version=NORMALIZATION_VERSION,
+                    now=ts,
+                    force_unconditional=(
+                        host_revalidation_mode == "UNCONDITIONAL"
+                    ),
+                )
+                request_plan = revalidation_preparation.request_plan
+            except RevalidationCompatibilityError as exc:
+                status = _commit_fenced(
+                    conn, run_id, claim, ts=ts,
+                    mutate=lambda cursor_conn, _exc=exc: _record_evidence(
+                        cursor_conn,
+                        request_id=claim.request_id,
+                        attempt_id=claim.attempt_id,
+                        kind="SECURITY_POLICY",
+                        ref="cache://REVALIDATION_PLAN_REFUSED",
+                        detail={"reason": str(_exc)[:500]},
+                        content_hash=None,
+                        now=ts,
+                    ),
+                    transition=FenceTransition(
+                        outcome="FAILED",
+                        failure_kind=FailureKind.POLICY_REJECTED.value,
+                        failure_json=bounded_json({
+                            "reason": "REVALIDATION_PLAN_REFUSED",
+                            "detail": str(exc)[:500],
+                        }),
+                    ),
+                )
+                if status == "CANCELLED":
+                    cancelled = True
+                elif status == "STALE":
+                    deferred = True
+                else:
+                    run_degraded = True
+                    if is_enumeration or not listing_identity_sufficient:
+                        coverage_degraded = True
+                continue
+
         envelope = ExecutionPlanEnvelope(
             plan_id=new_id("plan"),
             request_id=claim.request_id,
@@ -1000,6 +1079,15 @@ def _execute_plan(
                 max_bytes=request_plan.max_bytes,
                 purpose=claim.request_type,
                 allowed_redirects=policy.max_redirects,
+                cache_policy=request_plan.cache_policy,
+                revalidation_headers_allowed=(
+                    revalidation_preparation.conditional
+                    if eligible_revalidation else False
+                ),
+                auth_scope_ref=(
+                    str(plan_row["auth_scope_id"])
+                    if plan_row["auth_scope_id"] else None
+                ),
                 egress_requirement=None,
                 expected_operation_class="READ",
             ),
@@ -1210,6 +1298,29 @@ def _execute_plan(
         result = dispatched.result
         classification = dispatched.classification
         retry_decision = dispatched.retry
+        revalidation_reuse = None
+        if result.was_304 and eligible_revalidation:
+            revalidation_reuse = resolve_304(
+                conn,
+                preparation=revalidation_preparation,
+                plan_row=plan_row,
+                request_plan=request_plan,
+                expected_page_classes=expected_cache_classes,
+                require_membership=is_enumeration,
+                normalization_version=NORMALIZATION_VERSION,
+            )
+            if revalidation_reuse.accepted:
+                # Keep transport ResultEnvelope untouched until its durable
+                # fetch/result evidence records the real bodyless 304.
+                classification = PageClassification(
+                    PageClass(revalidation_reuse.validated_page_class),
+                    {
+                        "status_code": 304,
+                        "revalidated_from_cache": True,
+                        "cache_representation_id": revalidation_reuse.representation_id,
+                        "retained_membership_count": len(revalidation_reuse.membership),
+                    },
+                )
         robots_policy = (
             parse_robots_result(result)
             if is_robots and retry_decision.action is RetryAction.SUCCEED
@@ -1262,7 +1373,17 @@ def _execute_plan(
         }
 
         def mutate(cursor_conn):
-            fetch_attempt_id = _persist_fetch_attempt(cursor_conn, envelope, result, ts)
+            fetch_attempt_id = _persist_fetch_attempt(
+                cursor_conn,
+                envelope,
+                result,
+                ts,
+                cache_representation_id=(
+                    revalidation_reuse.representation_id
+                    if revalidation_reuse is not None and revalidation_reuse.accepted
+                    else None
+                ),
+            )
             _record_evidence(
                 cursor_conn,
                 request_id=claim.request_id,
@@ -1274,6 +1395,25 @@ def _execute_plan(
                 content_hash=result.normalized_content_hash,
                 now=ts,
             )
+            if (
+                result.was_304
+                and revalidation_reuse is not None
+                and revalidation_reuse.accepted
+            ):
+                # Raw transport evidence above remains a bodyless 304. Only
+                # parser-facing state is now restored from the held cache row.
+                result.body = revalidation_reuse.body or b""
+                result.content_type = revalidation_reuse.content_type
+                result.body_hash = revalidation_reuse.body_hash
+                result.normalized_content_hash = (
+                    revalidation_reuse.normalized_content_hash
+                )
+                result.cache_representation_ref = (
+                    f"cache://{revalidation_reuse.representation_id}"
+                )
+                result.body_ref = (
+                    f"cache://{revalidation_reuse.representation_id}/body"
+                )
             if result.security_policy_result != "ALLOWED":
                 # the denial itself is durable evidence (04 §5.1): an empty
                 # result must always be explainable as a policy outcome
@@ -1342,6 +1482,80 @@ def _execute_plan(
                 record_rate_success(
                     cursor_conn, dispatched.rate_key, now=ts, commit=False
                 )
+            if (
+                result.was_304
+                and eligible_revalidation
+                and (revalidation_reuse is None or not revalidation_reuse.accepted)
+            ):
+                # Missing/pruned/incompatible 304 never means EMPTY. Queue one
+                # ordinary durable unconditional replacement; no second hidden
+                # network call occurs inside this attempt.
+                usage = load_usage(cursor_conn, plan_id, now=ts)
+                budget_decision = check_budget(
+                    crawl_budget,
+                    usage,
+                    proposed_request_type=claim.request_type,
+                    proposed_depth=claim_depth,
+                    proposed_execution_class=plan_row["execution_class"],
+                )
+                reason = (
+                    revalidation_reuse.reason
+                    if revalidation_reuse is not None
+                    else "304_WITHOUT_CACHE_REPRESENTATION"
+                )
+                _record_evidence(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    fetch_attempt_id=fetch_attempt_id,
+                    kind="REVIEW",
+                    ref="cache://304_REFETCH_REQUIRED",
+                    detail={
+                        "reason": reason,
+                        "absence_authority": False,
+                        "treated_as_empty": False,
+                    },
+                    content_hash=None,
+                    now=ts,
+                )
+                if not budget_decision.allowed:
+                    if (
+                        (is_enumeration or not listing_identity_sufficient)
+                        and not coverage_finalized
+                    ):
+                        degrade_coverage(
+                            cursor_conn,
+                            coverage_id,
+                            reason=f"304 refetch blocked: {budget_decision.reason}",
+                            commit=False,
+                        )
+                    signal["value"] = "BUDGET_STOP"
+                    signal["degraded"] = True
+                    signal["budget_exhausted"] = True
+                    return
+                refetch_payload = dict(claim_payload)
+                refetch_payload["_host_revalidation"] = "UNCONDITIONAL"
+                enqueue_request(
+                    cursor_conn,
+                    run_id=run_id,
+                    run_source_plan_id=plan_id,
+                    source_id=plan_row["source_id"],
+                    binding_id=plan_row["binding_id"],
+                    request_type=claim.request_type,
+                    target_identity=request_plan.url,
+                    payload=refetch_payload,
+                    strategy=plan_row["strategy"],
+                    execution_class=plan_row["execution_class"],
+                    priority=claim_priority + 1,
+                    depth=claim_depth,
+                    parent_request_id=claim.request_id,
+                    logical_key=f"unconditional-revalidation:{claim.request_id}",
+                    now=ts,
+                    commit=False,
+                )
+                signal["value"] = "REFETCH"
+                return
+
             if is_robots:
                 # This is policy evidence, not a source page parse. Even a
                 # text/plain robots response classified UNEXPECTED_CONTENT by
@@ -1447,6 +1661,42 @@ def _execute_plan(
                 signal["value"] = "SITEMAP_PROCESSED"
                 return
             if classification.state in NORMAL_PARSE_CLASSES:
+                if (
+                    result.was_304
+                    and revalidation_reuse is not None
+                    and revalidation_reuse.accepted
+                ):
+                    touch_representation(
+                        cursor_conn,
+                        revalidation_reuse.representation_id,
+                        now=ts,
+                        commit=False,
+                    )
+                    if is_enumeration and not coverage_finalized:
+                        restore_membership(
+                            cursor_conn,
+                            representation_id=revalidation_reuse.representation_id,
+                            coverage_id=coverage_id,
+                            plan_row=plan_row,
+                            now=ts,
+                            commit=False,
+                        )
+                    _record_evidence(
+                        cursor_conn,
+                        request_id=claim.request_id,
+                        attempt_id=claim.attempt_id,
+                        fetch_attempt_id=fetch_attempt_id,
+                        kind="REVIEW",
+                        ref="cache://304_REUSE",
+                        detail={
+                            "cache_representation_id": revalidation_reuse.representation_id,
+                            "validated_page_class": revalidation_reuse.validated_page_class,
+                            "membership_count": len(revalidation_reuse.membership),
+                            "content_revision_increment": False,
+                        },
+                        content_hash=revalidation_reuse.normalized_content_hash,
+                        now=ts,
+                    )
                 # EMPTY is a recognized non-job outcome (§21): the adapter parse
                 # yields SUCCESS_EMPTY, which terminates the enumeration
                 # authoritatively (ACQ-02).
@@ -1614,6 +1864,54 @@ def _execute_plan(
                     if task_kind in _CURSOR_TASK_KINDS
                     else None
                 )
+                if (
+                    not result.was_304
+                    and result.status_code is not None
+                    and 200 <= int(result.status_code) < 300
+                    and outcome_obj.kind
+                    in {ParseOutcomeKind.SUCCESS_WITH_JOBS, ParseOutcomeKind.SUCCESS_EMPTY}
+                ):
+                    representation_id = store_representation(
+                        cursor_conn,
+                        plan_row=plan_row,
+                        request_plan=request_plan,
+                        validated_page_class=classification.state.value,
+                        body=result.body,
+                        body_hash=result.body_hash,
+                        normalized_content_hash=result.normalized_content_hash,
+                        content_type=result.content_type,
+                        response_headers=result.headers_redacted,
+                        observations=outcome_obj.observations,
+                        membership_complete=is_enumeration,
+                        normalization_version=NORMALIZATION_VERSION,
+                        now=ts,
+                        commit=False,
+                    )
+                    if representation_id is not None:
+                        result.cache_representation_ref = f"cache://{representation_id}"
+                        bind_fetch_representation(
+                            cursor_conn,
+                            fetch_attempt_id,
+                            representation_id,
+                            commit=False,
+                        )
+                        _record_evidence(
+                            cursor_conn,
+                            request_id=claim.request_id,
+                            attempt_id=claim.attempt_id,
+                            fetch_attempt_id=fetch_attempt_id,
+                            parse_attempt_id=parse_attempt_id,
+                            kind="REVIEW",
+                            ref=f"cache://{representation_id}",
+                            detail={
+                                "reason": "REPRESENTATION_STORED",
+                                "validated_page_class": classification.state.value,
+                                "membership_complete": bool(is_enumeration),
+                                "normalized_content_hash": result.normalized_content_hash,
+                            },
+                            content_hash=result.normalized_content_hash,
+                            now=ts,
+                        )
                 if next_cursor is not None:
                     new_guard, pagination_decision = advance_guard(
                         pagination_guard,
@@ -1781,6 +2079,12 @@ def _execute_plan(
             mutate=mutate,
             transition=transition_box["value"],
             transition_resolver=lambda: transition_box["value"],
+        )
+        release_hold(
+            conn,
+            revalidation_preparation.hold_id,
+            now=db_utc_now(conn),
+            commit=True,
         )
         if commit_status != "COMMITTED":
             if commit_status == "CANCELLED" or run_is_cancelled(conn, run_id):
@@ -2029,7 +2333,9 @@ def _record_evidence(
     return evidence_id
 
 
-def _persist_fetch_attempt(conn, envelope, result, ts) -> str:
+def _persist_fetch_attempt(
+    conn, envelope, result, ts, *, cache_representation_id: str | None = None
+) -> str:
     """Durable fetch attempt for one ResultEnvelope (02 §11.3, 03 §30).
 
     The attempt's pre-dispatch ``execution_plan_id`` and the returned result
@@ -2074,9 +2380,9 @@ def _persist_fetch_attempt(conn, envelope, result, ts) -> str:
             contract_version, execution_plan_id, headers_redacted_json,
             validators_sent_json, robots_decision, transport, browser_used,
             resource_blocking_applied, security_policy_json,
-            structured_payload_ref)
+            structured_payload_ref, cache_representation_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?)
+                 ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             fetch_attempt_id,
@@ -2114,6 +2420,7 @@ def _persist_fetch_attempt(conn, envelope, result, ts) -> str:
                 default=str,
             ),
             result.structured_payload_ref,
+            cache_representation_id,
         ),
     )
     return fetch_attempt_id

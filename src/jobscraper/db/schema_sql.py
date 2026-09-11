@@ -1424,6 +1424,88 @@ ALTER TABLE crawl_cursors_v16 RENAME TO crawl_cursors;
     return sql
 
 
+
+# ------------------------- v17 S3.7 revalidation cache / retained membership
+# R2-F1: v16 is frozen by S3.5; S3.7 owns the next unused migration.
+# 304 reuse requires an exact retained representation; authoritative list
+# reuse additionally requires retained membership. Holds protect active
+# revalidation/backup references from pruning.
+@_step(17, "s3_7_revalidation_cache")
+def _(sql: str = '''
+CREATE TABLE cache_representation (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES sources(id),
+    binding_revision_id TEXT NOT NULL REFERENCES source_adapter_binding_revisions(id),
+    auth_scope_ref TEXT NOT NULL,
+    request_variant_key TEXT NOT NULL,
+    validated_page_class TEXT NOT NULL
+        CHECK (validated_page_class IN ('VALID_LIST', 'VALID_JOB', 'EMPTY')),
+    body_hash TEXT NOT NULL,
+    normalized_content_hash TEXT NOT NULL,
+    content_type TEXT,
+    body_blob BLOB,
+    parser_recipe_compatibility_key TEXT NOT NULL,
+    membership_ref TEXT,
+    membership_complete INTEGER NOT NULL DEFAULT 0
+        CHECK (membership_complete IN (0, 1)),
+    etag TEXT,
+    last_modified TEXT,
+    stored_at TEXT NOT NULL,
+    last_verified_at TEXT NOT NULL,
+    retention_policy TEXT NOT NULL DEFAULT 'BOUNDED_LOCAL',
+    expires_at TEXT,
+    superseded_at TEXT,
+    pruned_at TEXT
+);
+CREATE UNIQUE INDEX idx_cache_representation_exact
+    ON cache_representation(
+        source_id, binding_revision_id, auth_scope_ref, request_variant_key,
+        validated_page_class, normalized_content_hash,
+        parser_recipe_compatibility_key
+    );
+CREATE INDEX idx_cache_representation_lookup
+    ON cache_representation(
+        source_id, binding_revision_id, auth_scope_ref, request_variant_key,
+        parser_recipe_compatibility_key, last_verified_at
+    );
+CREATE INDEX idx_cache_representation_retention
+    ON cache_representation(pruned_at, superseded_at, last_verified_at);
+
+CREATE TABLE cache_representation_membership (
+    representation_id TEXT NOT NULL REFERENCES cache_representation(id) ON DELETE CASCADE,
+    stable_source_identity TEXT NOT NULL,
+    source_identity_generation INTEGER NOT NULL DEFAULT 1,
+    evidence_ref TEXT,
+    PRIMARY KEY (
+        representation_id, stable_source_identity, source_identity_generation
+    )
+);
+
+CREATE TABLE cache_representation_hold (
+    id TEXT PRIMARY KEY,
+    representation_id TEXT NOT NULL REFERENCES cache_representation(id) ON DELETE CASCADE,
+    owner_kind TEXT NOT NULL
+        CHECK (owner_kind IN ('REVALIDATION', 'BACKUP')),
+    owner_ref TEXT NOT NULL,
+    owner_attempt_id TEXT REFERENCES request_attempts(attempt_id),
+    created_at TEXT NOT NULL,
+    released_at TEXT
+);
+CREATE UNIQUE INDEX idx_cache_representation_hold_active
+    ON cache_representation_hold(representation_id, owner_kind, owner_ref)
+    WHERE released_at IS NULL;
+CREATE INDEX idx_cache_representation_hold_attempt
+    ON cache_representation_hold(owner_attempt_id, released_at);
+
+ALTER TABLE fetch_attempts
+    ADD COLUMN cache_representation_id TEXT REFERENCES cache_representation(id);
+CREATE INDEX idx_fetch_attempts_cache_representation
+    ON fetch_attempts(cache_representation_id);
+'''
+) -> None:
+    return sql
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1438,6 +1520,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10, 16})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 16, (
-    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16"
+assert LATEST_SCHEMA_VERSION == 17, (
+    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17"
 )

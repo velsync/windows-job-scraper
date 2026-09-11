@@ -88,6 +88,11 @@ def classify_page(
         "final_url": result.final_url,
         "body_bytes": len(result.body or b""),
     }
+    if result.was_304:
+        # Bare 304 has no body semantics. S3.7 must resolve an exact retained
+        # representation before restoring its validated page class.
+        evidence["revalidation_required"] = True
+        return PageClassification(PageClass.UNKNOWN, evidence)
     if result.failure is not None and result.status_code is None:
         # transport-level failure: no page to classify
         evidence["failure_kind"] = result.failure.kind.value

@@ -121,6 +121,15 @@ def validate_envelope(
     for name in plan.headers:
         if name.lower() in _FORBIDDEN_HEADER_NAMES:
             raise ValueError(f"secret-bearing header {name!r} is not allowed in plans")
+    conditional = sorted(
+        name for name in plan.headers
+        if name.lower() in {"if-none-match", "if-modified-since"}
+    )
+    if conditional and not plan.revalidation_headers_allowed:
+        raise ValueError(
+            "conditional revalidation headers are host-owned and require a "
+            "compatible retained cache representation"
+        )
     if plan.max_bytes > policy.max_bytes:
         raise ValueError(
             f"plan max_bytes {plan.max_bytes} exceeds policy cap {policy.max_bytes}"
