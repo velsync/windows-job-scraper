@@ -31,6 +31,7 @@ from jobscraper.timeutil import utc_now_s
 
 PUBLISH_POLL_S = 0.05
 PUBLISH_TIMEOUT_S = 30.0
+RECOVERY_FAILURE_EXIT_CODE = 4
 
 
 def _bind_loopback_socket(host: str) -> socket.socket:
@@ -116,7 +117,10 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
     app.state.lifespan = lifespan
 
     # Then reclaim the orphaned RUNNING requests and finalize any
-    # cancellation the crash interrupted. Runs before the listener serves.
+    # cancellation the crash interrupted. This is a correctness gate, not
+    # best-effort diagnostics: after the epoch advances, old RUNNING owners
+    # are invalid and must be durably reclaimed before the service can serve
+    # or accept new acquisition work (§50/RUN-19).
     try:
         recovered = recover_interrupted_requests(db.conn)
         if recovered["reclaimed"] or recovered["finalized_cancelled_runs"]:
@@ -135,7 +139,7 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
                     },
                 ),
             )
-    except Exception as exc:  # pragma: no cover - defensive: never block boot
+    except Exception as exc:
         append_event(
             db.conn,
             event(
@@ -145,6 +149,12 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
                 data={"error_type": type(exc).__name__},
             ),
         )
+        # The socket is bound but uvicorn has not adopted/listened on it yet.
+        # Fail closed: do not provision/serve with invalidated prior-epoch
+        # RUNNING work still unreconciled.
+        sock.close()
+        db.close()
+        return RECOVERY_FAILURE_EXIT_CODE
 
     # S2.3 (01 §45): provision the search surface (FTS5 when the host has it,
     # an honest SUBSTRING_FALLBACK record otherwise).  Capability-gated and
