@@ -288,6 +288,7 @@ def heartbeat(
     now: str | None = None,
     lease_window_s: float = DEFAULT_LEASE_WINDOW_S,
     epoch: ServiceEpoch | None = None,
+    guard: ServiceClockGuard | None = None,
 ) -> str:
     """Renew the lease; refused for stale tokens, expired leases or stale epochs.
 
@@ -298,8 +299,20 @@ def heartbeat(
     cancelled and current source/binding authority still holds (RUN-02 rule
     9, §18). Host-native heartbeats are independent of the source-network
     predicate (R2-F3): accepted local obligations keep draining.
+
+    When a service-lifetime clock guard is supplied, the heartbeat observes
+    the database clock before opening its renewal transaction. A material
+    wall-clock anomaly therefore rotates the service epoch first; this stale
+    attempt then fails the epoch fence and cannot extend its lease (§50).
+    Recovery of the invalidated epoch remains the coordinator/claim path's
+    responsibility.
     """
     ts = now or db_utc_now(conn)
+    if guard is not None:
+        # Observe before BEGIN IMMEDIATE because anomaly rotation performs its
+        # own serialized write transaction. The resulting fresh epoch makes
+        # this old attempt stale before any renewal can be persisted (§50).
+        guard.observe(conn, db_now=ts)
     if epoch is not None:
         row = conn.execute(
             "SELECT ended_at FROM service_clock_epochs WHERE id = ?",
@@ -420,8 +433,7 @@ def _heartbeat_denial(
         )
     if row["request_type"] in ACQUISITION_REQUEST_TYPES:
         run = conn.execute(
-            "SELECT cancel_requested_at FROM scrape_runs WHERE id = ?",
-            (row["run_id"],),
+            "SELECT cancel_requested_at FROM scrape_runs WHERE id = ?", (row["run_id"],)
         ).fetchone()
         if run is not None and run["cancel_requested_at"] is not None:
             return StaleOwnership(request_id, "run invalidated")
