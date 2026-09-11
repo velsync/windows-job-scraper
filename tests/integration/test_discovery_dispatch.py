@@ -269,8 +269,8 @@ def test_lease_expiry_between_claim_and_dispatch_blocks_io(
     between claim and dispatch, without touching the system clock or
     sleeping. `bind_execution_plan` must reject ownership before any
     network I/O: zero HTTP hits, zero fetch evidence. The truly expired
-    lease is consumed (RETRY_WAIT) and the run mirrors it; nothing
-    commits request-owned outputs.
+    lease is consumed (RETRY_WAIT) while the run stays open for the later
+    redrive proven below; nothing commits request-owned outputs.
     """
     from jobscraper.acquisition import envelope as envelope_module
     from jobscraper.runtime import claims as claims_module
@@ -335,7 +335,8 @@ def test_lease_expiry_between_claim_and_dispatch_blocks_io(
         run = db.conn.execute(
             "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
         ).fetchone()
-        assert run["status"] in ("SUCCEEDED", "PARTIAL", "FAILED")
+        # persisted terminal state agrees with the returned outcome
+        assert run["status"] == outcome.run_status
         group = db.conn.execute(
             "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
             (queued.run_id,),
@@ -389,5 +390,242 @@ def test_epoch_stale_live_request_leaves_discovery_run_open(
             (queued.run_id,),
         ).fetchone()
         assert group["group_outcome"] is None
+    finally:
+        db.close()
+
+
+def _event_time_machine(monkeypatch, *, claim_ts, event_ts):
+    """Shared mutable clock for ownership-time regressions.
+
+    The discovery seam starts at `claim_ts` (claim/run-start history);
+    wrappers advance it to `event_ts` inside the dispatch window, so
+    post-claim handlers observe event time — the production analogue of
+    time passing, without touching the system clock. All other ownership
+    namespaces are fixed at `event_ts` (they are only read post-claim).
+    """
+    from jobscraper.acquisition import envelope as envelope_module
+    from jobscraper.runtime import claims as claims_module
+    from jobscraper.runtime import discovery as discovery_module
+    from jobscraper.runtime import dispatch as dispatch_module
+    from jobscraper.runtime import fence as fence_module
+
+    state = {"t": claim_ts}
+    monkeypatch.setattr(discovery_module, "db_utc_now", lambda conn: state["t"])
+    monkeypatch.setattr(dispatch_module, "db_utc_now", lambda conn: event_ts)
+    monkeypatch.setattr(envelope_module, "db_utc_now", lambda conn: event_ts)
+    monkeypatch.setattr(claims_module, "db_utc_now", lambda conn: event_ts)
+    monkeypatch.setattr(fence_module, "db_utc_now", lambda conn: event_ts)
+    return state
+
+
+def _request_row(db, request_id):
+    return db.conn.execute(
+        "SELECT status, current_attempt_id, attempt_count, next_retry_at"
+        " FROM scrape_requests WHERE id = ?",
+        (request_id,),
+    ).fetchone()
+
+
+def _run_open(db, run_id):
+    run = db.conn.execute(
+        "SELECT status FROM scrape_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    group = db.conn.execute(
+        "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    return run["status"] == "RUNNING" and group["group_outcome"] is None
+
+
+def test_capacity_deferral_after_lease_expiry_refunds_nothing(
+    tmp_path, server, monkeypatch
+):
+    """Expired lease + capacity pressure: no refund, no evidence, run open."""
+    from jobscraper.runtime.capacity import CapacityKey, service_capacity_coordinator
+
+    T1 = NOW
+    T2 = "2026-09-10T07:30:00.000000Z"  # past the 120s lease window
+    clock = _event_time_machine(monkeypatch, claim_ts=T1, event_ts=T2)
+
+    from jobscraper.runtime import discovery as discovery_module
+
+    real_dispatch = discovery_module.dispatch_http
+
+    def _advance_then_dispatch(conn, envelope, policy, **kwargs):
+        clock["t"] = T2
+        return real_dispatch(conn, envelope, policy, **kwargs)
+
+    monkeypatch.setattr(discovery_module, "dispatch_http", _advance_then_dispatch)
+
+    db = _database(tmp_path / "cap-expired.db")
+    reservations = []
+    try:
+        queued = _queue(db, server)
+        coordinator = service_capacity_coordinator()
+        key = CapacityKey(
+            execution_class="HTTP",
+            source_id=queued.source_id,
+            host="127.0.0.1",
+        )
+        for _ in range(2):
+            reservations.append(coordinator.try_reserve(key))
+
+        with pytest.raises(DiscoveryError, match="no provider capacity"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=None)
+
+        assert _Handler.hits == 0
+        # the stale attempt could not be refunded with T1: still RUNNING,
+        # budget untouched (claim minted attempt 1, no decrement restored it)
+        request = _request_row(db, queued.request_id)
+        assert request["status"] == "RUNNING"
+        assert request["current_attempt_id"] is not None
+        assert request["attempt_count"] == 1
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM acquisition_evidence WHERE request_id = ?",
+            (queued.request_id,),
+        ).fetchone()[0] == 0
+        assert _run_open(db, queued.run_id)
+        # later recovery remains authoritative for the expired lease
+        from jobscraper.runtime.claims import reclaim_expired
+
+        assert queued.request_id in reclaim_expired(db.conn, now=T2)
+    finally:
+        for reservation in reservations:
+            reservation.release()
+        db.close()
+
+
+def test_cooldown_deferral_after_lease_expiry_mutates_nothing(
+    tmp_path, server, monkeypatch
+):
+    """Expired lease + active cooldown: no RETRY_WAIT self-mutation."""
+    T1 = NOW
+    T2 = "2026-09-10T07:00:00.000000Z"  # past lease, inside the 1h cooldown
+    clock = _event_time_machine(monkeypatch, claim_ts=T1, event_ts=T2)
+
+    from jobscraper.runtime import discovery as discovery_module
+
+    real_dispatch = discovery_module.dispatch_http
+
+    def _advance_then_dispatch(conn, envelope, policy, **kwargs):
+        clock["t"] = T2
+        return real_dispatch(conn, envelope, policy, **kwargs)
+
+    monkeypatch.setattr(discovery_module, "dispatch_http", _advance_then_dispatch)
+
+    db = _database(tmp_path / "cool-expired.db")
+    try:
+        queued = _queue(db, server)
+        record_failure(
+            db.conn,
+            RateKey(queued.binding_id, "127.0.0.1", None),
+            failure_kind="RATE_LIMIT",
+            delay_s=3600,
+            retry_after_raw="3600",
+            now=T1,
+        )
+        with pytest.raises(DiscoveryError, match="cooldown"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=None)
+
+        assert _Handler.hits == 0
+        # the expired worker could not park itself RETRY_WAIT with stale T1
+        request = _request_row(db, queued.request_id)
+        assert request["status"] == "RUNNING"
+        assert request["next_retry_at"] is None
+        assert _run_open(db, queued.run_id)
+        from jobscraper.runtime.claims import reclaim_expired
+
+        assert queued.request_id in reclaim_expired(db.conn, now=T2)
+    finally:
+        db.close()
+
+
+def test_terminal_denial_after_lease_expiry_commits_nothing(
+    tmp_path, server, monkeypatch
+):
+    """Expired lease + dispatch rejection: denial fence cannot commit stale."""
+    from jobscraper.runtime import discovery as discovery_module
+    from jobscraper.runtime.claims import claim_next_request
+
+    T1 = NOW
+    T2 = "2026-09-10T07:30:00.000000Z"
+    clock = _event_time_machine(monkeypatch, claim_ts=T1, event_ts=T2)
+
+    db = _database(tmp_path / "denied-expired.db")
+    try:
+        queued = _queue(db, server)
+        claim = claim_next_request(
+            db.conn, "w", now=T1,
+            types=frozenset({"SOURCE_DISCOVERY"}),
+            run_source_plan_id=queued.run_source_plan_id,
+        )
+        assert claim.request_id == queued.request_id
+        clock["t"] = T2
+
+        with pytest.raises(DiscoveryError, match="ownership was lost"):
+            discovery_module._terminalize_discovery_denied(
+                db.conn, queued, claim,
+                failure_kind="POLICY_REJECTED",
+                detail={"reason": "DISPATCH_PLAN_INVALID"},
+                now=None,  # production: fresh event time (T2), not T1
+            )
+
+        assert _Handler.hits == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM acquisition_evidence WHERE request_id = ?",
+            (queued.request_id,),
+        ).fetchone()[0] == 0
+        request = _request_row(db, queued.request_id)
+        assert request["status"] == "RUNNING"
+        # no execute ran, so the run was never started: QUEUED untouched,
+        # group open, nothing falsely closed
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
+        ).fetchone()
+        assert run["status"] == "QUEUED"
+        group = db.conn.execute(
+            "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
+            (queued.run_id,),
+        ).fetchone()
+        assert group["group_outcome"] is None
+    finally:
+        db.close()
+
+
+def test_executor_error_after_lease_expiry_commits_no_retry(
+    tmp_path, server, monkeypatch
+):
+    """Lease expiring during I/O: local-retry fence commits nothing stale."""
+    from jobscraper.runtime import discovery as discovery_module
+    from jobscraper.runtime.dispatch import DispatchExecutionError
+
+    T1 = NOW
+    T2 = "2026-09-10T07:30:00.000000Z"
+    clock = _event_time_machine(monkeypatch, claim_ts=T1, event_ts=T2)
+
+    def _blow_up_after_io_window(conn, envelope, policy, **kwargs):
+        clock["t"] = T2
+        raise DispatchExecutionError("SimulatedBlowup")
+
+    monkeypatch.setattr(discovery_module, "dispatch_http", _blow_up_after_io_window)
+
+    db = _database(tmp_path / "exec-expired.db")
+    try:
+        queued = _queue(db, server)
+        with pytest.raises(DiscoveryError, match="committed nothing"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=None)
+
+        assert _Handler.hits == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM acquisition_evidence WHERE request_id = ?",
+            (queued.request_id,),
+        ).fetchone()[0] == 0
+        request = _request_row(db, queued.request_id)
+        assert request["status"] == "RUNNING"
+        assert _run_open(db, queued.run_id)
+        # later recovery/reclaim remains authoritative
+        from jobscraper.runtime.claims import reclaim_expired
+
+        assert queued.request_id in reclaim_expired(db.conn, now=T2)
     finally:
         db.close()

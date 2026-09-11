@@ -636,6 +636,13 @@ def execute_source_discovery(
     if claim is None or claim.request_id != queued.request_id:
         raise DiscoveryError("durable SOURCE_DISCOVERY request is not claimable")
 
+    def _event_now() -> str:
+        # Ownership-sensitive post-claim mutations must prove current
+        # ownership: an explicit injected `now` stays deterministic, while
+        # production samples fresh database UTC at event time.  The
+        # historical claim timestamp is never reused past the claim.
+        return now if now is not None else db_utc_now(conn)
+
     _plan_row, source, _request_plan, envelope = _plan_request(conn, queued, claim)
     policy = source_policy(source, adapter_id=_DISCOVERY_ADAPTER_ID)
     budget = conn.execute(
@@ -665,10 +672,11 @@ def execute_source_discovery(
     except CapacityUnavailable:
         # No network request happened and the provider attempt budget is
         # untouched: the minted attempt is abandoned and the request returns
-        # to PENDING eligibility for a later pass.
+        # to PENDING eligibility for a later pass.  Event time (not the
+        # claim timestamp) proves the lease is still live for the refund.
         yield_unstarted_claim(
             conn, claim.request_id, claim.attempt_id,
-            reason="CAPACITY_UNAVAILABLE", now=claim_ts,
+            reason="CAPACITY_UNAVAILABLE", now=_event_now(),
         )
         raise DiscoveryError(
             "discovery dispatch deferred: no provider capacity"
@@ -677,10 +685,11 @@ def execute_source_discovery(
         if exc.next_retry_at is not None:
             # Durable source cooldown: no I/O, attempt preserved as
             # RETRY_WAIT so the probe resumes after the cooldown expires.
+            # Event time proves the lease still covers this mutation.
             yield_unstarted_claim(
                 conn, claim.request_id, claim.attempt_id,
                 reason="RATE_COOLDOWN", next_retry_at=exc.next_retry_at,
-                now=claim_ts,
+                now=_event_now(),
             )
             raise DiscoveryError(
                 "discovery dispatch deferred: source cooldown active"
@@ -689,7 +698,7 @@ def execute_source_discovery(
             conn, queued, claim,
             failure_kind=exc.failure_kind or "BLOCKED",
             detail={"reason": exc.reason},
-            now=claim_ts,
+            now=_event_now(),
         )
         raise DiscoveryError(
             f"discovery dispatch refused: {exc.reason}"
@@ -700,7 +709,7 @@ def execute_source_discovery(
             failure_kind="POLICY_REJECTED",
             detail={"reason": "DISPATCH_PLAN_INVALID",
                     "error_type": type(exc).__name__},
-            now=claim_ts,
+            now=_event_now(),
         )
         raise DiscoveryError(
             f"discovery dispatch rejected: {type(exc).__name__}"
@@ -708,13 +717,20 @@ def execute_source_discovery(
     except DispatchExecutionError as exc:
         # Local infrastructure failure escaping the executor: retryable
         # WORKER_CRASH with no source-health impact, request stays open.
-        local_retry = _discovery_local_retry(conn, claim, budget, now=claim_ts)
+        # The retry/failure fence uses fresh post-I/O event time so an
+        # executor error cannot create retry evidence after its lease expired.
+        try:
+            local_retry = _discovery_local_retry(conn, claim, budget, now=_event_now())
+        except StaleOwnership:
+            raise DiscoveryError(
+                "discovery executor error committed nothing: lease expired"
+            ) from None
         if local_retry is None:
             _terminalize_discovery_denied(
                 conn, queued, claim,
                 failure_kind="WORKER_CRASH",
                 detail={"error_type": exc.error_type},
-                now=claim_ts,
+                now=_event_now(),
             )
             raise DiscoveryError(
                 f"discovery executor error, budget exhausted: {exc.error_type}"
@@ -723,7 +739,7 @@ def execute_source_discovery(
             f"discovery executor error, retry open: {exc.error_type}"
         ) from None
     except AuthorizationDenied as exc:
-        _handle_discovery_authorization_denied(conn, queued, claim, exc, now=claim_ts)
+        _handle_discovery_authorization_denied(conn, queued, claim, exc, now=_event_now())
         raise DiscoveryError(
             f"discovery authorization denied: {exc.decision.reason.value}"
         ) from None
