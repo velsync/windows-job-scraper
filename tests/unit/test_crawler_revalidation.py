@@ -90,7 +90,14 @@ def _conn():
             id TEXT PRIMARY KEY,
             run_source_plan_id TEXT NOT NULL,
             source_id TEXT NOT NULL,
-            binding_id TEXT NOT NULL
+            binding_id TEXT NOT NULL,
+            binding_revision_id TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            coverage_authority TEXT NOT NULL,
+            finalized_at TEXT,
+            started_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            generation_order_key TEXT NOT NULL
         );
         CREATE TABLE coverage_seen_identity(
             coverage_id TEXT NOT NULL,
@@ -98,6 +105,19 @@ def _conn():
             source_identity_generation INTEGER NOT NULL DEFAULT 1,
             observation_or_listing_evidence_ref TEXT,
             PRIMARY KEY(coverage_id,stable_source_identity,source_identity_generation)
+        );
+        CREATE TABLE source_presence_scope_membership(
+            job_source_id TEXT NOT NULL,
+            binding_revision_id TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            first_seen_coverage_id TEXT NOT NULL,
+            last_seen_coverage_id TEXT NOT NULL,
+            last_seen_order_key TEXT NOT NULL,
+            last_absence_coverage_id TEXT,
+            last_absence_order_key TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(job_source_id,binding_revision_id,scope_key)
         );
         CREATE TABLE job_sources(
             id TEXT PRIMARY KEY,
@@ -342,7 +362,15 @@ def test_304_membership_advances_verification_without_content_revision():
         now="2026-09-11T15:00:00Z",
     )
     conn.execute(
-        "INSERT INTO enumeration_coverage VALUES ('cov','rsp1','src','bnd')"
+        """
+        INSERT INTO enumeration_coverage(
+            id,run_source_plan_id,source_id,binding_id,binding_revision_id,
+            scope_key,coverage_authority,finalized_at,started_at,created_at,
+            generation_order_key)
+        VALUES ('cov','rsp1','src','bnd','rev1','full-source',
+                'AUTHORITATIVE_FULL_SOURCE',NULL,?,?,?)
+        """,
+        (NOW, NOW, f"{NOW}|cov"),
     )
     conn.execute(
         "INSERT INTO job_sources VALUES "

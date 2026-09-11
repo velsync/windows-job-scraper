@@ -672,8 +672,8 @@ def restore_membership(
         raise RevalidationCompatibilityError("membership binding/source mismatch")
 
     coverage = conn.execute(
-        "SELECT run_source_plan_id, source_id, binding_id FROM enumeration_coverage"
-        " WHERE id = ?",
+        "SELECT run_source_plan_id, source_id, binding_id, binding_revision_id"
+        " FROM enumeration_coverage WHERE id = ?",
         (coverage_id,),
     ).fetchone()
     if coverage is None:
@@ -682,6 +682,7 @@ def restore_membership(
         coverage["run_source_plan_id"] != _row_get(plan_row, "id")
         or coverage["source_id"] != _row_get(plan_row, "source_id")
         or coverage["binding_id"] != _row_get(plan_row, "binding_id")
+        or coverage["binding_revision_id"] != _row_get(plan_row, "binding_revision_id")
     ):
         raise RevalidationCompatibilityError(
             "coverage generation does not match immutable RunSourcePlan"
@@ -696,24 +697,24 @@ def restore_membership(
         """,
         (representation_id,),
     ).fetchall()
+    # S3.8 keeps coverage_seen_identity + explicit same-scope membership under
+    # the single coverage owner; 304 reuse cannot bypass that authority path.
+    from jobscraper.pipeline.coverage import record_seen_identity
+
     for member in members:
-        cur = conn.execute(
-            """
-            INSERT INTO coverage_seen_identity(
-                coverage_id, stable_source_identity,
-                source_identity_generation, observation_or_listing_evidence_ref)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT DO NOTHING
-            """,
-            (
-                coverage_id,
-                member["stable_source_identity"],
-                member["source_identity_generation"],
+        was_inserted = record_seen_identity(
+            conn,
+            coverage_id,
+            member["stable_source_identity"],
+            generation=member["source_identity_generation"],
+            evidence_ref=(
                 member["evidence_ref"]
-                or f"cache-membership://{representation_id}",
+                or f"cache-membership://{representation_id}"
             ),
+            now=now,
+            commit=False,
         )
-        inserted += max(0, int(cur.rowcount))
+        inserted += 1 if was_inserted else 0
         # Verification advances independently of content revision. This is a
         # conservative source-native identity update only; S3.10 still owns
         # broader temporal/presence ordering.

@@ -107,10 +107,12 @@ from jobscraper.net.destination import (
 )
 from jobscraper.net.urlnorm import normalize_url
 from jobscraper.pipeline.coverage import (
+    CoverageFinalizationError,
     degrade_coverage,
     finalize_coverage,
     is_coverage_degraded,
     open_or_resume_coverage,
+    record_contributing_request,
     record_seen_identity,
 )
 from jobscraper.pipeline.evidence import bounded_json
@@ -653,9 +655,11 @@ def _execute_plan(
             run_source_plan_id=plan_id,
             source_id=plan_row["source_id"],
             binding_id=plan_row["binding_id"],
+            binding_revision_id=plan_row["binding_revision_id"],
             scope_key="full-source",
             generation_key=f"run-{run_id}",
             coverage_authority="AUTHORITATIVE_FULL_SOURCE",
+            listing_identity_sufficient=listing_identity_sufficient,
             now=now,
         )
 
@@ -761,15 +765,14 @@ def _execute_plan(
             and not is_robots
             and not is_sitemap
         )
-        if is_enumeration or not listing_identity_sufficient:
-            # 03 §40: coverage links the requests/pages that contributed to
-            # this generation's enumeration proof.
-            conn.execute(
-                "INSERT INTO coverage_contributing_request (coverage_id, request_id)"
-                " VALUES (?, ?) ON CONFLICT DO NOTHING",
-                (coverage_id, claim.request_id),
-            )
-            conn.commit()
+        if is_enumeration or (
+            claim.request_type == "DETAIL_FETCH" and not listing_identity_sufficient
+        ):
+            # 03 §40: the coverage owner validates that each contributing
+            # request belongs to this exact immutable plan/source/binding.
+            # Robots/sitemap discovery metadata never becomes a membership
+            # contributor merely because detail completion is required.
+            record_contributing_request(conn, coverage_id, claim.request_id)
 
         cursor = None
         pagination_guard = PaginationGuardState()
@@ -2186,11 +2189,11 @@ def _execute_plan(
             completion_state = "COMPLETE"
             stop_reason = "terminal cursor"
         elif cancelled:
-            completion_state = "PARTIAL"
+            completion_state = "CANCELLED"
             stop_reason = "cancelled"
         elif coverage_budget_exhausted and coverage_barrier_open:
             completion_state = "BUDGET_EXHAUSTED"
-            stop_reason = "host crawler budget exhausted with open contributing work"
+            stop_reason = "host crawler budget exhausted before complete coverage"
         elif coverage_barrier_open:
             completion_state = "PARTIAL"
             stop_reason = "open contributing work remains"
@@ -2210,8 +2213,9 @@ def _execute_plan(
                 pages_completed=final_usage.pages_completed,
                 now=db_utc_now(conn),
             )
-        except Exception:
-            # Coverage finalization must never block the run outcome.
+        except CoverageFinalizationError:
+            # A refused COMPLETE barrier is conservatively finalized PARTIAL;
+            # programming/SQL errors are not swallowed as ordinary coverage.
             finalize_coverage(
                 conn,
                 coverage_id,

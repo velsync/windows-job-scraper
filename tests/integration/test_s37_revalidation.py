@@ -136,10 +136,22 @@ def test_retained_membership_survives_restart_and_304_reuse_restores_seen_union(
         )
         coverage_id = "cov304"
         db.conn.execute(
-            "INSERT INTO enumeration_coverage(id,run_source_plan_id,source_id,binding_id,"
-            "scope_key,generation_key,coverage_authority,absence_inference_allowed,started_at,created_at)"
-            " VALUES (?,?,?,?,?,'g','AUTHORITATIVE_FULL_SOURCE',1,?,?)",
-            (coverage_id, plan["id"], plan["source_id"], plan["binding_id"], "all", now, now),
+            "INSERT INTO enumeration_coverage(id,run_source_plan_id,source_plan_group_id,"
+            "source_id,binding_id,binding_revision_id,scope_key,generation_key,"
+            "coverage_authority,absence_inference_allowed,started_at,created_at,generation_order_key)"
+            " VALUES (?,?,?,?,?,?,?,'g','AUTHORITATIVE_FULL_SOURCE',1,?,?,?)",
+            (
+                coverage_id,
+                plan["id"],
+                plan["source_plan_group_id"],
+                plan["source_id"],
+                plan["binding_id"],
+                plan["binding_revision_id"],
+                "all",
+                now,
+                now,
+                f"{now}|{coverage_id}",
+            ),
         )
         db.conn.commit()
 

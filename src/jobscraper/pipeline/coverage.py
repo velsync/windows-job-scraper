@@ -1,25 +1,26 @@
 """Enumeration coverage and absence authority (03 §40, RUN-13, RUN-14A).
 
-Absence evidence may be created ONLY when:
+S3.8 makes coverage generation-wide, scope-explicit, and replay-safe:
 
-1. ``completion_state = COMPLETE``;
-2. ``coverage_authority`` is AUTHORITATIVE_FULL_SOURCE or
-   AUTHORITATIVE_DECLARED_SCOPE;
-3. ``absence_inference_allowed`` is true;
-4. the source-presence record belongs to the same declared scope;
-5. the run was not invalidated by challenge, auth failure, policy denial
-   or cancellation.
+* coverage identity is derived from the immutable RunSourcePlan;
+* contributing requests and the durable seen-identity union are validated
+  against that exact plan;
+* authoritative scope membership is explicit per source presence, binding
+  revision, and scope key -- never inferred from canonical job fields;
+* COMPLETE is a barrier: terminal enumeration, successful contributors, no
+  relevant continuation, and required detail completion when listing identity
+  is insufficient;
+* absence is applied at most once per coverage/presence/scope; and
+* generation order plus newer presence evidence prevents an older generation
+  from regressing current presence merely because it finished later.
 
-Each ``enumeration_coverage.id`` is applied at most once (idempotent);
-overlapping generations are ordered by their own finalized_at under
-RUN-21 so an older generation cannot regress newer presence.
-
-The finalization barrier refuses COMPLETE while any contributing request
-is still open, or when terminal enumeration is not proven.
+A PARTIAL/degraded generation can retain useful observations and scope
+membership evidence, but it can never create absence transitions.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from jobscraper.ids import new_id
@@ -27,95 +28,224 @@ from jobscraper.ids import new_id
 _ABSENCE_AUTHORITIES = frozenset(
     {"AUTHORITATIVE_FULL_SOURCE", "AUTHORITATIVE_DECLARED_SCOPE"}
 )
-_TERMINAL_REQUEST_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED"})
+_COMPLETION_STATES = frozenset(
+    {"COMPLETE", "PARTIAL", "CANCELLED", "FAILED", "BUDGET_EXHAUSTED", "UNKNOWN"}
+)
+_OPEN_REQUEST_STATES = frozenset({"PENDING", "RUNNING", "RETRY_WAIT"})
+_META_CRAWL_ROLES = frozenset({"ROBOTS", "SITEMAP"})
 
 
-class CoverageFinalizationError(Exception):
+class CoverageFinalizationError(RuntimeError):
     """The coverage generation cannot be finalized as requested."""
+
+
+class CoverageIdentityError(RuntimeError):
+    """Coverage/request/source identity conflicts with the immutable run plan."""
+
+
+def _plan_identity(conn: sqlite3.Connection, run_source_plan_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        """
+        SELECT id, run_id, source_plan_group_id, source_id, binding_id,
+               binding_revision_id
+          FROM run_source_plans
+         WHERE id = ?
+        """,
+        (run_source_plan_id,),
+    ).fetchone()
+    if row is None:
+        raise CoverageIdentityError(
+            f"unknown RunSourcePlan {run_source_plan_id!r}"
+        )
+    return row
+
+
+def _assert_optional_identity(
+    plan: sqlite3.Row,
+    *,
+    source_id: str | None,
+    binding_id: str | None,
+    binding_revision_id: str | None,
+) -> None:
+    supplied = (
+        ("source_id", source_id),
+        ("binding_id", binding_id),
+        ("binding_revision_id", binding_revision_id),
+    )
+    for name, value in supplied:
+        if value is not None and str(value) != str(plan[name]):
+            raise CoverageIdentityError(
+                f"caller {name}={value!r} conflicts with immutable "
+                f"RunSourcePlan value {plan[name]!r}"
+            )
+
+
+def _order_key(row: sqlite3.Row) -> str:
+    stored = row["generation_order_key"] if "generation_order_key" in row.keys() else None
+    if stored:
+        return str(stored)
+    started = row["started_at"] or row["created_at"] or ""
+    return f"{started}|{row['id']}"
+
+
+def _validate_resumable_generation(
+    row: sqlite3.Row,
+    plan: sqlite3.Row,
+    *,
+    coverage_authority: str,
+    listing_identity_sufficient: bool,
+) -> None:
+    expected = {
+        "run_source_plan_id": plan["id"],
+        "source_plan_group_id": plan["source_plan_group_id"],
+        "source_id": plan["source_id"],
+        "binding_id": plan["binding_id"],
+        "binding_revision_id": plan["binding_revision_id"],
+    }
+    mismatches = [
+        name
+        for name, wanted in expected.items()
+        if row[name] is None or str(row[name]) != str(wanted)
+    ]
+    if mismatches:
+        raise CoverageIdentityError(
+            "unfinished coverage conflicts with immutable RunSourcePlan: "
+            + ", ".join(mismatches)
+        )
+    if str(row["coverage_authority"]) != str(coverage_authority):
+        raise CoverageIdentityError(
+            "unfinished coverage authority differs from the resumed pass"
+        )
+    if bool(row["listing_identity_sufficient"]) != bool(listing_identity_sufficient):
+        # v18 deliberately degrades every pre-S3.8 unfinished generation
+        # because that generation never durably recorded this barrier bit.
+        # Such a generation may be resumed only to preserve/use its positive
+        # evidence and finish non-authoritatively; a fresh generation must
+        # establish absence authority. New authoritative generations still
+        # require an exact match.
+        if bool(row["absence_inference_allowed"]):
+            raise CoverageIdentityError(
+                "unfinished coverage listing-identity sufficiency differs from resumed binding"
+            )
 
 
 def open_coverage(
     conn: sqlite3.Connection,
     *,
     run_source_plan_id: str,
-    source_id: str,
-    binding_id: str,
     scope_key: str,
     generation_key: str,
     coverage_authority: str,
     now: str,
+    source_id: str | None = None,
+    binding_id: str | None = None,
+    binding_revision_id: str | None = None,
+    listing_identity_sufficient: bool = False,
 ) -> str:
-    presence_id = new_id("cov")
+    """Open one coverage generation pinned to its immutable RunSourcePlan.
+
+    ``source_id``/``binding_id``/``binding_revision_id`` are compatibility
+    arguments for older call sites. They are never trusted: when supplied they
+    must exactly equal the RunSourcePlan, and persisted identity is always
+    derived from that plan.
+    """
+    if not scope_key:
+        raise CoverageIdentityError("coverage scope_key must be non-empty")
+    if not generation_key:
+        raise CoverageIdentityError("coverage generation_key must be non-empty")
+
+    plan = _plan_identity(conn, run_source_plan_id)
+    _assert_optional_identity(
+        plan,
+        source_id=source_id,
+        binding_id=binding_id,
+        binding_revision_id=binding_revision_id,
+    )
+
+    coverage_id = new_id("cov")
     absence_allowed = coverage_authority in _ABSENCE_AUTHORITIES
+    generation_order_key = f"{now}|{coverage_id}"
     conn.execute(
         """
         INSERT INTO enumeration_coverage (
             id, run_source_plan_id, source_plan_group_id, source_id, binding_id,
-            scope_key, generation_key, coverage_authority,
-            absence_inference_allowed, started_at, created_at)
-        VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            binding_revision_id, scope_key, generation_key, coverage_authority,
+            absence_inference_allowed, listing_identity_sufficient,
+            generation_order_key, started_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            presence_id,
-            run_source_plan_id,
-            source_id,
-            binding_id,
+            coverage_id,
+            plan["id"],
+            plan["source_plan_group_id"],
+            plan["source_id"],
+            plan["binding_id"],
+            plan["binding_revision_id"],
             scope_key,
             generation_key,
             coverage_authority,
             1 if absence_allowed else 0,
+            1 if listing_identity_sufficient else 0,
+            generation_order_key,
             now,
             now,
         ),
     )
     conn.commit()
-    return presence_id
+    return coverage_id
 
 
 def open_or_resume_coverage(
     conn: sqlite3.Connection,
     *,
     run_source_plan_id: str,
-    source_id: str,
-    binding_id: str,
     scope_key: str,
     generation_key: str,
     coverage_authority: str,
     now: str,
+    source_id: str | None = None,
+    binding_id: str | None = None,
+    binding_revision_id: str | None = None,
+    listing_identity_sufficient: bool = False,
 ) -> tuple[str, bool]:
-    """Open this pass's coverage generation, or resume an unfinished one.
+    """Open this pass's generation or resume the one unfinished generation.
 
-    Returns ``(coverage_id, resumed)``.
-
-    Restart recovery re-drives a plan whose earlier pass may have died
-    mid-generation, or may have finalized one and still left accepted child
-    work open (ACQ-04).  Generations are immutable once finalized and the
-    durable uniqueness key is ``(plan, scope, generation)``, so:
-
-    * an **unfinalized** generation of this plan and scope is *continued* —
-      one enumeration attempt in flight per plan, finalized exactly once, even
-      when the resumed pass is itself a later pass with its own key;
-    * a **finalized** generation is left untouched and the resuming pass opens
-      a distinct, deterministically named generation (``…#pass-N``) that
-      records only what that pass actually covered.
-
-    Without this, re-driving an interrupted run raised a UNIQUE constraint
-    error inside the driver: a recovery path that crashes is not a recovery
-    path (RUN-07, 03 §18).
+    Restart/retry preserves one durable seen union. A finalized generation is
+    immutable; a later pass receives a deterministic ``#pass-N`` key. Any
+    unfinished generation whose plan/group/binding revision/authority no
+    longer matches the immutable plan is refused rather than silently reused.
     """
+    plan = _plan_identity(conn, run_source_plan_id)
+    _assert_optional_identity(
+        plan,
+        source_id=source_id,
+        binding_id=binding_id,
+        binding_revision_id=binding_revision_id,
+    )
     existing = conn.execute(
-        "SELECT id, generation_key, finalized_at FROM enumeration_coverage"
-        " WHERE run_source_plan_id = ? AND scope_key = ? ORDER BY created_at, id",
+        """
+        SELECT * FROM enumeration_coverage
+         WHERE run_source_plan_id = ? AND scope_key = ?
+         ORDER BY created_at, id
+        """,
         (run_source_plan_id, scope_key),
     ).fetchall()
-    for row in existing:
-        # at most one generation of a plan+scope can be in flight: continuing it
-        # is what makes an interrupted enumeration recoverable instead of
-        # leaving a permanently unfinalized row behind
-        if row["finalized_at"] is None:
-            return row["id"], True
+    unfinished = [row for row in existing if row["finalized_at"] is None]
+    if len(unfinished) > 1:
+        raise CoverageIdentityError(
+            "multiple unfinished generations exist for one plan/scope; refusing ambiguous resume"
+        )
+    if unfinished:
+        row = unfinished[0]
+        _validate_resumable_generation(
+            row,
+            plan,
+            coverage_authority=coverage_authority,
+            listing_identity_sufficient=listing_identity_sufficient,
+        )
+        return str(row["id"]), True
 
-    taken = {row["generation_key"] for row in existing}
+    taken = {str(row["generation_key"]) for row in existing}
     key = generation_key
     attempt = len(existing) + 1
     while key in taken:
@@ -125,15 +255,63 @@ def open_or_resume_coverage(
         open_coverage(
             conn,
             run_source_plan_id=run_source_plan_id,
-            source_id=source_id,
-            binding_id=binding_id,
             scope_key=scope_key,
             generation_key=key,
             coverage_authority=coverage_authority,
             now=now,
+            source_id=source_id,
+            binding_id=binding_id,
+            binding_revision_id=binding_revision_id,
+            listing_identity_sufficient=listing_identity_sufficient,
         ),
         False,
     )
+
+
+def record_contributing_request(
+    conn: sqlite3.Connection,
+    coverage_id: str,
+    request_id: str,
+    *,
+    commit: bool = True,
+) -> bool:
+    """Link a request only to coverage owned by the same immutable plan."""
+    coverage = conn.execute(
+        """
+        SELECT run_source_plan_id, source_id, binding_id, finalized_at
+          FROM enumeration_coverage WHERE id = ?
+        """,
+        (coverage_id,),
+    ).fetchone()
+    if coverage is None:
+        raise CoverageIdentityError(f"unknown coverage {coverage_id!r}")
+    if coverage["finalized_at"] is not None:
+        raise CoverageIdentityError("cannot add a contributor to finalized coverage")
+    request = conn.execute(
+        """
+        SELECT run_source_plan_id, source_id, binding_id
+          FROM scrape_requests WHERE id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+    if request is None:
+        raise CoverageIdentityError(f"unknown request {request_id!r}")
+    for name in ("run_source_plan_id", "source_id", "binding_id"):
+        if request[name] is None or str(request[name]) != str(coverage[name]):
+            raise CoverageIdentityError(
+                f"request {request_id!r} {name} does not match coverage generation"
+            )
+    cur = conn.execute(
+        """
+        INSERT INTO coverage_contributing_request(coverage_id, request_id)
+        VALUES (?, ?)
+        ON CONFLICT DO NOTHING
+        """,
+        (coverage_id, request_id),
+    )
+    if commit:
+        conn.commit()
+    return bool(cur.rowcount)
 
 
 def degrade_coverage(
@@ -143,20 +321,7 @@ def degrade_coverage(
     reason: str,
     commit: bool = True,
 ) -> None:
-    """Irreversibly withdraw absence authority from one open generation.
-
-    ACQ-03 / RUN-13: a ``PARTIAL`` acquisition unit means the membership
-    proof for this generation is incomplete, so the generation may never
-    become absence-authoritative — regardless of how many clean pages follow
-    it, whether a continuation cursor was proposed, or whether the pass that
-    saw the PARTIAL outcome is the pass that finalizes.  The flag is the
-    existing durable ``absence_inference_allowed`` column: it only ever moves
-    from 1 to 0, is written inside the same fenced commit as the PARTIAL
-    page, and is what :func:`finalize_coverage` consults, so a resumed pass
-    that never saw the PARTIAL outcome in memory inherits the degradation.
-
-    Finalized generations are immutable and are left untouched.
-    """
+    """Irreversibly withdraw absence authority from one open generation."""
     conn.execute(
         """
         UPDATE enumeration_coverage
@@ -171,8 +336,6 @@ def degrade_coverage(
 
 
 def is_coverage_degraded(conn: sqlite3.Connection, coverage_id: str) -> bool:
-    """Durable truth for a generation whose authority class would otherwise
-    permit absence inference: has it been degraded?"""
     row = conn.execute(
         "SELECT coverage_authority, absence_inference_allowed"
         " FROM enumeration_coverage WHERE id = ?",
@@ -182,7 +345,79 @@ def is_coverage_degraded(conn: sqlite3.Connection, coverage_id: str) -> bool:
         return False
     return (
         row["coverage_authority"] in _ABSENCE_AUTHORITIES
-        and not row["absence_inference_allowed"]
+        and not bool(row["absence_inference_allowed"])
+    )
+
+
+def _record_scope_membership(
+    conn: sqlite3.Connection,
+    coverage: sqlite3.Row,
+    *,
+    stable_source_identity: str,
+    source_identity_generation: int,
+    now: str,
+) -> None:
+    """Persist explicit authoritative scope membership for a resolved presence.
+
+    The relation is created only from a seen source-native identity under an
+    authoritative coverage declaration. Missing legacy rows are *not*
+    backfilled by guessing from canonical fields.
+    """
+    if coverage["coverage_authority"] not in _ABSENCE_AUTHORITIES:
+        return
+    presence = conn.execute(
+        """
+        SELECT id
+          FROM job_sources
+         WHERE source_id = ?
+           AND source_job_id = ?
+           AND source_identity_generation = ?
+        """,
+        (
+            coverage["source_id"],
+            stable_source_identity,
+            source_identity_generation,
+        ),
+    ).fetchone()
+    if presence is None:
+        # Retained membership can legitimately outlive a canonical projection
+        # in fixture/recovery scenarios. The seen union is still valid; absence
+        # simply has no source-presence row to affect.
+        return
+
+    order_key = _order_key(coverage)
+    conn.execute(
+        """
+        INSERT INTO source_presence_scope_membership(
+            job_source_id, binding_revision_id, scope_key,
+            first_seen_coverage_id, last_seen_coverage_id,
+            last_seen_order_key, last_absence_coverage_id,
+            last_absence_order_key, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+        ON CONFLICT(job_source_id, binding_revision_id, scope_key) DO UPDATE SET
+            last_seen_coverage_id = CASE
+                WHEN excluded.last_seen_order_key > source_presence_scope_membership.last_seen_order_key
+                THEN excluded.last_seen_coverage_id
+                ELSE source_presence_scope_membership.last_seen_coverage_id END,
+            last_seen_order_key = CASE
+                WHEN excluded.last_seen_order_key > source_presence_scope_membership.last_seen_order_key
+                THEN excluded.last_seen_order_key
+                ELSE source_presence_scope_membership.last_seen_order_key END,
+            updated_at = CASE
+                WHEN excluded.last_seen_order_key > source_presence_scope_membership.last_seen_order_key
+                THEN excluded.updated_at
+                ELSE source_presence_scope_membership.updated_at END
+        """,
+        (
+            presence["id"],
+            coverage["binding_revision_id"],
+            coverage["scope_key"],
+            coverage["id"],
+            coverage["id"],
+            order_key,
+            now,
+            now,
+        ),
     )
 
 
@@ -193,9 +428,30 @@ def record_seen_identity(
     generation: int = 1,
     evidence_ref: str | None = None,
     *,
+    now: str | None = None,
     commit: bool = True,
-) -> None:
-    conn.execute(
+) -> bool:
+    """Add one identity to the generation-wide union and explicit scope map.
+
+    Returns True only when this call inserted a new row into the seen union.
+    Replays are idempotent. ``now`` defaults to the coverage start timestamp
+    solely for scope-membership bookkeeping; the caller should pass the DB UTC
+    observation/verification time when available.
+    """
+    if not stable_source_identity:
+        raise CoverageIdentityError("seen identity must be non-empty")
+    coverage = conn.execute(
+        "SELECT * FROM enumeration_coverage WHERE id = ?",
+        (coverage_id,),
+    ).fetchone()
+    if coverage is None:
+        raise CoverageIdentityError(f"unknown coverage {coverage_id!r}")
+    if coverage["finalized_at"] is not None:
+        raise CoverageIdentityError("cannot add seen identity to finalized coverage")
+    if coverage["binding_revision_id"] is None:
+        raise CoverageIdentityError("coverage is missing its pinned binding revision")
+
+    cur = conn.execute(
         """
         INSERT INTO coverage_seen_identity (
             coverage_id, stable_source_identity, source_identity_generation,
@@ -205,8 +461,121 @@ def record_seen_identity(
         """,
         (coverage_id, stable_source_identity, generation, evidence_ref),
     )
+    _record_scope_membership(
+        conn,
+        coverage,
+        stable_source_identity=stable_source_identity,
+        source_identity_generation=generation,
+        now=now or coverage["started_at"] or coverage["created_at"],
+    )
     if commit:
         conn.commit()
+    return bool(cur.rowcount)
+
+
+def _payload_role(payload_json: str | None) -> str:
+    try:
+        value = json.loads(payload_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    return str(value.get("role") or "").upper()
+
+
+def _validate_complete_barrier(conn: sqlite3.Connection, row: sqlite3.Row) -> None:
+    contributors = conn.execute(
+        """
+        SELECT r.id, r.status, r.run_source_plan_id, r.source_id, r.binding_id
+          FROM coverage_contributing_request c
+          JOIN scrape_requests r ON r.id = c.request_id
+         WHERE c.coverage_id = ?
+         ORDER BY r.id
+        """,
+        (row["id"],),
+    ).fetchall()
+    if not contributors:
+        raise CoverageFinalizationError(
+            "COMPLETE requires at least one durable contributing request"
+        )
+    mismatched = [
+        r["id"]
+        for r in contributors
+        if r["run_source_plan_id"] != row["run_source_plan_id"]
+        or r["source_id"] != row["source_id"]
+        or r["binding_id"] != row["binding_id"]
+    ]
+    if mismatched:
+        raise CoverageFinalizationError(
+            "COMPLETE refuses cross-plan/source/binding contributors: "
+            + ", ".join(str(v) for v in mismatched[:5])
+        )
+    not_accepted_terminal = [r for r in contributors if r["status"] != "SUCCEEDED"]
+    if not_accepted_terminal:
+        raise CoverageFinalizationError(
+            "COMPLETE requires every contributing request to be accepted SUCCEEDED: "
+            + ", ".join(
+                f"{r['id']}={r['status']}" for r in not_accepted_terminal[:5]
+            )
+        )
+
+    plan = conn.execute(
+        """
+        SELECT p.run_id, r.cancel_requested_at, r.status AS run_status
+          FROM run_source_plans p
+          JOIN scrape_runs r ON r.id = p.run_id
+         WHERE p.id = ?
+        """,
+        (row["run_source_plan_id"],),
+    ).fetchone()
+    if plan is None:
+        raise CoverageFinalizationError("coverage RunSourcePlan no longer resolves")
+    if plan["cancel_requested_at"] is not None or plan["run_status"] == "CANCELLED":
+        raise CoverageFinalizationError("COMPLETE refused after run cancellation")
+
+    # A continuation can be accepted durably before it has been claimed and
+    # linked to the generation. Refuse COMPLETE while any relevant
+    # enumeration request remains open. Host-owned ROBOTS/SITEMAP metadata is
+    # advisory and cannot itself grant/withhold list-membership authority.
+    open_enum = conn.execute(
+        """
+        SELECT id, status, payload_json
+          FROM scrape_requests
+         WHERE run_source_plan_id = ?
+           AND request_type IN ('LIST_FETCH', 'SOURCE_CRAWL')
+           AND status IN ('PENDING', 'RUNNING', 'RETRY_WAIT')
+        """,
+        (row["run_source_plan_id"],),
+    ).fetchall()
+    relevant_open_enum = [
+        r for r in open_enum if _payload_role(r["payload_json"]) not in _META_CRAWL_ROLES
+    ]
+    if relevant_open_enum:
+        raise CoverageFinalizationError(
+            "COMPLETE refuses while enumeration continuation remains open: "
+            + ", ".join(
+                f"{r['id']}={r['status']}" for r in relevant_open_enum[:5]
+            )
+        )
+
+    if not bool(row["listing_identity_sufficient"]):
+        open_detail = conn.execute(
+            """
+            SELECT id, status
+              FROM scrape_requests
+             WHERE run_source_plan_id = ?
+               AND request_type = 'DETAIL_FETCH'
+               AND status IN ('PENDING', 'RUNNING', 'RETRY_WAIT')
+            """,
+            (row["run_source_plan_id"],),
+        ).fetchall()
+        if open_detail:
+            raise CoverageFinalizationError(
+                "COMPLETE refuses while required detail work remains open: "
+                + ", ".join(
+                    f"{r['id']}={r['status']}" for r in open_detail[:5]
+                )
+            )
 
 
 def finalize_coverage(
@@ -220,142 +589,313 @@ def finalize_coverage(
     pages_completed: int | None = None,
     items_observed: int | None = None,
 ) -> None:
-    """Finalize one coverage generation and (when absence-authoritative and
-    COMPLETE) apply absence evidence to the scope's presences exactly once."""
-    row = conn.execute(
-        "SELECT * FROM enumeration_coverage WHERE id = ?", (coverage_id,)
-    ).fetchone()
-    if row is None:
-        raise CoverageFinalizationError(f"unknown coverage {coverage_id!r}")
-    if row["finalized_at"] is not None:
+    """Finalize a generation and apply same-scope absence exactly once.
+
+    Replaying an already-finalized generation with the same terminal facts is
+    an idempotent no-op (the per-presence application table is checked again).
+    A conflicting re-finalization is rejected because finalized generations
+    are immutable.
+    """
+    if completion_state not in _COMPLETION_STATES:
         raise CoverageFinalizationError(
-            f"coverage {coverage_id!r} is already finalized (generations are immutable)"
+            f"invalid completion state {completion_state!r}"
         )
-    if completion_state not in (
-        "COMPLETE", "PARTIAL", "CANCELLED", "FAILED", "BUDGET_EXHAUSTED", "UNKNOWN"
-    ):
-        raise CoverageFinalizationError(f"invalid completion state {completion_state!r}")
 
-    if completion_state == "COMPLETE":
-        if not terminal_enumeration_proven:
-            raise CoverageFinalizationError(
-                "COMPLETE requires proven terminal enumeration (cursor reached end)"
-            )
-        if (
-            row["coverage_authority"] in _ABSENCE_AUTHORITIES
-            and not row["absence_inference_allowed"]
-        ):
-            # ACQ-03 / RUN-13: a generation that contained a PARTIAL unit was
-            # durably degraded when that unit committed; no later clean page
-            # can restore the membership proof it lacks.
-            raise CoverageFinalizationError(
-                "COMPLETE refused: this generation was degraded by a PARTIAL"
-                " acquisition unit and cannot become absence-authoritative"
-            )
-        open_requests = conn.execute(
-            """
-            SELECT r.id, r.status FROM coverage_contributing_request c
-            JOIN scrape_requests r ON r.id = c.request_id
-            WHERE c.coverage_id = ? AND r.status NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
-            """,
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT * FROM enumeration_coverage WHERE id = ?",
             (coverage_id,),
-        ).fetchall()
-        if open_requests:
+        ).fetchone()
+        if row is None:
+            raise CoverageFinalizationError(f"unknown coverage {coverage_id!r}")
+        if row["binding_revision_id"] is None:
             raise CoverageFinalizationError(
-                "COMPLETE refuses to finalize while contributing requests are open: "
-                + ", ".join(f"{r['id']}={r['status']}" for r in open_requests[:5])
+                "coverage is missing immutable binding-revision identity"
             )
+        if row["finalized_at"] is not None:
+            if (
+                row["completion_state"] != completion_state
+                or bool(row["terminal_enumeration_proven"])
+                != bool(terminal_enumeration_proven)
+            ):
+                raise CoverageFinalizationError(
+                    f"coverage {coverage_id!r} is already finalized with different facts"
+                )
+            if (
+                completion_state == "COMPLETE"
+                and bool(row["absence_inference_allowed"])
+                and row["coverage_authority"] in _ABSENCE_AUTHORITIES
+            ):
+                _apply_absence(conn, row, now)
+                conn.execute(
+                    "UPDATE enumeration_coverage SET applied_at = COALESCE(applied_at, ?)"
+                    " WHERE id = ?",
+                    (now, coverage_id),
+                )
+            if owns_transaction:
+                conn.execute("COMMIT")
+            return
 
-    contributing = conn.execute(
-        "SELECT COUNT(*) FROM coverage_contributing_request WHERE coverage_id = ?",
-        (coverage_id,),
-    ).fetchone()[0]
-    seen_count = conn.execute(
-        "SELECT COUNT(*) FROM coverage_seen_identity WHERE coverage_id = ?",
-        (coverage_id,),
-    ).fetchone()[0]
+        if completion_state == "COMPLETE":
+            if not terminal_enumeration_proven:
+                raise CoverageFinalizationError(
+                    "COMPLETE requires proven terminal enumeration"
+                )
+            if (
+                row["coverage_authority"] in _ABSENCE_AUTHORITIES
+                and not bool(row["absence_inference_allowed"])
+            ):
+                raise CoverageFinalizationError(
+                    "COMPLETE refused: this generation was degraded and cannot "
+                    "become absence-authoritative"
+                )
+            _validate_complete_barrier(conn, row)
 
+        contributing = conn.execute(
+            "SELECT COUNT(*) FROM coverage_contributing_request WHERE coverage_id = ?",
+            (coverage_id,),
+        ).fetchone()[0]
+        seen_count = conn.execute(
+            "SELECT COUNT(*) FROM coverage_seen_identity WHERE coverage_id = ?",
+            (coverage_id,),
+        ).fetchone()[0]
+        effective_items = seen_count if items_observed is None else items_observed
+
+        conn.execute(
+            """
+            UPDATE enumeration_coverage SET
+                finished_at = ?, completion_state = ?, stop_reason = ?,
+                pages_completed = COALESCE(?, pages_completed),
+                items_observed = ?, cursor_terminal = ?,
+                terminal_enumeration_proven = ?, contributing_request_count = ?,
+                finalized_at = ?
+            WHERE id = ?
+            """,
+            (
+                now,
+                completion_state,
+                stop_reason,
+                pages_completed,
+                effective_items,
+                1 if terminal_enumeration_proven else 0,
+                1 if terminal_enumeration_proven else 0,
+                contributing,
+                now,
+                coverage_id,
+            ),
+        )
+        finalized = conn.execute(
+            "SELECT * FROM enumeration_coverage WHERE id = ?",
+            (coverage_id,),
+        ).fetchone()
+        if (
+            completion_state == "COMPLETE"
+            and bool(finalized["absence_inference_allowed"])
+            and finalized["coverage_authority"] in _ABSENCE_AUTHORITIES
+        ):
+            _apply_absence(conn, finalized, now)
+        conn.execute(
+            "UPDATE enumeration_coverage SET applied_at = ? WHERE id = ?",
+            (now, coverage_id),
+        )
+        if owns_transaction:
+            conn.execute("COMMIT")
+    except BaseException:
+        if owns_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
+        raise
+
+
+def _newer_presence_than_generation(presence: sqlite3.Row, coverage: sqlite3.Row) -> bool:
+    started = str(coverage["started_at"] or coverage["created_at"] or "")
+    latest_presence = max(
+        str(presence["last_seen_at"] or ""),
+        str(presence["last_verified_at"] or ""),
+    )
+    return bool(started and latest_presence and latest_presence > started)
+
+
+def _record_application(
+    conn: sqlite3.Connection,
+    *,
+    coverage: sqlite3.Row,
+    presence: sqlite3.Row,
+    decision: str,
+    prior_state: str,
+    new_state: str,
+    now: str,
+) -> None:
     conn.execute(
         """
-        UPDATE enumeration_coverage SET
-            completion_state = ?, stop_reason = ?,
-            pages_completed = COALESCE(?, pages_completed),
-            items_observed = COALESCE(?, items_observed),
-            cursor_terminal = ?, terminal_enumeration_proven = ?,
-            contributing_request_count = ?, finalized_at = ?, applied_at = ?
-        WHERE id = ?
+        INSERT INTO coverage_presence_application(
+            coverage_id, job_source_id, binding_revision_id, scope_key,
+            decision, prior_presence_state, new_presence_state,
+            coverage_order_key, applied_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT DO NOTHING
         """,
         (
-            completion_state,
-            stop_reason,
-            pages_completed,
-            items_observed,
-            1 if terminal_enumeration_proven else 0,
-            1 if terminal_enumeration_proven else 0,
-            contributing,
+            coverage["id"],
+            presence["job_source_id"],
+            coverage["binding_revision_id"],
+            coverage["scope_key"],
+            decision,
+            prior_state,
+            new_state,
+            _order_key(coverage),
             now,
-            now,
-            coverage_id,
         ),
     )
 
-    if (
-        completion_state == "COMPLETE"
-        and row["absence_inference_allowed"]
-        and row["coverage_authority"] in _ABSENCE_AUTHORITIES
-    ):
-        _apply_absence(conn, row, coverage_id, now)
-
-    conn.commit()
-
 
 def _apply_absence(
-    conn: sqlite3.Connection, row: sqlite3.Row, coverage_id: str, now: str
+    conn: sqlite3.Connection,
+    coverage: sqlite3.Row,
+    now: str,
 ) -> None:
-    """One complete absence-authoritative generation: unseen presences in
-    scope go UNCERTAIN; previously-UNCERTAIN presences still unseen go
-    EXPIRED (RUN-13 policy). Seen presences stay untouched."""
+    """Apply one COMPLETE authoritative generation to explicit same-scope members.
+
+    One missing generation yields UNCERTAIN; a later same-scope authoritative
+    miss may yield EXPIRED. An older generation that finishes later is recorded
+    as skipped and cannot intensify or regress newer presence/absence state.
+    """
     seen = {
-        (r["stable_source_identity"], r["source_identity_generation"])
+        (str(r["stable_source_identity"]), int(r["source_identity_generation"]))
         for r in conn.execute(
-            "SELECT stable_source_identity, source_identity_generation"
-            " FROM coverage_seen_identity WHERE coverage_id = ?",
-            (coverage_id,),
+            """
+            SELECT stable_source_identity, source_identity_generation
+              FROM coverage_seen_identity WHERE coverage_id = ?
+            """,
+            (coverage["id"],),
         )
     }
-    scope_presences = conn.execute(
+    current_order = _order_key(coverage)
+    members = conn.execute(
         """
-        SELECT id, source_job_id, source_identity_generation, presence_state,
-               last_absence_coverage_id
-        FROM job_sources
-        WHERE source_id = ? AND source_job_id IS NOT NULL
+        SELECT m.*, js.source_id, js.source_job_id, js.source_identity_generation,
+               js.presence_state, js.last_seen_at, js.last_verified_at,
+               js.last_absence_coverage_id
+          FROM source_presence_scope_membership m
+          JOIN job_sources js ON js.id = m.job_source_id
+         WHERE m.binding_revision_id = ?
+           AND m.scope_key = ?
+           AND js.source_id = ?
+         ORDER BY m.job_source_id
         """,
-        (row["source_id"],),
+        (
+            coverage["binding_revision_id"],
+            coverage["scope_key"],
+            coverage["source_id"],
+        ),
     ).fetchall()
-    for presence in scope_presences:
-        identity = (presence["source_job_id"], presence["source_identity_generation"])
+
+    for presence in members:
+        identity = (
+            str(presence["source_job_id"]),
+            int(presence["source_identity_generation"]),
+        )
         if identity in seen:
             continue
-        state = presence["presence_state"]
-        if state == "ACTIVE":
+        already = conn.execute(
+            """
+            SELECT 1 FROM coverage_presence_application
+             WHERE coverage_id = ? AND job_source_id = ?
+               AND binding_revision_id = ? AND scope_key = ?
+            """,
+            (
+                coverage["id"],
+                presence["job_source_id"],
+                coverage["binding_revision_id"],
+                coverage["scope_key"],
+            ),
+        ).fetchone()
+        if already is not None:
+            continue
+
+        prior_state = str(presence["presence_state"])
+        decision = "NO_STATE_CHANGE"
+        new_state = prior_state
+        last_absence_order = str(presence["last_absence_order_key"] or "")
+
+        if str(presence["last_seen_order_key"]) > current_order:
+            decision = "SKIPPED_NEWER_PRESENCE"
+        elif _newer_presence_than_generation(presence, coverage):
+            # Cross-scope/cross-binding current presence is still current
+            # presence. S3.8 must not make an older scope generation win merely
+            # because it finalized late; S3.10 later generalizes the evidence
+            # ordering model beyond coverage.
+            decision = "SKIPPED_NEWER_PRESENCE"
+        elif last_absence_order and last_absence_order > current_order:
+            decision = "SKIPPED_NEWER_ABSENCE"
+        elif prior_state == "ACTIVE":
+            decision = "UNCERTAIN"
             new_state = "UNCERTAIN"
-        elif state == "UNCERTAIN" and presence["last_absence_coverage_id"] != coverage_id:
+        elif prior_state == "UNCERTAIN":
+            decision = "EXPIRED"
             new_state = "EXPIRED"
-        else:
-            continue  # CLOSED/WITHDRAWN/EXPIRED stay; same-generation replay is a no-op
-        conn.execute(
-            "UPDATE job_sources SET presence_state = ?, last_absence_coverage_id = ?,"
-            " updated_at = ? WHERE id = ?",
-            (new_state, coverage_id, now, presence["id"]),
+
+        if new_state != prior_state:
+            conn.execute(
+                """
+                UPDATE job_sources
+                   SET presence_state = ?, last_absence_coverage_id = ?, updated_at = ?
+                 WHERE id = ? AND presence_state = ?
+                """,
+                (
+                    new_state,
+                    coverage["id"],
+                    now,
+                    presence["job_source_id"],
+                    prior_state,
+                ),
+            )
+
+        if decision not in {"SKIPPED_NEWER_PRESENCE", "SKIPPED_NEWER_ABSENCE"}:
+            conn.execute(
+                """
+                UPDATE source_presence_scope_membership
+                   SET last_absence_coverage_id = ?,
+                       last_absence_order_key = ?, updated_at = ?
+                 WHERE job_source_id = ? AND binding_revision_id = ?
+                   AND scope_key = ?
+                   AND (last_absence_order_key IS NULL OR last_absence_order_key < ?)
+                """,
+                (
+                    coverage["id"],
+                    current_order,
+                    now,
+                    presence["job_source_id"],
+                    coverage["binding_revision_id"],
+                    coverage["scope_key"],
+                    current_order,
+                ),
+            )
+
+        _record_application(
+            conn,
+            coverage=coverage,
+            presence=presence,
+            decision=decision,
+            prior_state=prior_state,
+            new_state=new_state,
+            now=now,
         )
 
 
 __all__ = [
     "CoverageFinalizationError",
+    "CoverageIdentityError",
     "degrade_coverage",
     "finalize_coverage",
     "is_coverage_degraded",
     "open_coverage",
     "open_or_resume_coverage",
+    "record_contributing_request",
     "record_seen_identity",
 ]

@@ -641,7 +641,10 @@ class TestCancellationAndCrashRecovery:
         assert _count(state, "SELECT COUNT(*) FROM fetch_attempts") == 0
         assert _count(state, "SELECT COUNT(*) FROM jobs") == 0
         coverage = db.execute("SELECT * FROM enumeration_coverage").fetchone()
-        assert coverage["completion_state"] == "PARTIAL"
+        # S3.8 records an explicit CANCELLED coverage state instead of the
+        # old PARTIAL blur (S3.8 corrective review #9); like PARTIAL it
+        # never applies absence because absence requires COMPLETE.
+        assert coverage["completion_state"] == "CANCELLED"
 
         # the run list shows the cancelled run through the API
         status, runs = _api(state, auth, "GET", "/api/runs")

@@ -1506,6 +1506,98 @@ CREATE INDEX idx_fetch_attempts_cache_representation
     return sql
 
 
+# -------------------- v18 S3.8 coverage authority / explicit scope membership
+# R2-F1: v1-v17 are frozen. S3.8 owns the next unused migration.
+# RunSourcePlan identity is authoritative; explicit scope membership prevents
+# declared-scope absence from scanning every presence for a source, and the
+# application table proves per-coverage/per-presence exactly-once semantics.
+@_step(18, "s3_8_coverage_authority_and_scope_membership")
+def _(sql: str = '''
+-- S3.8 coverage authority / explicit scope membership / exactly-once absence.
+-- v1-v17 are frozen. This is the next-unused sequential migration.
+
+ALTER TABLE enumeration_coverage
+    ADD COLUMN listing_identity_sufficient INTEGER NOT NULL DEFAULT 0
+    CHECK (listing_identity_sufficient IN (0, 1));
+ALTER TABLE enumeration_coverage
+    ADD COLUMN generation_order_key TEXT NOT NULL DEFAULT '';
+
+-- The immutable RunSourcePlan already owns these identities. Backfill old
+-- coverage rows from that exact FK rather than guessing from mutable source
+-- or canonical job state.
+UPDATE enumeration_coverage
+   SET source_plan_group_id = (
+           SELECT p.source_plan_group_id
+             FROM run_source_plans p
+            WHERE p.id = enumeration_coverage.run_source_plan_id
+       ),
+       source_id = (
+           SELECT p.source_id
+             FROM run_source_plans p
+            WHERE p.id = enumeration_coverage.run_source_plan_id
+       ),
+       binding_id = (
+           SELECT p.binding_id
+             FROM run_source_plans p
+            WHERE p.id = enumeration_coverage.run_source_plan_id
+       ),
+       binding_revision_id = (
+           SELECT p.binding_revision_id
+             FROM run_source_plans p
+            WHERE p.id = enumeration_coverage.run_source_plan_id
+       ),
+       generation_order_key =
+           COALESCE(started_at, created_at, '') || '|' || id;
+
+-- A pre-v18 unfinished generation did not durably record S3.8's barrier
+-- contract. Preserve its useful seen data, but force it non-authoritative so
+-- restart can finish it PARTIAL and a fresh S3.8 generation can prove absence.
+UPDATE enumeration_coverage
+   SET absence_inference_allowed = 0,
+       stop_reason = COALESCE(stop_reason, 'S3.8_MIGRATION_REQUIRES_FRESH_AUTHORITY')
+ WHERE finalized_at IS NULL;
+
+CREATE TABLE source_presence_scope_membership (
+    job_source_id TEXT NOT NULL REFERENCES job_sources(id) ON DELETE CASCADE,
+    binding_revision_id TEXT NOT NULL REFERENCES source_adapter_binding_revisions(id),
+    scope_key TEXT NOT NULL,
+    first_seen_coverage_id TEXT NOT NULL REFERENCES enumeration_coverage(id),
+    last_seen_coverage_id TEXT NOT NULL REFERENCES enumeration_coverage(id),
+    last_seen_order_key TEXT NOT NULL,
+    last_absence_coverage_id TEXT REFERENCES enumeration_coverage(id),
+    last_absence_order_key TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (job_source_id, binding_revision_id, scope_key)
+);
+CREATE INDEX idx_source_presence_scope_lookup
+    ON source_presence_scope_membership(binding_revision_id, scope_key, job_source_id);
+CREATE INDEX idx_source_presence_scope_seen_order
+    ON source_presence_scope_membership(last_seen_order_key);
+
+CREATE TABLE coverage_presence_application (
+    coverage_id TEXT NOT NULL REFERENCES enumeration_coverage(id),
+    job_source_id TEXT NOT NULL REFERENCES job_sources(id) ON DELETE CASCADE,
+    binding_revision_id TEXT NOT NULL REFERENCES source_adapter_binding_revisions(id),
+    scope_key TEXT NOT NULL,
+    decision TEXT NOT NULL
+        CHECK (decision IN (
+            'UNCERTAIN', 'EXPIRED', 'NO_STATE_CHANGE',
+            'SKIPPED_NEWER_PRESENCE', 'SKIPPED_NEWER_ABSENCE'
+        )),
+    prior_presence_state TEXT NOT NULL,
+    new_presence_state TEXT NOT NULL,
+    coverage_order_key TEXT NOT NULL,
+    applied_at TEXT NOT NULL,
+    PRIMARY KEY (coverage_id, job_source_id, binding_revision_id, scope_key)
+);
+CREATE INDEX idx_coverage_presence_application_presence
+    ON coverage_presence_application(job_source_id, binding_revision_id, scope_key, coverage_order_key);
+'''
+) -> None:
+    return sql
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1520,6 +1612,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10, 16})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 17, (
-    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17"
+assert LATEST_SCHEMA_VERSION == 18, (
+    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18"
 )

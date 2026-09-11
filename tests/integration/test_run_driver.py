@@ -380,9 +380,12 @@ def test_driver_mid_run_cancellation_no_late_commits(db, server):
     # only page 1 committed evidence; page 2's rolled back at the fence
     assert db.conn.execute("SELECT COUNT(*) FROM fetch_attempts").fetchone()[0] == 1
     assert db.conn.execute("SELECT COUNT(*) FROM job_observations").fetchone()[0] == 2
-    # coverage can not claim terminal enumeration after cancellation
+    # coverage can not claim terminal enumeration after cancellation.
+    # S3.8 records an explicit CANCELLED coverage state instead of the old
+    # PARTIAL blur (S3.8 corrective review #9); like PARTIAL it never applies
+    # absence because absence requires a COMPLETE barrier.
     cov = db.conn.execute("SELECT completion_state FROM enumeration_coverage").fetchone()
-    assert cov["completion_state"] == "PARTIAL"
+    assert cov["completion_state"] == "CANCELLED"
     # §18: host-native obligations for accepted work still drained
     assert db.conn.execute("SELECT COUNT(*) FROM job_scores").fetchone()[0] == 2
 
