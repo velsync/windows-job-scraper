@@ -199,8 +199,6 @@ def _page_validity_kinds(db, request_id):
     ("path", "expected_class"),
     [
         ("/careers/notfound", "NOT_FOUND"),
-        ("/careers/challenge", "CHALLENGE_PAGE"),
-        ("/careers/ratelimited", "RATE_LIMITED"),
         ("/careers/login", "LOGIN_REQUIRED"),
         ("/careers/binary", "UNEXPECTED_CONTENT"),
         ("/careers/badjson", "UNEXPECTED_CONTENT"),
@@ -250,6 +248,76 @@ def test_invalid_or_hostile_probes_are_refused_without_fingerprint_or_route(
             (queued.request_id,),
         ).fetchone()
         assert request["page_class"] == expected_class
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_class"),
+    [
+        ("/careers/challenge", "CHALLENGE_PAGE"),
+        ("/careers/ratelimited", "RATE_LIMITED"),
+    ],
+)
+def test_retryable_transient_probe_stays_open_with_cooldown_evidence(
+    tmp_path, server, path, expected_class
+):
+    """A retryable transient (challenge/rate-limit) is not a refusal verdict.
+
+    S3.4 normative transition supersedes the old Slice-2 PARTIAL expectation
+    for these two classes only: the probe durably becomes RETRY_WAIT with
+    persisted cooldown/rate evidence, the run stays open (RUNNING, no group
+    outcome), and no fingerprint, route, observation, or coverage is
+    manufactured. The non-retryable refusal classes above keep the PARTIAL
+    verdict and its safety assertions unchanged.
+    """
+    db = _database(tmp_path / "transient.db")
+    try:
+        queued, outcome = _probe(db, server, path)
+
+        assert outcome.page_class.value == expected_class
+        assert outcome.fingerprint is None
+        assert outcome.decision is None
+        assert outcome.run_status == "RUNNING"
+
+        request = db.conn.execute(
+            "SELECT status, page_class, next_retry_at FROM scrape_requests"
+            " WHERE id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert request["status"] == "RETRY_WAIT"
+        assert request["page_class"] == expected_class
+        assert request["next_retry_at"] > NOW
+
+        assert _page_validity_kinds(db, queued.request_id) == [
+            f"validity://{expected_class}"
+        ]
+        cooldown = db.conn.execute(
+            "SELECT cooldown_until FROM binding_host_rate_state"
+            " WHERE binding_id = (SELECT binding_id FROM scrape_requests"
+            " WHERE id = ?)",
+            (queued.request_id,),
+        ).fetchone()
+        assert cooldown is not None and cooldown["cooldown_until"] > NOW
+
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM ats_fingerprints"
+        ).fetchone()[0] == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM job_observations"
+        ).fetchone()[0] == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM enumeration_coverage"
+        ).fetchone()[0] == 0
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
+        ).fetchone()
+        assert run["status"] == "RUNNING"
+        group = db.conn.execute(
+            "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
+            (queued.run_id,),
+        ).fetchone()
+        assert group["group_outcome"] is None
     finally:
         db.close()
 

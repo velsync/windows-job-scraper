@@ -1,4 +1,4 @@
-"""S3.3 durable claim/capacity coordination tests. GENERATED ONLY; not executed."""
+"""S3.3 durable claim/capacity coordination tests."""
 
 from __future__ import annotations
 

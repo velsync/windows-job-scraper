@@ -1,4 +1,4 @@
-"""S3.2 authorization/fence regressions.  GENERATED ONLY; not executed."""
+"""S3.2 authorization/fence regressions."""
 
 from __future__ import annotations
 

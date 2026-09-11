@@ -1,4 +1,4 @@
-"""S3.3 capacity coordinator contract tests.  GENERATED ONLY; not executed."""
+"""S3.3 capacity coordinator contract tests."""
 
 from __future__ import annotations
 

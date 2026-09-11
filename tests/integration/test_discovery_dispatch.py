@@ -1,0 +1,258 @@
+"""S3.3/S3.4 discovery dispatch regression: SOURCE_DISCOVERY through the
+service-owned HTTP dispatch seam (no direct executor calls).
+
+Covers capacity deferral, active cooldown, authorization denial and
+cancellation: no network I/O before dispatch, no consumed provider budget,
+no stranded RUNNING request, durable retry/cooldown state.
+"""
+
+from __future__ import annotations
+
+import http.server
+import threading
+
+import pytest
+
+from jobscraper.db.connection import Database
+from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
+from jobscraper.runtime.cancellation import request_run_cancellation
+from jobscraper.runtime.capacity import CapacityKey, service_capacity_coordinator
+from jobscraper.runtime.discovery import (
+    DiscoveryError,
+    execute_source_discovery,
+    queue_source_discovery,
+)
+from jobscraper.runtime.rate import RateKey, record_failure
+
+NOW = "2026-09-10T06:30:00.000000Z"
+
+_GENERIC_PAGE = b"<!doctype html><html><body><h1>Careers</h1><p>Join us.</p></body></html>"
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    hits = 0
+
+    def do_GET(self):  # noqa: N802 - stdlib handler interface
+        type(self).hits += 1
+        body = _GENERIC_PAGE
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture()
+def server():
+    _Handler.hits = 0
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield srv
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _database(path):
+    db = Database(path)
+    migrate_schema(db.conn, LATEST_SCHEMA_VERSION)
+    db.conn.executescript(
+        f"""
+        INSERT INTO adapter_permission_profiles (id, display_name, created_at)
+        VALUES ('perm-dispatch', 'dispatch', '{NOW}');
+        INSERT INTO adapter_permission_profile_revisions
+            (id, permission_profile_id, revision, policy_json, created_at)
+        VALUES ('permrev-dispatch', 'perm-dispatch', 1, '{{}}', '{NOW}');
+        """
+    )
+    db.conn.commit()
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    begin_service_epoch(db.conn, now=NOW)
+    return db
+
+
+def _queue(db, server):
+    return queue_source_discovery(
+        db.conn,
+        display_name="Dispatch careers",
+        entry_url=f"http://127.0.0.1:{server.server_address[1]}/careers/generic",
+        source_family="EMPLOYER_CAREERS",
+        now=NOW,
+    )
+
+
+def test_capacity_deferral_performs_no_io_and_preserves_attempt_budget(
+    tmp_path, server
+):
+    """Exhausted provider capacity: no request, ABANDONED attempt, PENDING work."""
+    db = _database(tmp_path / "capacity.db")
+    reservations = []
+    try:
+        queued = _queue(db, server)
+        coordinator = service_capacity_coordinator()
+        key = CapacityKey(
+            execution_class="HTTP",
+            source_id=queued.source_id,
+            host="127.0.0.1",
+        )
+        for _ in range(2):  # default per-source cap is 2
+            reservation = coordinator.try_reserve(key)
+            assert reservation is not None
+            reservations.append(reservation)
+
+        with pytest.raises(DiscoveryError, match="no provider capacity"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=NOW)
+
+        assert _Handler.hits == 0
+        request = db.conn.execute(
+            "SELECT status, attempt_count, current_attempt_id"
+            " FROM scrape_requests WHERE id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert request["status"] == "PENDING"
+        assert request["attempt_count"] == 0
+        assert request["current_attempt_id"] is None
+        attempt = db.conn.execute(
+            "SELECT outcome, abandoned_reason FROM request_attempts"
+            " WHERE request_id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert attempt["outcome"] == "ABANDONED"
+        assert attempt["abandoned_reason"] == "CAPACITY_UNAVAILABLE"
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM fetch_attempts WHERE request_id = ?",
+            (queued.request_id,),
+        ).fetchone()[0] == 0
+    finally:
+        for reservation in reservations:
+            reservation.release()
+        db.close()
+
+
+def test_active_cooldown_defers_probe_to_retry_wait(tmp_path, server):
+    """Persisted Retry-After: no I/O, RETRY_WAIT with the durable cooldown."""
+    db = _database(tmp_path / "cooldown.db")
+    try:
+        queued = _queue(db, server)
+        record_failure(
+            db.conn,
+            RateKey(queued.binding_id, "127.0.0.1", None),
+            failure_kind="RATE_LIMIT",
+            delay_s=120,
+            retry_after_raw="120",
+            now=NOW,
+        )
+        with pytest.raises(DiscoveryError, match="cooldown"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=NOW)
+
+        assert _Handler.hits == 0
+        request = db.conn.execute(
+            "SELECT status, next_retry_at FROM scrape_requests WHERE id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert request["status"] == "RETRY_WAIT"
+        assert request["next_retry_at"] == "2026-09-10T06:32:00.000000Z"
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
+        ).fetchone()
+        assert run["status"] == "RUNNING"
+    finally:
+        db.close()
+
+
+def test_binding_revocation_between_claim_and_dispatch_denies_probe(
+    tmp_path, server, monkeypatch
+):
+    """Current revocation after claim: FAILED, run mirrors it, no I/O.
+
+    The wrapper revokes inside the dispatch window (after the claim, before
+    the authorization checkpoint) to deterministically exercise the exact
+    race the live-authorization seam exists for.
+    """
+    from jobscraper.runtime import discovery as discovery_module
+
+    real_dispatch = discovery_module.dispatch_http
+
+    db = _database(tmp_path / "denied.db")
+    try:
+        queued = _queue(db, server)
+
+        def _revoke_then_dispatch(conn, envelope, policy, **kwargs):
+            conn.execute(
+                "UPDATE source_adapter_bindings SET desired_state = 'DISABLED'"
+                " WHERE id = ?",
+                (queued.binding_id,),
+            )
+            conn.commit()
+            return real_dispatch(conn, envelope, policy, **kwargs)
+
+        monkeypatch.setattr(
+            discovery_module, "dispatch_http", _revoke_then_dispatch
+        )
+
+        with pytest.raises(DiscoveryError, match="denied"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=NOW)
+
+        assert _Handler.hits == 0
+        request = db.conn.execute(
+            "SELECT status FROM scrape_requests WHERE id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert request["status"] == "FAILED"
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
+        ).fetchone()
+        assert run["status"] == "FAILED"
+        group = db.conn.execute(
+            "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
+            (queued.run_id,),
+        ).fetchone()
+        assert group["group_outcome"] == "FAILED"
+    finally:
+        db.close()
+
+
+def test_cancellation_between_claim_and_dispatch_abandons_probe(
+    tmp_path, server, monkeypatch
+):
+    """Cancellation after claim: cooperatively CANCELLED, never stranded.
+
+    Same dispatch-window injection as above, but for run cancellation: the
+    attempt is abandoned (not left RUNNING) and the run closes CANCELLED.
+    """
+    from jobscraper.runtime import discovery as discovery_module
+
+    real_dispatch = discovery_module.dispatch_http
+
+    db = _database(tmp_path / "cancelled.db")
+    try:
+        queued = _queue(db, server)
+
+        def _cancel_then_dispatch(conn, envelope, policy, **kwargs):
+            request_run_cancellation(conn, queued.run_id, now=NOW)
+            return real_dispatch(conn, envelope, policy, **kwargs)
+
+        monkeypatch.setattr(
+            discovery_module, "dispatch_http", _cancel_then_dispatch
+        )
+
+        with pytest.raises(DiscoveryError, match="denied"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=NOW)
+
+        assert _Handler.hits == 0
+        request = db.conn.execute(
+            "SELECT status FROM scrape_requests WHERE id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert request["status"] == "CANCELLED"
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
+        ).fetchone()
+        assert run["status"] == "CANCELLED"
+    finally:
+        db.close()

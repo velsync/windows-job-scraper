@@ -690,7 +690,13 @@ def test_a_rejected_member_on_an_earlier_page_is_never_laundered_into_complete(d
     COMPLETE and grant absence authority over a membership set that was
     provably incomplete on page 1.  The adapter therefore proposes no cursor
     after a PARTIAL page: coverage stays PARTIAL, and the good observations
-    from page 1 are still persisted (PARTIAL is not FAILURE).
+    from page 1 are still persisted (PARTIAL observations survive; only the
+    owning request verdict changed).
+
+    S3.4 normative transition supersedes the old SUCCEEDED expectation for
+    the owning request: the rejected-member page is a terminally
+    failed/degraded unit (FAILED), not a success. All absence-safety
+    assertions below are unchanged.
     """
     run_id, _ = _run_board(
         db, server, board="rejectedthenclean", config={"page_size": 2, "detail_fetch": False}
@@ -698,8 +704,9 @@ def test_a_rejected_member_on_an_earlier_page_is_never_laundered_into_complete(d
     assert execute_run(db.conn, run_id) == "PARTIAL"
 
     requests = _requests(db, run_id)
-    # exactly one page was fetched: the walk stopped at the degraded page
-    assert [(r["request_type"], r["status"]) for r in requests] == [("LIST_FETCH", "SUCCEEDED")]
+    # exactly one page was fetched: the walk stopped at the degraded page.
+    # S3.4 normative transition: the PARTIAL page is FAILED, not SUCCEEDED.
+    assert [(r["request_type"], r["status"]) for r in requests] == [("LIST_FETCH", "FAILED")]
     assert [u.rsplit("?", 1)[1] for u in _fetch_urls(db)] == ["mode=json&skip=0&limit=2"]
     parse = db.conn.execute(
         "SELECT outcome_kind, continuation_required, coverage_proposal_json, cursor_proposal_json,"

@@ -1,4 +1,4 @@
-"""S3.4 durable cooldown/cancellation tests. GENERATED ONLY; not executed."""
+"""S3.4 durable cooldown/cancellation tests."""
 
 from __future__ import annotations
 

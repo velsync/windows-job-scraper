@@ -929,12 +929,19 @@ def _execute_plan(
             break
         except StaleOwnership:
             # Plan binding is the last ownership checkpoint before I/O.  If it
-            # fails, no network request has started — but the attempt itself
-            # was consumed (reclaimed for retry below), so the pass must still
-            # terminalize honestly instead of leaving the group open.
+            # fails, no network request has started.  Reclamation does not
+            # necessarily consume ownership (an unexpired lease under a
+            # rotated epoch stays live), so inspect durable state instead of
+            # assuming: a still-live attempt stays open for redrive, and only
+            # a consumed attempt lets the pass terminalize below.
             reclaim_expired(conn)
             deferred = True
-            ownership_lost = True
+            live = conn.execute(
+                "SELECT 1 FROM scrape_requests WHERE id = ?"
+                " AND status = 'RUNNING' AND current_attempt_id = ?",
+                (claim.request_id, claim.attempt_id),
+            ).fetchone()
+            ownership_lost = live is None
             break
         # Post-I/O durable evidence/cooldown time is sampled after the
         # network wait; claim-time timestamps must not shorten Retry-After or
@@ -954,15 +961,15 @@ def _execute_plan(
         )
         transition_box = {
             "value": FenceTransition(
-                # A fetch that produced durable evidence is a definitive
-                # answer: the owning request commits SUCCEEDED and any
-                # degradation rides the parsed signals into the run/group
-                # outcome (sealed Slice-2 behavior). Only a retryable
-                # transient with budget left stays open as RETRY_WAIT; the
-                # durable retry/cooldown state is recorded in the mutate
-                # below regardless of the terminal mapping.
+                # Normative S3.2/S3.4 mapping: a retryable transient with
+                # budget stays open (RETRY_WAIT); a definitive failure is a
+                # failed acquisition unit (FAILED), never a false success;
+                # only a clean valid result commits SUCCEEDED here — parser
+                # PARTIAL/FAILURE kinds refine the transition inside mutate
+                # after their accepted outputs are derived (below).
                 outcome=(
                     "RETRY_WAIT" if retry_decision.action is RetryAction.RETRY
+                    else "FAILED" if retry_decision.action is RetryAction.FAIL
                     else "SUCCEEDED"
                 ),
                 retry_delay_s=retry_decision.delay_s,
@@ -1086,11 +1093,55 @@ def _execute_plan(
                         ),
                     )
 
-                # Definitive parse answers — including PARTIAL and FAILURE kinds —
-                # commit with the owning request SUCCEEDED. Degradation is
-                # expressed through the parsed signals into the run/group
-                # outcome below (sealed Slice-2 behavior); the request itself
-                # carries the evidence, not a failure verdict.
+                # Parser PARTIAL/FAILURE kinds never default the owning request
+                # to SUCCEEDED. This refinement only selects the verdict in
+                # transition_box; the fence applies it after mutate completes,
+                # so all accepted observations/evidence/children/local
+                # obligations persist atomically under the same fence. A
+                # retryable typed failure with budget left stays open
+                # (RETRY_WAIT), otherwise the unit is terminally failed and
+                # degraded. PARTIAL coverage degradation above is never
+                # undone here, so authoritative coverage cannot be restored.
+                if outcome_obj.kind in {ParseOutcomeKind.PARTIAL, ParseOutcomeKind.FAILURE}:
+                    if outcome_obj.failure is not None:
+                        parse_retry = decide_retry(
+                            outcome_obj.failure,
+                            page_class=None,
+                            attempt_count=int(budget["attempt_count"]),
+                            max_attempts=int(budget["max_attempts"]),
+                            headers={},
+                        )
+                        if parse_retry.action is RetryAction.RETRY:
+                            transition_box["value"] = FenceTransition(
+                                outcome="RETRY_WAIT",
+                                retry_delay_s=parse_retry.delay_s,
+                                failure_kind=outcome_obj.failure.kind.value,
+                                failure_json=bounded_json({
+                                    **outcome_obj.failure.as_dict(),
+                                    "retry_reason": parse_retry.reason,
+                                    "retry_delay_s": parse_retry.delay_s,
+                                    "budget_exhausted": parse_retry.budget_exhausted,
+                                }),
+                            )
+                        else:
+                            transition_box["value"] = FenceTransition(
+                                outcome="FAILED",
+                                failure_kind=outcome_obj.failure.kind.value,
+                                failure_json=bounded_json({
+                                    **outcome_obj.failure.as_dict(),
+                                    "retry_reason": parse_retry.reason,
+                                    "budget_exhausted": parse_retry.budget_exhausted,
+                                }),
+                            )
+                    else:
+                        transition_box["value"] = FenceTransition(
+                            outcome="FAILED",
+                            failure_json=bounded_json({
+                                "kind": outcome_obj.kind.value,
+                                "reason": "non-success parse outcome without typed failure",
+                            }),
+                        )
+
                 for observation in outcome_obj.observations:
                     # 02 §32 origin resolution — host-owned and network-inert:
                     # it consumes the recorded redirect chain plus the
@@ -1281,6 +1332,12 @@ def _execute_plan(
         # reclaimed attempt was consumed, so the pass terminalizes below.
         return
     open_child_work = _open_acquisition_requests(conn, plan_id)
+    if not (pages or details or terminal or cancelled or ownership_lost):
+        # This pass consumed and produced nothing (e.g. only epoch-orphaned
+        # RUNNING work remains, still live under an unexpired lease): stay
+        # open for redrive rather than manufacturing a terminal outcome.
+        # Epoch invalidation alone must never close a plan/group/run.
+        return
     if cancelled:
         outcome = "CANCELLED"
     elif terminal and not run_degraded and open_child_work == 0:

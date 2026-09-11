@@ -1,4 +1,4 @@
-"""S3.4 deterministic retry policy tests.  GENERATED ONLY; not executed."""
+"""S3.4 deterministic retry policy tests."""
 
 from __future__ import annotations
 

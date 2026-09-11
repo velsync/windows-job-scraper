@@ -27,10 +27,9 @@ from typing import Any
 from jobscraper.acquisition.envelope import (
     ExecutionPlanEnvelope,
     RequestPlan,
-    bind_execution_plan,
     policy_snapshot_reference,
 )
-from jobscraper.acquisition.httpexec import execute_request
+from jobscraper.acquisition.failures import FailureKind, FailureRecord
 from jobscraper.acquisition.pagevalidity import PageClass, classify_page
 from jobscraper.acquisition.result import ResultEnvelope
 from jobscraper.adapters.contract import AdapterTask, AdapterTaskKind, PlanningContext
@@ -43,9 +42,31 @@ from jobscraper.pipeline.driver import (
     _record_evidence,
     source_policy,
 )
-from jobscraper.runtime.claims import StaleOwnership, claim_next_request
+from jobscraper.runtime.authorization import (
+    AuthorizationDenied,
+    AuthorizationReason,
+    finalize_authorization_denial,
+)
+from jobscraper.runtime.cancellation import abandon_request_for_cancellation
+from jobscraper.runtime.claim_control import yield_unstarted_claim
+from jobscraper.runtime.claims import StaleOwnership, claim_next_request, reclaim_expired
 from jobscraper.runtime.clock import db_utc_now
+from jobscraper.runtime.dispatch import (
+    CapacityUnavailable,
+    DispatchDeferred,
+    DispatchExecutionError,
+    DispatchRejected,
+    UnsupportedExecutionClass,
+    dispatch_http,
+)
 from jobscraper.runtime.fence import fenced_commit
+from jobscraper.runtime.rate import (
+    record_failure as record_rate_failure,
+)
+from jobscraper.runtime.rate import (
+    record_success as record_rate_success,
+)
+from jobscraper.runtime.retry import RetryAction
 from jobscraper.runtime.provisioning import (
     ensure_builtin_adapter_definition,
     provision_source_and_binding,
@@ -53,6 +74,7 @@ from jobscraper.runtime.provisioning import (
     record_route_decision,
 )
 from jobscraper.runtime.requests import enqueue_request
+from jobscraper.runtime.retry import RetryAction, decide_retry
 from jobscraper.runtime.runs import create_run, mark_run_started
 
 _DISCOVERY_ADAPTER_ID = "generic_discovery"
@@ -397,6 +419,184 @@ def _finalize_discovery_run_under_fence(
     return run_status
 
 
+def _terminalize_discovery_run(
+    conn: sqlite3.Connection,
+    queued: QueuedDiscovery,
+    *,
+    run_status: str,
+    group_outcome: str,
+    now: str,
+) -> None:
+    """Terminalize a discovery run whose probe never produced evidence.
+
+    Used for typed authorization denial/cancellation and dispatch rejection:
+    the request was already terminalized by its typed handler, so the run
+    and its single plan mirror that verdict instead of stranding RUNNING.
+    """
+    shape = conn.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM run_source_plans WHERE run_id = ?) AS plans,
+          (SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?) AS requests
+        """,
+        (queued.run_id, queued.run_id),
+    ).fetchone()
+    if shape is None or tuple(shape) != (1, 1):
+        raise DiscoveryError("discovery run shape changed before terminalization")
+    conn.execute(
+        "UPDATE run_source_plans SET group_outcome = ?"
+        " WHERE id = ? AND run_id = ? AND group_outcome IS NULL",
+        (group_outcome, queued.run_source_plan_id, queued.run_id),
+    )
+    conn.execute(
+        """
+        UPDATE scrape_runs
+        SET status = ?,
+            finished_at = COALESCE(finished_at, ?),
+            requests_total = (SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?),
+            requests_failed = (SELECT COUNT(*) FROM scrape_requests
+                               WHERE run_id = ? AND status = 'FAILED')
+        WHERE id = ?
+        """,
+        (run_status, now, queued.run_id, queued.run_id, queued.run_id),
+    )
+    conn.commit()
+
+
+def _terminalize_discovery_denied(
+    conn: sqlite3.Connection,
+    queued: QueuedDiscovery,
+    claim,
+    *,
+    failure_kind: str,
+    detail: dict,
+    now: str,
+) -> None:
+    """Record a terminal discovery denial without request-owned outputs.
+
+    No fetch attempt exists (no I/O happened), so only denial evidence is
+    recorded under the ownership fence; the request goes FAILED and the
+    single-probe run mirrors that verdict instead of stranding RUNNING.
+    """
+    from jobscraper.pipeline.driver import _record_evidence
+
+    def mutate(cursor_conn: sqlite3.Connection) -> None:
+        _record_evidence(
+            cursor_conn,
+            request_id=claim.request_id,
+            attempt_id=claim.attempt_id,
+            kind="FAILURE",
+            ref=f"DENIED:{failure_kind}",
+            detail=detail,
+            content_hash=None,
+            now=now,
+        )
+
+    try:
+        with fenced_commit(
+            conn,
+            claim.request_id,
+            claim.attempt_id,
+            now=now,
+            outcome="FAILED",
+            failure_kind=failure_kind,
+            failure_json=json.dumps(detail, sort_keys=True),
+            mutate=mutate,
+        ):
+            pass
+    except StaleOwnership as exc:
+        raise DiscoveryError(
+            "discovery ownership was lost before denial commit"
+        ) from exc
+    _terminalize_discovery_run(
+        conn, queued, run_status="FAILED", group_outcome="FAILED", now=now
+    )
+
+
+def _discovery_local_retry(conn, claim, budget, *, now: str):
+    """Open a retry window for a local executor failure, if budget remains.
+
+    Returns the retry delay when the request was parked RETRY_WAIT, else
+    None (budget exhausted — the caller terminalizes). Source health and
+    circuit state are untouched: local infrastructure failure never poisons
+    them (S3.4 local-vs-source separation).
+    """
+    from jobscraper.pipeline.driver import _record_evidence
+
+    failure = FailureRecord(
+        kind=FailureKind.WORKER_CRASH,
+        retryable=True,
+        source_health_impact="NONE",
+        source_id="",
+        binding_id="",
+        adapter_id=_DISCOVERY_ADAPTER_ID,
+        adapter_version="",
+        run_id="",
+        request_id=claim.request_id,
+        attempt_id=claim.attempt_id,
+        details_redacted={},
+        observed_at=now,
+    )
+    decision = decide_retry(
+        failure,
+        page_class=None,
+        attempt_count=int(budget["attempt_count"]),
+        max_attempts=int(budget["max_attempts"]),
+        headers={},
+    )
+    if decision.action is not RetryAction.RETRY:
+        return None
+
+    def mutate(cursor_conn: sqlite3.Connection) -> None:
+        _record_evidence(
+            cursor_conn,
+            request_id=claim.request_id,
+            attempt_id=claim.attempt_id,
+            kind="FAILURE",
+            ref="DISPATCH_EXECUTOR_ERROR",
+            detail={"kind": FailureKind.WORKER_CRASH.value},
+            content_hash=None,
+            now=now,
+        )
+
+    with fenced_commit(
+        conn,
+        claim.request_id,
+        claim.attempt_id,
+        now=now,
+        outcome="RETRY_WAIT",
+        retry_delay_s=decision.delay_s,
+        failure_kind=FailureKind.WORKER_CRASH.value,
+        failure_json=json.dumps({"retry_reason": decision.reason}, sort_keys=True),
+        mutate=mutate,
+    ):
+        pass
+    return decision.delay_s
+
+
+def _handle_discovery_authorization_denied(conn, queued, claim, exc, *, now: str) -> None:
+    """Typed handling for a discovery authorization denial: never strand RUNNING."""
+    if exc.decision.reason is AuthorizationReason.RUN_CANCELLED:
+        abandon_request_for_cancellation(
+            conn, claim.request_id, attempt_id=claim.attempt_id, now=now
+        )
+        _terminalize_discovery_run(
+            conn, queued, run_status="CANCELLED", group_outcome="CANCELLED",
+            now=now,
+        )
+        return
+    finalized = finalize_authorization_denial(
+        conn, claim.request_id, claim.attempt_id,
+        decision=exc.decision, now=now,
+    )
+    if finalized:
+        _terminalize_discovery_run(
+            conn, queued, run_status="FAILED", group_outcome="FAILED", now=now
+        )
+    # When not finalized the denial was stale (current authority re-check
+    # passed): the still-live attempt stays open for redrive.
+
+
 def execute_source_discovery(
     conn: sqlite3.Connection,
     queued: QueuedDiscovery,
@@ -437,13 +637,114 @@ def execute_source_discovery(
         raise DiscoveryError("durable SOURCE_DISCOVERY request is not claimable")
 
     _plan_row, source, _request_plan, envelope = _plan_request(conn, queued, claim)
-    # S3.2: bind the exact claimed/run-plan identity before any network I/O so
-    # the fenced commit can prove result/envelope/attempt identity (CR-07).
-    bind_execution_plan(conn, envelope, now=claim_ts)
-    result = execute_request(
-        envelope, source_policy(source, adapter_id=_DISCOVERY_ADAPTER_ID)
-    )
-    classification = classify_page(result, expect="LIST")
+    policy = source_policy(source, adapter_id=_DISCOVERY_ADAPTER_ID)
+    budget = conn.execute(
+        "SELECT attempt_count, max_attempts FROM scrape_requests WHERE id = ?",
+        (claim.request_id,),
+    ).fetchone()
+    try:
+        # S3.3/S3.4 service-owned HTTP dispatch: live authorization, durable
+        # rate/cooldown gating, capacity reservation, execution-plan binding,
+        # network I/O, classification and retry intent. No direct
+        # execute_request() call remains on this path.
+        dispatched = dispatch_http(
+            conn,
+            envelope,
+            policy,
+            attempt_count=int(budget["attempt_count"]),
+            max_attempts=int(budget["max_attempts"]),
+            expect="LIST",
+            now=claim_ts,
+        )
+    except CapacityUnavailable:
+        # No network request happened and the provider attempt budget is
+        # untouched: the minted attempt is abandoned and the request returns
+        # to PENDING eligibility for a later pass.
+        yield_unstarted_claim(
+            conn, claim.request_id, claim.attempt_id,
+            reason="CAPACITY_UNAVAILABLE", now=claim_ts,
+        )
+        raise DiscoveryError(
+            "discovery dispatch deferred: no provider capacity"
+        ) from None
+    except DispatchDeferred as exc:
+        if exc.next_retry_at is not None:
+            # Durable source cooldown: no I/O, attempt preserved as
+            # RETRY_WAIT so the probe resumes after the cooldown expires.
+            yield_unstarted_claim(
+                conn, claim.request_id, claim.attempt_id,
+                reason="RATE_COOLDOWN", next_retry_at=exc.next_retry_at,
+                now=claim_ts,
+            )
+            raise DiscoveryError(
+                "discovery dispatch deferred: source cooldown active"
+            ) from None
+        _terminalize_discovery_denied(
+            conn, queued, claim,
+            failure_kind=exc.failure_kind or "BLOCKED",
+            detail={"reason": exc.reason},
+            now=claim_ts,
+        )
+        raise DiscoveryError(
+            f"discovery dispatch refused: {exc.reason}"
+        ) from None
+    except (DispatchRejected, UnsupportedExecutionClass) as exc:
+        _terminalize_discovery_denied(
+            conn, queued, claim,
+            failure_kind="POLICY_REJECTED",
+            detail={"reason": "DISPATCH_PLAN_INVALID",
+                    "error_type": type(exc).__name__},
+            now=claim_ts,
+        )
+        raise DiscoveryError(
+            f"discovery dispatch rejected: {type(exc).__name__}"
+        ) from None
+    except DispatchExecutionError as exc:
+        # Local infrastructure failure escaping the executor: retryable
+        # WORKER_CRASH with no source-health impact, request stays open.
+        local_retry = _discovery_local_retry(conn, claim, budget, now=claim_ts)
+        if local_retry is None:
+            _terminalize_discovery_denied(
+                conn, queued, claim,
+                failure_kind="WORKER_CRASH",
+                detail={"error_type": exc.error_type},
+                now=claim_ts,
+            )
+            raise DiscoveryError(
+                f"discovery executor error, budget exhausted: {exc.error_type}"
+            ) from None
+        raise DiscoveryError(
+            f"discovery executor error, retry open: {exc.error_type}"
+        ) from None
+    except AuthorizationDenied as exc:
+        _handle_discovery_authorization_denied(conn, queued, claim, exc, now=claim_ts)
+        raise DiscoveryError(
+            f"discovery authorization denied: {exc.decision.reason.value}"
+        ) from None
+    except StaleOwnership:
+        # Pre-I/O ownership loss: reclaim, then inspect durable state. A
+        # still-live attempt stays open for redrive; only a consumed attempt
+        # lets the run terminalize below.
+        reclaim_expired(conn, now=claim_ts)
+        live = conn.execute(
+            "SELECT 1 FROM scrape_requests WHERE id = ?"
+            " AND status = 'RUNNING' AND current_attempt_id = ?",
+            (claim.request_id, claim.attempt_id),
+        ).fetchone()
+        if live is not None:
+            raise DiscoveryError(
+                "discovery ownership advanced before dispatch; still open"
+            ) from None
+        _terminalize_discovery_run(
+            conn, queued, run_status="FAILED", group_outcome="FAILED",
+            now=claim_ts,
+        )
+        raise DiscoveryError(
+            "discovery ownership was lost before dispatch; attempt consumed"
+        ) from None
+    result = dispatched.result
+    classification = dispatched.classification
+    retry_decision = dispatched.retry
     commit_ts = now or db_utc_now(conn)
 
     fingerprint: AtsFingerprint | None = None
@@ -502,6 +803,20 @@ def execute_source_discovery(
                 claim.request_id,
             ),
         )
+        if retry_decision.action is not RetryAction.SUCCEED:
+            # Durable source-protection state survives restart even when the
+            # probe itself stays open for retry (S3.4).
+            record_rate_failure(
+                cursor_conn,
+                dispatched.rate_key,
+                failure_kind=retry_decision.failure_kind or "SOURCE_CHANGED",
+                delay_s=retry_delay_s,
+                retry_after_raw=retry_decision.retry_after_raw,
+                now=commit_ts,
+                commit=False,
+            )
+        else:
+            record_rate_success(cursor_conn, dispatched.rate_key, now=commit_ts, commit=False)
         _record_evidence(
             cursor_conn,
             request_id=claim.request_id,
@@ -530,19 +845,52 @@ def execute_source_discovery(
                 now=commit_ts,
                 commit=False,
             )
-        stored["run_status"] = _finalize_discovery_run_under_fence(
-            cursor_conn,
-            queued,
-            has_fingerprint=fingerprint is not None,
-            now=commit_ts,
-        )
+        if retry_decision.action is RetryAction.RETRY:
+            # A retryable transient stays open: the probe is durably RETRY_WAIT
+            # with cooldown evidence, and the discovery run must NOT
+            # terminalize as success/failure while retry work remains open.
+            # A later service pass reclaims it after next_retry_at.
+            stored["run_status"] = "RUNNING"
+        else:
+            stored["run_status"] = _finalize_discovery_run_under_fence(
+                cursor_conn,
+                queued,
+                has_fingerprint=fingerprint is not None,
+                now=commit_ts,
+            )
 
+    # Post-I/O cooldown/retry delay is sampled after the network wait (S3.4);
+    # the same value drives both the durable rate record (in mutate) and the
+    # RETRY_WAIT fence transition below.
+    retry_delay_s = retry_decision.delay_s
+    if (
+        retry_delay_s is None
+        and retry_decision.failure_kind in {"RATE_LIMIT", "CHALLENGE", "BLOCKED"}
+    ):
+        retry_delay_s = 300.0
+    retry_transition = (
+        ("RETRY_WAIT", retry_delay_s)
+        if retry_decision.action is RetryAction.RETRY
+        else ("SUCCEEDED", None)
+    )
     try:
         with fenced_commit(
             conn,
             claim.request_id,
             claim.attempt_id,
             now=commit_ts,
+            outcome=retry_transition[0],
+            retry_delay_s=retry_transition[1],
+            failure_kind=retry_decision.failure_kind,
+            failure_json=(
+                json.dumps(
+                    {
+                        "kind": retry_decision.failure_kind,
+                        "reason": retry_decision.reason,
+                        "retry_after": retry_decision.retry_after_raw,
+                    }
+                ) if retry_decision.failure_kind else None
+            ),
             mutate=mutate,
         ):
             pass

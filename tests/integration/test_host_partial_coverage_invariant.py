@@ -317,9 +317,12 @@ def test_partial_with_cursor_cannot_be_laundered_into_complete_by_a_clean_termin
 
     assert execute_run(db.conn, run_id) == "PARTIAL"
 
-    # both pages really ran through the driver (the cursor was honoured)
+    # both pages really ran through the driver (the cursor was honoured).
+    # S3.4 normative transition: the PARTIAL page (no retryable typed
+    # failure) is a terminally failed/degraded unit, not a success; its
+    # accepted observations below still persist atomically.
     requests = _requests(db, run_id)
-    assert [r["status"] for r in requests] == ["SUCCEEDED", "SUCCEEDED"]
+    assert [r["status"] for r in requests] == ["FAILED", "SUCCEEDED"]
     assert [(p["outcome_kind"], p["continuation_required"]) for p in _parses(db)] == [
         ("PARTIAL", 1), ("SUCCESS_WITH_JOBS", 0),
     ]
@@ -373,9 +376,11 @@ def test_the_degradation_is_durable_the_moment_the_partial_page_commits(db, serv
     finally:
         driver_module.claim_next_request = real_claim
 
-    # page 0 committed PARTIAL and enqueued page 1; the generation is still open
+    # page 0 committed PARTIAL and enqueued page 1; the generation is still open.
+    # S3.4 normative transition: page 0 is FAILED/degraded (not SUCCEEDED);
+    # the durability assertions below are unchanged.
     requests = _requests(db, run_id)
-    assert [r["status"] for r in requests] == ["SUCCEEDED", "PENDING"]
+    assert [r["status"] for r in requests] == ["FAILED", "PENDING"]
     cov = _coverage(db)[0]
     assert cov["finalized_at"] is None
     # …and the degradation is already durable on the open generation
@@ -416,7 +421,8 @@ def test_restart_between_the_partial_page_and_the_continuation_cannot_erase_degr
     assert cov["terminal_enumeration_proven"] == 0
     assert cov["absence_inference_allowed"] == 0
     assert cov["pages_completed"] >= 1
-    assert [r["status"] for r in _requests(db, run_id)] == ["SUCCEEDED", "SUCCEEDED"]
+    # S3.4 normative transition (see above): the PARTIAL page is FAILED.
+    assert [r["status"] for r in _requests(db, run_id)] == ["FAILED", "SUCCEEDED"]
     assert _outcome(db, run_id) == "SATISFIED_PARTIAL"
     assert db.conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 3
 

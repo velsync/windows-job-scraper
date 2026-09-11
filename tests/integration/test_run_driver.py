@@ -420,7 +420,14 @@ def test_driver_redirect_denied_is_partial_and_grants_no_absence_authority(db, s
     """§21/RUN-13 regression: a mid-chain policy denial carries the hop's
     status code but no page.  The run must end PARTIAL with coverage
     PARTIAL — never a terminal EMPTY that would grant absence authority
-    over jobs the run never actually enumerated."""
+    over jobs the run never actually enumerated.
+
+    S3.4 normative transition supersedes the old SUCCEEDED expectation for
+    the owning request: a definitive policy failure is a failed acquisition
+    unit (FAILED with POLICY_REJECTED evidence), not a success. The safety
+    assertions — PARTIAL run/coverage, no absence authority, no retry
+    storm — are unchanged and still hold.
+    """
     db.conn.execute(
         "UPDATE source_adapter_binding_revisions SET config_json = ?"
         " WHERE id = 'bndrev-1'",
@@ -440,7 +447,7 @@ def test_driver_redirect_denied_is_partial_and_grants_no_absence_authority(db, s
         "SELECT status, page_class FROM scrape_requests WHERE run_id = ?",
         (run_id,),
     ).fetchone()
-    assert req["status"] == "SUCCEEDED"  # definitive answer, no retry storm
+    assert req["status"] == "FAILED"  # definitive policy failure: failed unit
     assert req["page_class"] == "UNKNOWN"
     fa = db.conn.execute(
         "SELECT failure_kind FROM fetch_attempts WHERE request_id ="
@@ -532,3 +539,54 @@ def test_execute_run_claim_path_cannot_bypass_clock_anomaly_detection(db):
         (run_id,),
     ).fetchall()
     assert len(pages) == 2 and all(p["status"] == "SUCCEEDED" for p in pages)
+
+
+def test_epoch_rotation_with_live_lease_leaves_plan_open(db):
+    """Stale service epoch + unexpired lease: no false plan/run closure.
+
+    The orphaned RUNNING attempt is still live (lease unexpired), so the
+    pass must stay open for redrive: no group outcome, no run terminal
+    status, no coverage finalization, request untouched. Epoch invalidation
+    alone closes nothing.
+    """
+    from jobscraper.runtime.claims import claim_next_request
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    run_id = _start_run(db)
+    claim = claim_next_request(db.conn, "worker-1", now=NOW)
+    assert claim is not None
+    row = db.conn.execute(
+        "SELECT status, current_attempt_id, lease_until FROM scrape_requests"
+        " WHERE id = ?",
+        (claim.request_id,),
+    ).fetchone()
+    assert row["status"] == "RUNNING" and row["lease_until"] > NOW
+
+    # rotate the service epoch: the live lease is now epoch-stale, but the
+    # attempt itself was not consumed.
+    begin_service_epoch(db.conn, now=NOW)
+
+    assert execute_run(db.conn, run_id) is None
+    row = db.conn.execute(
+        "SELECT status, current_attempt_id FROM scrape_requests WHERE id = ?",
+        (claim.request_id,),
+    ).fetchone()
+    assert row["status"] == "RUNNING"
+    assert row["current_attempt_id"] == claim.attempt_id
+    group = db.conn.execute(
+        "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    assert group["group_outcome"] is None
+    run = db.conn.execute(
+        "SELECT status FROM scrape_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    assert run["status"] == "RUNNING"
+    coverage = db.conn.execute(
+        "SELECT completion_state, finalized_at, terminal_enumeration_proven"
+        " FROM enumeration_coverage"
+    ).fetchall()
+    assert all(
+        row["finalized_at"] is None and not row["terminal_enumeration_proven"]
+        for row in coverage
+    )
