@@ -1372,6 +1372,58 @@ CREATE INDEX idx_binding_host_rate_state_cooldown
     return sql
 
 
+# ------------------- v16 S3.5 binding-revision crawler cursor (ROAD-04)
+# Rebuild the pre-S3.5 cursor table in place. Cursor lookup identity is the
+# compatible binding revision + adapter ID/version + cursor schema: any run
+# under unchanged pins resumes the same row, and each adapter decides from
+# the stored state whether an earlier run's cursor is reusable for a new run
+# (feed-style offsets resume; plan-scoped states such as Lever's restart).
+# The RunSourcePlan that wrote/checkpointed the cursor is preserved as
+# provenance only (checkpoint_run_source_plan_id) and is never the lookup
+# key. Pagination/trap guard state resumes only for the SAME RunSourcePlan;
+# a new run always begins with fresh guard state. Existing rows are preserved
+# as deliberately unbound legacy rows: migration cannot honestly guess which
+# historical binding revision or RunSourcePlan owned a binding-wide cursor.
+@_step(16, "s3_5_binding_revision_crawl_cursor")
+def _(sql: str = """
+CREATE TABLE crawl_cursors_v16 (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES sources(id),
+    binding_id TEXT NOT NULL REFERENCES source_adapter_bindings(id),
+    binding_revision_id TEXT REFERENCES source_adapter_binding_revisions(id),
+    adapter_id TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+    cursor_schema_version INTEGER NOT NULL,
+    state_json TEXT NOT NULL DEFAULT '{}',
+    guard_state_json TEXT NOT NULL DEFAULT '{}',
+    checkpoint_run_source_plan_id TEXT REFERENCES run_source_plans(id),
+    checkpoint_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_crawl_cursors_compatible_identity
+    ON crawl_cursors_v16(binding_revision_id, adapter_id, adapter_version, cursor_schema_version)
+    WHERE binding_revision_id IS NOT NULL;
+CREATE INDEX idx_crawl_cursors_binding
+    ON crawl_cursors_v16(binding_id, adapter_id, adapter_version);
+CREATE INDEX idx_crawl_cursors_binding_revision
+    ON crawl_cursors_v16(binding_revision_id);
+CREATE INDEX idx_crawl_cursors_checkpoint_plan
+    ON crawl_cursors_v16(checkpoint_run_source_plan_id);
+
+INSERT INTO crawl_cursors_v16 (
+    id, source_id, binding_id, binding_revision_id,
+    adapter_id, adapter_version, cursor_schema_version, state_json,
+    guard_state_json, checkpoint_run_source_plan_id, checkpoint_at)
+SELECT id, source_id, binding_id, NULL,
+       adapter_id, adapter_version, cursor_schema_version, state_json,
+       '{}', NULL, checkpoint_at
+  FROM crawl_cursors;
+
+DROP TABLE crawl_cursors;
+ALTER TABLE crawl_cursors_v16 RENAME TO crawl_cursors;
+""") -> None:
+    return sql
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1382,10 +1434,10 @@ _finalize()
 # Steps whose SQL rebuilds existing tables (SQLite 12-step ALTER procedure).
 # The machinery runs these with foreign keys disabled for the duration of the
 # step and gates COMMIT on a clean PRAGMA foreign_key_check (03 §50).
-REBUILD_STEPS: frozenset[int] = frozenset({10})
+REBUILD_STEPS: frozenset[int] = frozenset({10, 16})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 15, (
-    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15"
+assert LATEST_SCHEMA_VERSION == 16, (
+    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16"
 )

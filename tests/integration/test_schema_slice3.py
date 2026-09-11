@@ -51,6 +51,11 @@ S3_0_STEP_SHA256 = {
     15: "1848e82890da89863de913cee74a039485bf0939ba4536b607e2f94b58a902bc",
 }
 
+# S3.5 freezes the binding-revision cursor rebuild. v1-v15 remain immutable.
+S3_5_STEP_SHA256 = {
+    16: "176f8fac243b988bd5bd1180048ec8ee897184a3ceb741f6a7b6ffd2d397acd0",
+}
+
 
 def _digest(sql: str) -> str:
     return hashlib.sha256(sql.encode()).hexdigest()
@@ -75,6 +80,63 @@ def test_s30_v15_is_sequential_and_pinned():
     name, sql = _step(15)
     assert name == "s3_0_runtime_foundation"
     assert _digest(sql) == S3_0_STEP_SHA256[15]
+
+
+def test_s35_v16_is_sequential_and_pinned():
+    versions = [version for version, _name, _sql in MIGRATION_STEPS]
+    assert versions == list(range(1, 17))
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 16
+    name, sql = _step(16)
+    assert name == "s3_5_binding_revision_crawl_cursor"
+    assert _digest(sql) == S3_5_STEP_SHA256[16]
+    # S3.5 appends. It never edits the accepted S3.0 migration.
+    assert _digest(_step(15)[1]) == S3_0_STEP_SHA256[15]
+
+
+def test_v16_rebuild_preserves_legacy_cursor_without_guessing_provenance(tmp_path):
+    db = Database(tmp_path / "cursor-v16.db")
+    try:
+        migrate_schema(db.conn, 15)
+        db.conn.execute(
+            "INSERT INTO sources(id,display_name,source_family,entry_url,created_at,updated_at)"
+            " VALUES ('src','Fixture','CAREERS','https://jobs.example.test',?,?)",
+            (NOW, NOW),
+        )
+        db.conn.execute(
+            "INSERT INTO source_adapter_bindings(id,source_id,display_name,created_at)"
+            " VALUES ('bnd','src','fixture',?)", (NOW,),
+        )
+        db.conn.execute(
+            "INSERT INTO crawl_cursors(id,source_id,binding_id,adapter_id,adapter_version,"
+            " cursor_schema_version,state_json,checkpoint_at)"
+            " VALUES ('cur-old','src','bnd','fixture','1.0.0',1,'{\"page\":2}',?)",
+            (NOW,),
+        )
+        db.conn.commit()
+        migrate_schema(db.conn, 16)
+        row = db.conn.execute("SELECT * FROM crawl_cursors WHERE id='cur-old'").fetchone()
+        assert row["binding_revision_id"] is None
+        assert row["checkpoint_run_source_plan_id"] is None
+        assert row["state_json"] == '{"page":2}'
+        assert row["guard_state_json"] == '{}'
+        assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        db.close()
+
+
+def test_v16_shares_one_compatible_cursor_row_with_plan_provenance(tmp_path):
+    db = Database(tmp_path / "cursor-identity-v16.db")
+    try:
+        migrate_schema(db.conn, 16)
+        columns = {row[1] for row in db.conn.execute("PRAGMA table_info(crawl_cursors)")}
+        assert {"binding_revision_id", "guard_state_json", "checkpoint_run_source_plan_id"} <= columns
+        # Partial unique index exists on the compatible lookup identity:
+        # legacy NULL rows may coexist, while S3.5 rows share exactly one
+        # cursor per compatible binding revision + code pins.
+        indexes = db.conn.execute("PRAGMA index_list(crawl_cursors)").fetchall()
+        assert any(row[1] == "idx_crawl_cursors_compatible_identity" and row[2] == 1 for row in indexes)
+    finally:
+        db.close()
 
 
 def test_v15_contains_only_s31_to_s34_runtime_foundation_storage():

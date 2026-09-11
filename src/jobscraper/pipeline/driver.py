@@ -41,6 +41,33 @@ from jobscraper.acquisition.envelope import (
 )
 from jobscraper.acquisition.failures import FailureKind, FailureRecord
 from jobscraper.acquisition.origin import resolve_origin
+from jobscraper.acquisition.crawler.budget import (
+    budget_from_plan,
+    check_budget,
+    close_unstarted_over_budget,
+    load_usage,
+)
+from jobscraper.acquisition.crawler.cursor import (
+    CursorCompatibilityError,
+    load_cursor as load_crawl_cursor,
+    save_cursor as save_crawl_cursor,
+)
+from jobscraper.acquisition.crawler.frontier import enqueue_discovered_task
+from jobscraper.acquisition.crawler.pagination import (
+    PaginationGuardState,
+    PaginationSignature,
+    PaginationStopKind,
+    advance_guard,
+)
+from jobscraper.acquisition.crawler.robots import (
+    RobotsDecisionKind,
+    build_robots_request_plan,
+    ensure_robots_request,
+    evaluate_robots_policy,
+    load_robots_gate,
+    parse_robots_result,
+)
+from jobscraper.acquisition.crawler.scope import check_scope, scope_from_plan
 from jobscraper.acquisition.pagevalidity import PageClass, classify_page
 from jobscraper.adapters.contract import (
     NORMAL_PARSE_CLASSES,
@@ -50,6 +77,7 @@ from jobscraper.adapters.contract import (
     ParseContext,
     ParseOutcomeKind,
     PlanningContext,
+    StopPolicy,
     ValidatedResultEnvelope,
     task_kind_for_request_type,
 )
@@ -115,6 +143,10 @@ MAX_DETAIL_REQUESTS_PER_RUN = 200
 #: Request types that constitute enumeration pages for coverage purposes
 #: (03 §40: coverage links the contributing *enumeration* requests/pages).
 _ENUMERATION_REQUEST_TYPES = frozenset({"LIST_FETCH", "SOURCE_CRAWL"})
+_CURSOR_TASK_KINDS = frozenset({AdapterTaskKind.ENUMERATE, AdapterTaskKind.CRAWL})
+_CRAWL_SCOPED_TASK_KINDS = frozenset(
+    {AdapterTaskKind.ENUMERATE, AdapterTaskKind.CRAWL, AdapterTaskKind.DETAIL}
+)
 #: Typed child work (ACQ-02 DETAIL_FETCH): budgeted separately, and part of
 #: the absence barrier only when listing identity is NOT sufficient.
 _DETAIL_REQUEST_TYPES = frozenset({"DETAIL_FETCH"})
@@ -187,58 +219,6 @@ def _plan_config(conn: sqlite3.Connection, plan_row: sqlite3.Row) -> dict:
         (plan_row["binding_revision_id"],),
     ).fetchone()
     return json.loads(row["config_json"]) if row and row["config_json"] else {}
-
-
-def _load_cursor(conn: sqlite3.Connection, plan_row: sqlite3.Row) -> CrawlCursor | None:
-    row = conn.execute(
-        """
-        SELECT * FROM crawl_cursors
-        WHERE binding_id = ? AND adapter_id = ? AND adapter_version = ?
-          AND cursor_schema_version = ?
-        """,
-        (
-            plan_row["binding_id"],
-            plan_row["adapter_id"],
-            plan_row["adapter_version"],
-            plan_row["cursor_schema_version"],
-        ),
-    ).fetchone()
-    if row is None:
-        return None
-    return CrawlCursor(
-        source_id=row["source_id"],
-        binding_id=row["binding_id"],
-        adapter_id=row["adapter_id"],
-        adapter_version=row["adapter_version"],
-        cursor_schema_version=row["cursor_schema_version"],
-        state_json=row["state_json"],
-        checkpoint_at=row["checkpoint_at"],
-    )
-
-
-def _save_cursor(
-    conn: sqlite3.Connection, plan_row: sqlite3.Row, cursor: CrawlCursor, now: str
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO crawl_cursors (id, source_id, binding_id, adapter_id,
-            adapter_version, cursor_schema_version, state_json, checkpoint_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (binding_id, adapter_id, adapter_version, cursor_schema_version)
-        DO UPDATE SET state_json = excluded.state_json,
-                      checkpoint_at = excluded.checkpoint_at
-        """,
-        (
-            new_id("cur"),
-            cursor.source_id or plan_row["source_id"],
-            cursor.binding_id or plan_row["binding_id"],
-            cursor.adapter_id,
-            cursor.adapter_version,
-            cursor.cursor_schema_version,
-            cursor.state_json,
-            now,
-        ),
-    )
 
 
 def execute_run(
@@ -359,58 +339,78 @@ def _dispatch_child_tasks(
     plan_row: sqlite3.Row,
     run_id: str,
     ts: str,
-) -> None:
-    """Turn an adapter's proposed child tasks into durable typed requests.
+    crawl_scope,
+    crawl_budget,
+    base_url: str | None,
+) -> tuple[bool, bool]:
+    """Host-validate typed child proposals before durable enqueue (ACQ-04).
 
-    ACQ-02/ACQ-04: the adapter *proposes*; the host decides what exists.  In
-    Slice 2 the only dispatchable child kind is DETAIL, and only from an
-    enumeration pass — crawl breadth is ROAD-04 work, so anything else is
-    recorded as durable review evidence instead of being silently dropped.
+    Returns ``(degraded, budget_exhausted)``. Re-load durable usage before
+    every child so one parse cannot enqueue N tasks against one stale budget
+    snapshot. Opaque DETAIL references remain adapter input; the final planned
+    URL is independently scope-checked before dispatch.
     """
+    degraded = False
+    budget_exhausted = False
     for discovered in outcome_obj.discovered_tasks:
-        if task_kind is not AdapterTaskKind.ENUMERATE or discovered.kind != "DETAIL":
-            _record_evidence(
-                conn,
-                request_id=claim.request_id,
-                attempt_id=claim.attempt_id,
-                fetch_attempt_id=None,
-                kind="REVIEW",
-                ref=f"child-task://{discovered.kind}",
-                detail={
-                    "reason": "CHILD_TASK_NOT_DISPATCHED",
-                    "kind": discovered.kind,
-                    "depth": discovered.depth,
-                    "logical_key": discovered.logical_key,
-                    "target_reference": discovered.target_reference,
-                    "from_task_kind": task_kind.value,
-                },
-                content_hash=None,
-                now=ts,
-            )
-            continue
-        enqueue_request(
+        usage = load_usage(conn, plan_row["id"], now=ts)
+        decision = enqueue_discovered_task(
             conn,
             run_id=run_id,
-            run_source_plan_id=plan_row["id"],
-            source_id=plan_row["source_id"],
-            binding_id=plan_row["binding_id"],
-            request_type="DETAIL_FETCH",
-            target_identity=discovered.target_reference,
-            logical_key=discovered.logical_key,
-            payload={
-                "kind": discovered.kind,
-                "target_reference": discovered.target_reference,
-                "logical_key": discovered.logical_key,
-                "depth": discovered.depth,
-            },
-            priority=discovered.priority,
-            depth=discovered.depth,
+            plan_row=plan_row,
             parent_request_id=claim.request_id,
-            execution_class=plan_row["execution_class"],
-            strategy=plan_row["strategy"],
+            discovered=discovered,
+            scope=crawl_scope,
+            budget=crawl_budget,
+            usage=usage,
+            base_url=base_url,
             now=ts,
-            commit=False,
         )
+        if decision.accepted:
+            if (
+                not decision.created
+                and decision.request_type in _ENUMERATION_REQUEST_TYPES
+            ):
+                # Idempotency prevents a duplicate durable request, but a
+                # crawler proposing an already-known continuation is also
+                # no-progress evidence. Keep accepted DETAIL dedupe benign.
+                degraded = True
+                _record_evidence(
+                    conn, request_id=claim.request_id, attempt_id=claim.attempt_id,
+                    fetch_attempt_id=None, kind="REVIEW",
+                    ref="crawler://DUPLICATE_FRONTIER",
+                    detail={
+                        "reason": decision.reason,
+                        "request_type": decision.request_type,
+                        "normalized_target": decision.normalized_target,
+                        "logical_key": discovered.logical_key,
+                    },
+                    content_hash=None, now=ts,
+                )
+            continue
+        degraded = True
+        if decision.reason.startswith("BUDGET_"):
+            budget_exhausted = True
+        _record_evidence(
+            conn,
+            request_id=claim.request_id,
+            attempt_id=claim.attempt_id,
+            fetch_attempt_id=None,
+            kind="REVIEW",
+            ref=f"child-task://{discovered.kind}",
+            detail={
+                "reason": decision.reason,
+                "kind": discovered.kind,
+                "depth": discovered.depth,
+                "logical_key": discovered.logical_key,
+                "target_reference": discovered.target_reference,
+                "normalized_target": decision.normalized_target,
+                "from_task_kind": task_kind.value,
+            },
+            content_hash=None,
+            now=ts,
+        )
+    return degraded, budget_exhausted
 
 
 def _outcome_from_durable_state(conn: sqlite3.Connection, plan_id: str) -> str:
@@ -502,6 +502,62 @@ def _commit_fenced(
         return "STALE"
 
 
+def _bind_crawl_cursor_to_plan(proposal: CrawlCursor, plan_row) -> CrawlCursor:
+    """Stamp host-owned RunSourcePlan identity onto an adapter cursor proposal.
+
+    Cursor identity (source/binding) is host-owned: the adapter proposes
+    opaque pagination *state* under the plan's pins (02 ACQ-09), and accepted
+    pre-S3.5 adapters echo the incoming cursor's identity, which is empty on
+    the first page.  The driver therefore binds the immutable plan identity
+    here.  Adapter/version/schema provenance passes through untouched, so
+    ``save_crawl_cursor`` still refuses a state blob produced by different
+    code rather than silently restamping it.
+    """
+    return CrawlCursor(
+        source_id=plan_row["source_id"],
+        binding_id=plan_row["binding_id"],
+        adapter_id=proposal.adapter_id,
+        adapter_version=proposal.adapter_version,
+        cursor_schema_version=proposal.cursor_schema_version,
+        state_json=proposal.state_json,
+        checkpoint_at=proposal.checkpoint_at,
+    )
+
+
+def _commit_crawler_pre_dispatch_stop(
+    conn: sqlite3.Connection,
+    run_id: str,
+    claim,
+    *,
+    reason: str,
+    ts: str,
+    ref: str,
+    failure_kind: str | None = None,
+) -> str:
+    """Close a claimed unit that policy proves must not perform network I/O."""
+    return _commit_fenced(
+        conn,
+        run_id,
+        claim,
+        ts=ts,
+        mutate=lambda cursor_conn: _record_evidence(
+            cursor_conn,
+            request_id=claim.request_id,
+            attempt_id=claim.attempt_id,
+            kind="REVIEW",
+            ref=ref,
+            detail={"reason": reason, "network_io_started": False},
+            content_hash=None,
+            now=ts,
+        ),
+        transition=FenceTransition(
+            outcome="FAILED",
+            failure_kind=failure_kind,
+            failure_json=bounded_json({"reason": reason, "network_io_started": False}),
+        ),
+    )
+
+
 def _execute_plan(
     conn: sqlite3.Connection,
     run_id: str,
@@ -550,6 +606,11 @@ def _execute_plan(
         adapter = build_adapter(plan_row["adapter_id"], config)
     except KeyError as exc:
         raise ValueError(f"no builtin adapter for {plan_row['adapter_id']!r}") from exc
+    stop_policy = getattr(adapter, "stop_policy", StopPolicy())
+    crawl_budget = budget_from_plan(plan_row, stop_policy=stop_policy)
+    crawl_scope = scope_from_plan(
+        plan_row, source, destination_allowed_hosts=policy.allowed_hosts
+    )
 
     # 03 §40: detail completion joins the coverage barrier only when the
     # binding contract does not already declare listing identity sufficient.
@@ -593,6 +654,8 @@ def _execute_plan(
     cancelled = False
     deferred = False
     ownership_lost = False
+    state_changed = False
+    durable_budget_exhausted = False
     pages = 0
     details = 0
     while True:
@@ -600,14 +663,49 @@ def _execute_plan(
             # §18: no new acquisition driving once cancellation is durable
             cancelled = True
             break
+        loop_now = db_utc_now(conn)
+        durable_usage = load_usage(conn, plan_id, now=loop_now)
         allowed = set(ACQUISITION_REQUEST_TYPES)
+        if (
+            durable_usage.elapsed_s >= crawl_budget.max_runtime_s
+            or durable_usage.bytes_downloaded >= crawl_budget.max_bytes
+        ):
+            reason = (
+                "MAX_RUNTIME"
+                if durable_usage.elapsed_s >= crawl_budget.max_runtime_s
+                else "MAX_BYTES"
+            )
+            close_unstarted_over_budget(
+                conn, plan_id, request_types=frozenset(allowed), reason=reason, now=loop_now
+            )
+            durable_budget_exhausted = True
+            state_changed = True
+            break
+        if durable_usage.pages_completed >= crawl_budget.max_pages:
+            close_unstarted_over_budget(
+                conn, plan_id, request_types=_ENUMERATION_REQUEST_TYPES,
+                reason="MAX_PAGES", now=loop_now,
+            )
+            allowed -= set(_ENUMERATION_REQUEST_TYPES)
+            durable_budget_exhausted = True
+            state_changed = True
+        if durable_usage.detail_requests_created >= crawl_budget.max_detail_requests:
+            close_unstarted_over_budget(
+                conn, plan_id, request_types=_DETAIL_REQUEST_TYPES,
+                reason="MAX_DETAIL_REQUESTS", now=loop_now,
+            )
+            allowed -= set(_DETAIL_REQUEST_TYPES)
+            durable_budget_exhausted = True
+            state_changed = True
+        # S3.5 keeps the accepted per-pass claim throttles as fast guards
+        # alongside the durable plan-level budgets above: they only narrow
+        # what this pass may claim and never terminalize deferred work, so a
+        # throttled pass leaves PENDING children drainable by a later pass.
         if pages >= MAX_PAGES_PER_RUN:
             allowed -= set(_ENUMERATION_REQUEST_TYPES)
         if details >= MAX_DETAIL_REQUESTS_PER_RUN:
             allowed -= set(_DETAIL_REQUEST_TYPES)
         if not allowed:
-            # RUN-09: the host stops itself rather than asking the provider for
-            # more.  Nothing is terminalized from a stopped enumeration.
             break
         claim = claim_next_request(
             conn, worker_id, types=frozenset(allowed),
@@ -618,7 +716,19 @@ def _execute_plan(
         ts = db_utc_now(conn)
         task_kind = task_kind_for_request_type(claim.request_type)
         target_reference = _claim_target_reference(claim)
-        is_enumeration = claim.request_type in _ENUMERATION_REQUEST_TYPES
+        request_meta = conn.execute(
+            "SELECT depth, priority FROM scrape_requests WHERE id = ?",
+            (claim.request_id,),
+        ).fetchone()
+        claim_depth = int(request_meta["depth"] if request_meta is not None else 0)
+        claim_priority = int(request_meta["priority"] if request_meta is not None else 0)
+        is_robots = (
+            claim.request_type == "SOURCE_CRAWL"
+            and str(dict(claim.payload or {}).get("role") or "").upper() == "ROBOTS"
+        )
+        is_enumeration = (
+            claim.request_type in _ENUMERATION_REQUEST_TYPES and not is_robots
+        )
         if is_enumeration or not listing_identity_sufficient:
             # 03 §40: coverage links the requests/pages that contributed to
             # this generation's enumeration proof.
@@ -629,15 +739,22 @@ def _execute_plan(
             )
             conn.commit()
 
-        cursor = (
-            _load_cursor(conn, plan_row)
-            if task_kind is AdapterTaskKind.ENUMERATE
-            else None
-        )
+        cursor = None
+        pagination_guard = PaginationGuardState()
+        plan_refusal: str | None = None
+        if task_kind in _CURSOR_TASK_KINDS and not is_robots:
+            try:
+                loaded_cursor = load_crawl_cursor(
+                    conn, run_source_plan_id=plan_id, plan_row=plan_row
+                )
+                if loaded_cursor is not None:
+                    cursor = loaded_cursor.cursor
+                    pagination_guard = loaded_cursor.guard_state
+            except CursorCompatibilityError as exc:
+                plan_refusal = f"CursorCompatibilityError: {exc}"
         task = AdapterTask(kind=task_kind, payload=dict(claim.payload or {}))
         # 02 ACQ-09: planning receives the host-resolved pins, never mutable
-        # host state.  Snapshots that do not exist durably yet stay None —
-        # the driver does not fabricate references (Slice 3 frontier/budgets).
+        # host state.  Snapshots that do not exist durably yet stay None.
         planning_ctx = PlanningContext(
             run_id=run_id,
             run_source_plan_id=plan_id,
@@ -646,12 +763,16 @@ def _execute_plan(
             permission_profile_revision=plan_row["permission_profile_revision"],
             cursor_schema_version=plan_row["cursor_schema_version"],
         )
-        plan_refusal: str | None = None
-        try:
-            request_plan = adapter.plan(task, cursor, ctx=planning_ctx)
-        except (ValueError, TypeError) as exc:
-            request_plan = None
-            plan_refusal = f"{type(exc).__name__}: {exc}"
+        request_plan = None
+        if plan_refusal is None:
+            try:
+                request_plan = (
+                    build_robots_request_plan(source["entry_url"])
+                    if is_robots
+                    else adapter.plan(task, cursor, ctx=planning_ctx)
+                )
+            except (ValueError, TypeError) as exc:
+                plan_refusal = f"{type(exc).__name__}: {exc}"
 
         signal: dict = {}
         if request_plan is None:
@@ -705,11 +826,133 @@ def _execute_plan(
                 elif refusal_status == "STALE":
                     deferred = True
                 break
-            # No executor ran; a refused plan is not a completed page/detail.
+            # No executor ran; the durable request did reach a terminal
+            # policy/plan result, so a later aggregate pass must not stay open.
+            state_changed = True
             run_degraded = True
             if is_enumeration or not listing_identity_sufficient:
                 coverage_degraded = True
             continue
+
+        # S3.5 final crawl-scope check is against the actual adapter/host
+        # RequestPlan URL, so opaque DETAIL references remain supported while
+        # no planned URL can escape host-owned destination authority.
+        if task_kind in _CRAWL_SCOPED_TASK_KINDS and not is_robots:
+            scope_decision = check_scope(
+                crawl_scope, request_plan.url, depth=claim_depth
+            )
+            if not scope_decision.allowed:
+                status = _commit_crawler_pre_dispatch_stop(
+                    conn, run_id, claim, ts=ts,
+                    reason=f"CRAWL_SCOPE_{scope_decision.reason}",
+                    ref="crawler://SCOPE_DENIED",
+                    failure_kind=FailureKind.POLICY_REJECTED.value,
+                )
+                if status == "COMMITTED":
+                    state_changed = True
+                    run_degraded = True
+                    if is_enumeration or not listing_identity_sufficient:
+                        coverage_degraded = True
+                    continue
+                if status == "CANCELLED":
+                    cancelled = True
+                else:
+                    deferred = True
+                break
+
+        # Robots policy is a host-owned dependency only for generic CRAWL PAGE
+        # work. Provider/API ENUMERATE paths are not silently converted into
+        # web crawling. The robots fetch itself is durable SOURCE_CRAWL work.
+        page_robots_decision = None
+        if task_kind is AdapterTaskKind.CRAWL and not is_robots:
+            robots_mode = str(source["robots_mode"] or "RESPECT").upper()
+            if robots_mode != "RESPECT":
+                status = _commit_crawler_pre_dispatch_stop(
+                    conn, run_id, claim, ts=ts,
+                    reason=f"UNSUPPORTED_ROBOTS_MODE:{robots_mode}",
+                    ref="robots://UNSUPPORTED_MODE",
+                    failure_kind=FailureKind.POLICY_REJECTED.value,
+                )
+                if status == "COMMITTED":
+                    state_changed = True
+                    run_degraded = True
+                    coverage_degraded = True
+                    continue
+                deferred = status != "CANCELLED"
+                cancelled = status == "CANCELLED"
+                break
+            robots_gate = load_robots_gate(conn, plan_id)
+            if robots_gate.state == "MISSING":
+                usage = load_usage(conn, plan_id, now=ts)
+                budget_decision = check_budget(
+                    crawl_budget, usage, proposed_request_type=None, proposed_depth=0,
+                    proposed_execution_class="HTTP",
+                )
+                if not budget_decision.allowed:
+                    status = _commit_crawler_pre_dispatch_stop(
+                        conn, run_id, claim, ts=ts,
+                        reason=f"ROBOTS_{budget_decision.reason}",
+                        ref="robots://BUDGET_EXHAUSTED",
+                    )
+                    if status == "COMMITTED":
+                        state_changed = True
+                        durable_budget_exhausted = True
+                        run_degraded = True
+                        coverage_degraded = True
+                        continue
+                    deferred = status != "CANCELLED"
+                    cancelled = status == "CANCELLED"
+                    break
+                ensure_robots_request(
+                    conn, run_id=run_id, plan_row=plan_row,
+                    source_entry_url=source["entry_url"],
+                    parent_request_id=claim.request_id, priority=claim_priority + 1,
+                    now=ts, commit=True,
+                )
+                if not yield_unstarted_claim(
+                    conn, claim.request_id, claim.attempt_id, reason="ROBOTS_PENDING"
+                ):
+                    deferred = True
+                    break
+                continue
+            if robots_gate.state == "PENDING":
+                if not yield_unstarted_claim(
+                    conn, claim.request_id, claim.attempt_id, reason="ROBOTS_PENDING"
+                ):
+                    deferred = True
+                    break
+                continue
+            if robots_gate.state != "READY" or robots_gate.policy is None:
+                status = _commit_crawler_pre_dispatch_stop(
+                    conn, run_id, claim, ts=ts, reason="ROBOTS_UNKNOWN",
+                    ref="robots://UNKNOWN",
+                    failure_kind=FailureKind.POLICY_REJECTED.value,
+                )
+                if status == "COMMITTED":
+                    state_changed = True
+                    run_degraded = True
+                    coverage_degraded = True
+                    continue
+                deferred = status != "CANCELLED"
+                cancelled = status == "CANCELLED"
+                break
+            robots_decision = evaluate_robots_policy(robots_gate.policy, request_plan.url)
+            if robots_decision.kind is not RobotsDecisionKind.ALLOW:
+                status = _commit_crawler_pre_dispatch_stop(
+                    conn, run_id, claim, ts=ts, reason=robots_decision.reason,
+                    ref=f"robots://{robots_decision.kind.value}",
+                    failure_kind=FailureKind.POLICY_REJECTED.value,
+                )
+                if status == "COMMITTED":
+                    state_changed = True
+                    run_degraded = True
+                    coverage_degraded = True
+                    continue
+                deferred = status != "CANCELLED"
+                cancelled = status == "CANCELLED"
+                break
+
+            page_robots_decision = robots_decision
 
         envelope = ExecutionPlanEnvelope(
             plan_id=new_id("plan"),
@@ -943,6 +1186,15 @@ def _execute_plan(
         result = dispatched.result
         classification = dispatched.classification
         retry_decision = dispatched.retry
+        robots_policy = (
+            parse_robots_result(result)
+            if is_robots and retry_decision.action is RetryAction.SUCCEED
+            else None
+        )
+        if page_robots_decision is not None:
+            result.robots_decision = page_robots_decision.kind.value
+        elif robots_policy is not None:
+            result.robots_decision = f"POLICY_{robots_policy.status.value}"
         network_failure_json = (
             bounded_json({
                 "kind": retry_decision.failure_kind,
@@ -1040,7 +1292,8 @@ def _execute_plan(
                 return
 
             clean_rate_success = (
-                classification.state in NORMAL_PARSE_CLASSES
+                is_robots
+                or classification.state in NORMAL_PARSE_CLASSES
                 or (
                     task_kind is AdapterTaskKind.DETAIL
                     and classification.state in _CLOSURE_CLASSES
@@ -1050,6 +1303,23 @@ def _execute_plan(
                 record_rate_success(
                     cursor_conn, dispatched.rate_key, now=ts, commit=False
                 )
+            if is_robots:
+                # This is policy evidence, not a source page parse. Even a
+                # text/plain robots response classified UNEXPECTED_CONTENT by
+                # the job-page classifier never reaches adapter.parse().
+                _record_evidence(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    fetch_attempt_id=fetch_attempt_id,
+                    kind="REVIEW",
+                    ref="robots://POLICY",
+                    detail=robots_policy.to_detail(),
+                    content_hash=result.normalized_content_hash,
+                    now=ts,
+                )
+                signal["value"] = "ROBOTS_POLICY"
+                return
             if classification.state in NORMAL_PARSE_CLASSES:
                 # EMPTY is a recognized non-job outcome (§21): the adapter parse
                 # yields SUCCESS_EMPTY, which terminates the enumeration
@@ -1179,19 +1449,11 @@ def _execute_plan(
                             cursor_conn, coverage_id, observation.source_job_id,
                             evidence_ref=observation.raw_url, commit=False,
                         )
-                if outcome_obj.kind.value == "SUCCESS_EMPTY":
-                    signal["value"] = "EMPTY" if is_enumeration else "JOBS"
-                    return
                 if (
                     outcome_obj.kind is ParseOutcomeKind.PARTIAL
                     and (is_enumeration or not listing_identity_sufficient)
                     and not coverage_finalized
                 ):
-                    # ACQ-03 / RUN-13 at the host boundary: PARTIAL ⇒ this
-                    # generation is degraded, durably, *before* any
-                    # continuation is planned.  Whatever the adapter proposes
-                    # next (a cursor, more pages, a clean terminal page), the
-                    # generation can no longer become absence-authoritative.
                     degrade_coverage(
                         cursor_conn,
                         coverage_id,
@@ -1199,7 +1461,7 @@ def _execute_plan(
                         commit=False,
                     )
                     signal["degraded"] = True
-                _dispatch_child_tasks(
+                child_degraded, child_budget_exhausted = _dispatch_child_tasks(
                     cursor_conn,
                     outcome_obj=outcome_obj,
                     task_kind=task_kind,
@@ -1207,23 +1469,139 @@ def _execute_plan(
                     plan_row=plan_row,
                     run_id=run_id,
                     ts=ts,
+                    crawl_scope=crawl_scope,
+                    crawl_budget=crawl_budget,
+                    base_url=result.final_url or request_plan.url,
                 )
+                if child_degraded:
+                    signal["degraded"] = True
+                    if (is_enumeration or not listing_identity_sufficient) and not coverage_finalized:
+                        degrade_coverage(
+                            cursor_conn, coverage_id,
+                            reason="child frontier proposal refused", commit=False,
+                        )
+                if child_budget_exhausted:
+                    signal["budget_exhausted"] = True
+
                 next_cursor = (
                     adapter.next_cursor(task, outcome_obj, cursor, ctx=parse_ctx)
-                    if task_kind is AdapterTaskKind.ENUMERATE
+                    if task_kind in _CURSOR_TASK_KINDS
                     else None
                 )
                 if next_cursor is not None:
-                    _save_cursor(cursor_conn, plan_row, next_cursor, ts)
+                    new_guard, pagination_decision = advance_guard(
+                        pagination_guard,
+                        PaginationSignature.from_values(
+                            next_cursor=next_cursor.state_json,
+                            next_url=result.final_url or request_plan.url,
+                            page_hash=result.normalized_content_hash,
+                            job_ids=tuple(
+                                o.source_job_id for o in outcome_obj.observations
+                                if o.source_job_id
+                            ),
+                            observations_added=len(outcome_obj.observations),
+                            recognized_empty=(outcome_obj.kind is ParseOutcomeKind.SUCCESS_EMPTY),
+                        ),
+                        stop_policy,
+                    )
+                    if pagination_decision.kind is not PaginationStopKind.CONTINUE:
+                        if (is_enumeration or not listing_identity_sufficient) and not coverage_finalized:
+                            degrade_coverage(
+                                cursor_conn, coverage_id,
+                                reason=pagination_decision.reason, commit=False,
+                            )
+                        _record_evidence(
+                            cursor_conn,
+                            request_id=claim.request_id,
+                            attempt_id=claim.attempt_id,
+                            fetch_attempt_id=fetch_attempt_id,
+                            parse_attempt_id=parse_attempt_id,
+                            kind="FAILURE",
+                            ref=f"pagination://{pagination_decision.kind.value}",
+                            detail={
+                                "reason": pagination_decision.reason,
+                                "stop_kind": pagination_decision.kind.value,
+                                "candidate_cursor_hash": PaginationSignature.from_values(
+                                    next_cursor=next_cursor.state_json
+                                ).next_cursor_hash,
+                            },
+                            content_hash=result.normalized_content_hash,
+                            now=ts,
+                        )
+                        transition_box["value"] = FenceTransition(
+                            outcome="FAILED",
+                            failure_kind=pagination_decision.failure_kind,
+                            failure_json=bounded_json({
+                                "reason": pagination_decision.reason,
+                                "stop_kind": pagination_decision.kind.value,
+                            }),
+                        )
+                        signal["value"] = "PAGINATION_STOP"
+                        signal["degraded"] = True
+                        return
+
+                    continuation_type = (
+                        "SOURCE_CRAWL"
+                        if task_kind is AdapterTaskKind.CRAWL
+                        else "LIST_FETCH"
+                    )
+                    usage = load_usage(cursor_conn, plan_id, now=ts)
+                    budget_decision = check_budget(
+                        crawl_budget, usage, proposed_request_type=continuation_type,
+                        proposed_depth=claim_depth,
+                        proposed_execution_class=plan_row["execution_class"],
+                    )
+                    if not budget_decision.allowed:
+                        if (is_enumeration or not listing_identity_sufficient) and not coverage_finalized:
+                            degrade_coverage(
+                                cursor_conn, coverage_id,
+                                reason=f"crawler budget exhausted: {budget_decision.reason}",
+                                commit=False,
+                            )
+                        _record_evidence(
+                            cursor_conn,
+                            request_id=claim.request_id,
+                            attempt_id=claim.attempt_id,
+                            fetch_attempt_id=fetch_attempt_id,
+                            parse_attempt_id=parse_attempt_id,
+                            kind="REVIEW",
+                            ref="crawler://BUDGET_EXHAUSTED",
+                            detail={"reason": budget_decision.reason},
+                            content_hash=result.normalized_content_hash,
+                            now=ts,
+                        )
+                        signal["value"] = "BUDGET_STOP"
+                        signal["degraded"] = True
+                        signal["budget_exhausted"] = True
+                        return
+
+                    save_crawl_cursor(
+                        cursor_conn,
+                        run_source_plan_id=plan_id,
+                        plan_row=plan_row,
+                        cursor=_bind_crawl_cursor_to_plan(next_cursor, plan_row),
+                        guard_state=new_guard,
+                        now=ts,
+                    )
                     enqueue_request(
                         cursor_conn,
                         run_id=run_id,
                         run_source_plan_id=plan_id,
                         source_id=plan_row["source_id"],
                         binding_id=plan_row["binding_id"],
-                        request_type="LIST_FETCH",
+                        request_type=continuation_type,
                         target_identity=request_plan.url,
                         logical_key=next_cursor.state_json,
+                        payload=(
+                            {"role": "PAGE", "cursor_state": next_cursor.state_json}
+                            if continuation_type == "SOURCE_CRAWL"
+                            else {}
+                        ),
+                        strategy=plan_row["strategy"],
+                        execution_class=plan_row["execution_class"],
+                        depth=claim_depth,
+                        parent_request_id=claim.request_id,
+                        now=ts,
                         commit=False,
                     )
                     signal["value"] = "CONTINUE"
@@ -1232,17 +1610,14 @@ def _execute_plan(
                     outcome_obj.kind is ParseOutcomeKind.PARTIAL
                     or outcome_obj.continuation_required
                 ):
-                    # Degraded but recognized: the adapter says more exists and
-                    # the host could not plan it now.  Never absence authority.
                     signal["value"] = "PARTIAL"
                     return
                 if outcome_obj.kind is ParseOutcomeKind.FAILURE:
-                    # A failed parse proves nothing about membership: no
-                    # terminal enumeration may be derived from it (RUN-13).
                     signal["value"] = "FAILURE"
                     return
-                # Complete page with no further cursor proposed: for an
-                # enumeration task that is terminal membership proof.
+                # A recognized empty page is terminal only because the adapter
+                # produced no continuation cursor; emptiness alone never stops
+                # a cursor-bearing crawl page.
                 signal["value"] = "TERMINAL" if is_enumeration else "JOBS"
                 return
             if task_kind is AdapterTaskKind.DETAIL and classification.state in _CLOSURE_CLASSES:
@@ -1297,12 +1672,20 @@ def _execute_plan(
                 ownership_lost = live is None
             break
 
-        if is_enumeration:
+        state_changed = True
+        if is_robots:
+            pass
+        elif is_enumeration:
             pages += 1
-        else:
+        elif claim.request_type in _DETAIL_REQUEST_TYPES:
             details += 1
         value = signal.get("value")
-        if value in ("INVALID", "FAILURE", "PARTIAL", "REFUSED", "RETRY"):
+        if signal.get("budget_exhausted"):
+            durable_budget_exhausted = True
+        if value in (
+            "INVALID", "FAILURE", "PARTIAL", "REFUSED", "RETRY",
+            "PAGINATION_STOP", "BUDGET_STOP",
+        ):
             run_degraded = True
             if is_enumeration or not listing_identity_sufficient:
                 coverage_degraded = True
@@ -1325,7 +1708,7 @@ def _execute_plan(
         # reclaimed attempt was consumed, so the pass terminalizes below.
         return
     open_child_work = _open_acquisition_requests(conn, plan_id)
-    if not (pages or details or terminal or cancelled or ownership_lost):
+    if not (state_changed or pages or details or terminal or cancelled or ownership_lost):
         # This pass consumed and produced nothing (e.g. only epoch-orphaned
         # RUNNING work remains, still live under an unexpired lease): stay
         # open for redrive rather than manufacturing a terminal outcome.
@@ -1349,11 +1732,15 @@ def _execute_plan(
         coverage_barrier_open = (
             open_child_work if not listing_identity_sufficient else 0
         )
+        final_usage = load_usage(conn, plan_id, now=db_utc_now(conn))
         coverage_budget_exhausted = (
-            pages >= MAX_PAGES_PER_RUN
+            durable_budget_exhausted
+            or final_usage.pages_completed >= crawl_budget.max_pages
+            or final_usage.bytes_downloaded >= crawl_budget.max_bytes
+            or final_usage.elapsed_s >= crawl_budget.max_runtime_s
             or (
                 not listing_identity_sufficient
-                and details >= MAX_DETAIL_REQUESTS_PER_RUN
+                and final_usage.detail_requests_created >= crawl_budget.max_detail_requests
             )
         )
         # A degraded generation holds no terminal-enumeration authority even
@@ -1369,7 +1756,7 @@ def _execute_plan(
             stop_reason = "cancelled"
         elif coverage_budget_exhausted and coverage_barrier_open:
             completion_state = "BUDGET_EXHAUSTED"
-            stop_reason = "host coverage budget exhausted with open contributing work"
+            stop_reason = "host crawler budget exhausted with open contributing work"
         elif coverage_barrier_open:
             completion_state = "PARTIAL"
             stop_reason = "open contributing work remains"
@@ -1386,7 +1773,7 @@ def _execute_plan(
                 completion_state=completion_state,
                 stop_reason=stop_reason,
                 terminal_enumeration_proven=terminal_proven,
-                pages_completed=pages,
+                pages_completed=final_usage.pages_completed,
                 now=db_utc_now(conn),
             )
         except Exception:
@@ -1397,7 +1784,7 @@ def _execute_plan(
                 completion_state="PARTIAL",
                 stop_reason="driver stop",
                 terminal_enumeration_proven=False,
-                pages_completed=pages,
+                pages_completed=final_usage.pages_completed,
                 now=db_utc_now(conn),
             )
     set_group_outcome(conn, plan_id, outcome, now=db_utc_now(conn))
