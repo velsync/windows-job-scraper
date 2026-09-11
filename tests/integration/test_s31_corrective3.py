@@ -224,3 +224,5 @@ def test_run_service_fails_closed_when_restart_recovery_fails(tmp_path, monkeypa
 
     assert code == 4
     assert sock.closed
+
+# RED checkpoint: production code intentionally unchanged in this commit.
