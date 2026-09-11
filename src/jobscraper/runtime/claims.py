@@ -173,6 +173,30 @@ def _claim_selection_sql(
     return sql, params
 
 
+def _begin_ownership_transaction(
+    conn: sqlite3.Connection, *, now: str | None, guard: ServiceClockGuard | None,
+) -> str:
+    """Acquire the writer before sampling time or checking clock drift.
+
+    Rotation commits its own empty preflight transaction so it survives a
+    refused stale owner. Reacquire and resample after rotation; the lock wait
+    itself must never hide an anomaly or provide a stale lease timestamp.
+    """
+    while True:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ts = now or db_utc_now(conn)
+            if guard is not None:
+                guard.observe(conn, db_now=ts, owns_empty_transaction=True)
+                if not conn.in_transaction:  # new epoch durably committed
+                    continue
+            return ts
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+
 def claim_next_request(
     conn: sqlite3.Connection,
     worker_id: str,
@@ -188,26 +212,20 @@ def claim_next_request(
 
     The claim mints a fresh ``attempt_id`` and binds it to the current
     service epoch. When a :class:`ServiceClockGuard` is supplied, every claim
-    first observes the database clock through it: a material wall-clock
-    anomaly rotates the epoch (rotation runs its own serialized write
-    transaction before the claim transaction begins), and the guarded claim
+    observes the database clock after acquiring the writer: a material
+    wall-clock anomaly rotates the epoch (the empty preflight transaction
+    is committed, then the claim reacquires the writer and resamples), and the guarded claim
     then performs the §50 recovery inline — reclaiming the ORIGINAL
     invalidated epoch's orphaned RUNNING work and resuming only after that
     recovery completes, inside the same serialized claim write transaction —
     so the production claim path can never bypass anomaly detection. No
     network or file I/O occurs while the claim transaction is held.
     """
-    ts = now or db_utc_now(conn)
-    if guard is not None:
-        # Guarded claim (§50): observe BEFORE opening the claim transaction,
-        # because anomaly rotation ends the live epoch and opens the next
-        # one in its own BEGIN IMMEDIATE.
-        guard.observe(conn, db_now=ts)
     attempt_id = new_id("att")
     selection_sql, selection_params = _claim_selection_sql(types, run_source_plan_id)
-    selection_params[0] = ts  # RETRY_WAIT due comparison uses DB time (RUN-20)
-    conn.execute("BEGIN IMMEDIATE")
+    ts = _begin_ownership_transaction(conn, now=now, guard=guard)
     try:
+        selection_params[0] = ts  # authoritative time after the serialized wait
         if guard is not None:
             if guard.claims_halted:
                 # §50, inside the same serialized write transaction: recover
@@ -304,31 +322,25 @@ def heartbeat(
     predicate (R2-F3): accepted local obligations keep draining.
 
     When a service-lifetime clock guard is supplied, the heartbeat observes
-    the database clock before opening its renewal transaction. A material
-    wall-clock anomaly therefore rotates the service epoch first; this stale
+    the database clock after acquiring the serialized writer. A material
+    wall-clock anomaly commits a service epoch rotation first; this stale
     attempt then fails the epoch fence and cannot extend its lease (§50).
     Recovery of the invalidated epoch remains the coordinator/claim path's
     responsibility.
     """
-    ts = now or db_utc_now(conn)
-    if guard is not None:
-        # Observe before BEGIN IMMEDIATE because anomaly rotation performs its
-        # own serialized write transaction. The resulting fresh epoch makes
-        # this old attempt stale before any renewal can be persisted (§50).
-        guard.observe(conn, db_now=ts)
-    if epoch is not None:
-        row = conn.execute(
-            "SELECT ended_at FROM service_clock_epochs WHERE id = ?",
-            (epoch.epoch_id,),
-        ).fetchone()
-        if row is None or row["ended_at"] is not None:
-            raise StaleServiceEpoch(
-                f"service epoch {epoch.epoch_id} is not the current service epoch",
-                epoch_id=epoch.epoch_id,
-            )
-    lease_until = _add_seconds(ts, lease_window_s)
-    conn.execute("BEGIN IMMEDIATE")
+    ts = _begin_ownership_transaction(conn, now=now, guard=guard)
     try:
+        if epoch is not None:
+            row = conn.execute(
+                "SELECT ended_at FROM service_clock_epochs WHERE id = ?",
+                (epoch.epoch_id,),
+            ).fetchone()
+            if row is None or row["ended_at"] is not None:
+                raise StaleServiceEpoch(
+                    f"service epoch {epoch.epoch_id} is not the current service epoch",
+                    epoch_id=epoch.epoch_id,
+                )
+        lease_until = _add_seconds(ts, lease_window_s)
         request_row = conn.execute(
             "SELECT request_type FROM scrape_requests WHERE id = ?", (request_id,)
         ).fetchone()
@@ -505,6 +517,7 @@ def reclaim_expired(conn: sqlite3.Connection, *, now: str | None = None) -> list
     for row in expired:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            ts = now or db_utc_now(conn)
             # Re-check under the write lock: the worker may have committed.
             current = conn.execute(
                 "SELECT id, status, current_attempt_id, attempt_count, max_attempts,"
@@ -633,10 +646,10 @@ def reclaim_orphaned_epoch_work(
     inline inside their serialized transaction after a clock-anomaly
     rotation (§50).
     """
-    _validate_reclaimable_epoch(conn, epoch_id)
-    ts = now or db_utc_now(conn)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        ts = now or db_utc_now(conn)
+        _validate_reclaimable_epoch(conn, epoch_id)
         reclaimed = _reclaim_epoch_orphans(conn, epoch_id, ts)
         conn.execute("COMMIT")
     except BaseException:

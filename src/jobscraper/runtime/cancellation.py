@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from jobscraper.runtime.clock import db_utc_now
+from jobscraper.runtime.clock import current_service_epoch, db_utc_now
 from jobscraper.runtime.requests import ACQUISITION_REQUEST_TYPES
 
 
@@ -68,13 +68,12 @@ def abandon_request_for_cancellation(
     *,
     attempt_id: str | None = None,
     now: str | None = None,
-) -> None:
+) -> bool:
     """Close the still-current running acquisition after its fence was denied.
 
     Request-owned outputs were rolled back before this function is called.
     Existing observations from earlier accepted attempts are never deleted.
     """
-    ts = now or db_utc_now(conn)
     detail = json.dumps(
         {"kind": "CANCELLED", "detail": "current run authority cancelled"},
         sort_keys=True,
@@ -82,17 +81,25 @@ def abandon_request_for_cancellation(
     )
     conn.execute("BEGIN IMMEDIATE")
     try:
+        ts = now or db_utc_now(conn)
+        epoch = current_service_epoch(conn)
         row = conn.execute(
             """
-            SELECT req.current_attempt_id, req.request_type, run.cancel_requested_at
+            SELECT req.current_attempt_id, req.request_type, req.status, req.lease_until,
+                   a.service_epoch_id, run.cancel_requested_at
               FROM scrape_requests req
               JOIN scrape_runs run ON run.id = req.run_id
+              LEFT JOIN request_attempts a ON a.attempt_id = req.current_attempt_id
              WHERE req.id = ?
             """,
             (request_id,),
         ).fetchone()
         if (
             row is None
+            or epoch is None
+            or row["status"] != "RUNNING"
+            or (row["lease_until"] or "") <= ts
+            or row["service_epoch_id"] != epoch.epoch_id
             or row["request_type"] not in ACQUISITION_REQUEST_TYPES
             or row["cancel_requested_at"] is None
             or (attempt_id is not None and row["current_attempt_id"] != attempt_id)
@@ -100,7 +107,7 @@ def abandon_request_for_cancellation(
             # R2-F3: this helper can never silently cancel a host-native
             # obligation or a newer owner that replaced the caller's attempt.
             conn.execute("COMMIT")
-            return
+            return False
         if row["current_attempt_id"]:
             conn.execute(
                 """
@@ -123,6 +130,7 @@ def abandon_request_for_cancellation(
             (ts, detail, ts, request_id),
         )
         conn.execute("COMMIT")
+        return True
     except BaseException:
         conn.execute("ROLLBACK")
         raise

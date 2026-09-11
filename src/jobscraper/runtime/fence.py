@@ -64,9 +64,10 @@ def fenced_commit(
     )
     transition.validate()
 
-    ts = now or db_utc_now(conn)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Waiting for the writer can outlive the lease; sample only after BEGIN.
+        ts = now or db_utc_now(conn)
         epoch = current_service_epoch(conn)
         if epoch is None:
             raise StaleOwnership(request_id, "no active service epoch")

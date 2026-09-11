@@ -28,10 +28,11 @@ def yield_unstarted_claim(
     abandoned attempt row is retained so a crash/race remains inspectable.
     """
 
-    ts = now or db_utc_now(conn)
     target_status = "RETRY_WAIT" if next_retry_at is not None else "PENDING"
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # Waiting for the writer can outlive the lease; sample only after BEGIN.
+        ts = now or db_utc_now(conn)
         epoch = current_service_epoch(conn)
         if epoch is None:
             conn.execute("ROLLBACK")

@@ -1327,12 +1327,8 @@ CREATE INDEX idx_route_decisions_outcome
 
 
 # ----------------------------- v15 S3.0 durable runtime foundation (ROAD-04)
-# S3.0 owns storage required by S3.1-S3.4 plus the explicit logical source-plan
-# group state whose shape is selected by S3.0 because the pre-Slice-3 per-plan
-# group_outcome field cannot also encode one current active fallback rank
-# without ambiguity. S3.9 will own activation behavior; v15 only provides the
-# durable row. Later Slice-3 packages append new migrations when proven
-# necessary; they never reopen this step.
+# R2-F1: only storage required by S3.1-S3.4. Fallback/group storage
+# belongs to S3.9 if proven necessary, in its next unused migration.
 @_step(15, "s3_0_runtime_foundation")
 def _(sql: str = """
 CREATE TABLE service_clock_epochs (
@@ -1371,18 +1367,6 @@ CREATE UNIQUE INDEX idx_binding_host_rate_state_identity
 CREATE INDEX idx_binding_host_rate_state_cooldown
     ON binding_host_rate_state(cooldown_until);
 
-CREATE TABLE source_plan_group_state (
-    run_id TEXT NOT NULL REFERENCES scrape_runs(id),
-    source_plan_group_id TEXT NOT NULL,
-    active_fallback_rank INTEGER NOT NULL DEFAULT 0
-        CHECK (active_fallback_rank >= 0),
-    group_outcome TEXT
-        CHECK (group_outcome IS NULL OR group_outcome IN (
-            'SATISFIED', 'SATISFIED_PARTIAL', 'FAILED', 'CANCELLED',
-            'POLICY_DENIED', 'SKIPPED_NOT_NEEDED')),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (run_id, source_plan_group_id)
-);
 """
 ) -> None:
     return sql

@@ -248,12 +248,23 @@ class ServiceClockGuard:
             return None
         return self._monotonic() - self._last_monotonic
 
-    def observe(self, conn: sqlite3.Connection, *, db_now: str | None = None) -> ClockAnomaly | None:
+    def observe(
+        self, conn: sqlite3.Connection, *, db_now: str | None = None,
+        owns_empty_transaction: bool = False,
+    ) -> ClockAnomaly | None:
         """Checkpoint the database clock; rotate the epoch on material drift.
 
         Returns the detected :class:`ClockAnomaly`, or ``None`` when the
         clock moved within tolerance.
+
+        ``owns_empty_transaction`` is only for the claim/heartbeat preflight:
+        the caller acquired BEGIN IMMEDIATE but has made no mutations. On a
+        new anomaly, rotation commits that transaction before updating the
+        in-memory epoch. The caller must reacquire and resample before work.
+        Without rotation the transaction remains open for ownership checks.
         """
+        if owns_empty_transaction and not conn.in_transaction:
+            raise ValueError("clock preflight requires BEGIN IMMEDIATE")
         now = db_now or db_utc_now(conn)
         mono = self._monotonic()
         direction: str | None = None
@@ -277,10 +288,11 @@ class ServiceClockGuard:
             # checkpoint keeps re-baselining so post-halt observations are
             # judged from fresh samples (§50).
             return self._halt
-        return self._rotate(conn, direction, drift, now)
+        return self._rotate(conn, direction, drift, now, owns_empty_transaction=owns_empty_transaction)
 
     def _rotate(
-        self, conn: sqlite3.Connection, direction: str, drift_s: float, now: str
+        self, conn: sqlite3.Connection, direction: str, drift_s: float, now: str,
+        *, owns_empty_transaction: bool = False,
     ) -> ClockAnomaly:
         reason = (
             END_REASON_CLOCK_ANOMALY_FORWARD
@@ -288,7 +300,8 @@ class ServiceClockGuard:
             else END_REASON_CLOCK_ANOMALY_BACKWARD
         )
         new_epoch_id = new_id("epoch")
-        conn.execute("BEGIN IMMEDIATE")
+        if not owns_empty_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(
                 "UPDATE service_clock_epochs SET ended_at = ?, end_reason = ?"

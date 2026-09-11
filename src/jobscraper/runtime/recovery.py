@@ -44,7 +44,6 @@ def recover_interrupted_requests(
     """Reclaim requests orphaned by a service restart and finalize
     interrupted cancellations.  Returns ``{"reclaimed": [...],
     "finalized_cancelled_runs": [...]}``."""
-    ts = now or db_utc_now(conn)
     orphaned = conn.execute(
         """
         SELECT id, run_id, current_attempt_id, attempt_count, max_attempts
@@ -59,6 +58,7 @@ def recover_interrupted_requests(
     for row in orphaned:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            ts = now or db_utc_now(conn)
             # Re-check under the write lock: a live worker may have
             # committed between the scan and this transaction.
             current = conn.execute(
@@ -95,8 +95,8 @@ def recover_interrupted_requests(
             continue
         # The crash interrupted the cancellation sweep: finish it and
         # persist the run's terminal aggregate.
-        request_run_cancellation(conn, run_id, now=ts)
-        if aggregate_run(conn, run_id, now=ts) is not None:
+        request_run_cancellation(conn, run_id, now=now)
+        if aggregate_run(conn, run_id, now=now) is not None:
             finalized.append(run_id)
 
     return {"reclaimed": reclaimed, "finalized_cancelled_runs": finalized}

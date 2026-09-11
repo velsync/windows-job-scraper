@@ -203,20 +203,23 @@ def _evaluate_for_profiles(conn: sqlite3.Connection, job_id: str, *, now: str) -
         )
 
 
-def drain_one_obligation(conn: sqlite3.Connection, *, now: str, worker_id: str = "service") -> bool:
+def drain_one_obligation(conn: sqlite3.Connection, *, now: str | None = None, worker_id: str = "service") -> bool:
     """Claim and execute one host-native obligation under the fence."""
     claim = claim_next_request(conn, worker_id, now=now, types=OBLIGATION_TYPES)
     if claim is None:
         return False
 
     def mutate(cursor: sqlite3.Connection) -> None:
+        from jobscraper.runtime.clock import db_utc_now
+
+        ts = now or db_utc_now(cursor)
         payload = claim.payload or {}
         job_id = payload.get("job_id")
         if job_id:
             if claim.request_type == "RECONCILE":
-                reconcile_job(cursor, job_id, now=now)
+                reconcile_job(cursor, job_id, now=ts)
             elif claim.request_type in ("ELIGIBILITY", "SCORE"):
-                _evaluate_for_profiles(cursor, job_id, now=now)
+                _evaluate_for_profiles(cursor, job_id, now=ts)
 
     with fenced_commit(conn, claim.request_id, claim.attempt_id, now=now, mutate=mutate):
         pass
@@ -224,7 +227,7 @@ def drain_one_obligation(conn: sqlite3.Connection, *, now: str, worker_id: str =
 
 
 def drain_all_obligations(
-    conn: sqlite3.Connection, *, now: str, worker_id: str = "service", limit: int = 500
+    conn: sqlite3.Connection, *, now: str | None = None, worker_id: str = "service", limit: int = 500
 ) -> int:
     drained = 0
     while drained < limit and drain_one_obligation(conn, now=now, worker_id=worker_id):

@@ -269,7 +269,7 @@ def execute_run(
 
     # Host-native obligations drain before the run finalizes (a run must
     # not report finished while accepted observations are unprocessed).
-    drain_all_obligations(conn, now=ts)
+    drain_all_obligations(conn, now=now)
     _update_run_counters(conn, run_id)
     return aggregate_run(conn, run_id, now=ts)
 
@@ -457,19 +457,15 @@ def _commit_fenced(
     refine the terminal transition only after the caller mutation has derived
     parse outcome, while still inside the same serialized fence.
     """
-    from jobscraper.runtime.clock import db_utc_now
-
     selected = transition or FenceTransition()
     try:
         # Lease/service-epoch ownership is evaluated at commit time, not at the
         # earlier claim/dispatch timestamp.  A long network request must never
         # revive an ownership token whose lease expired while I/O was in flight.
-        fence_now = db_utc_now(conn)
         with fenced_commit(
             conn,
             claim.request_id,
             claim.attempt_id,
-            now=fence_now,
             outcome=selected.outcome,
             retry_delay_s=selected.retry_delay_s,
             failure_kind=selected.failure_kind,
@@ -480,32 +476,29 @@ def _commit_fenced(
             pass
         return "COMMITTED"
     except AuthorizationDenied as exc:
-        current = db_utc_now(conn)
         if exc.decision.reason is AuthorizationReason.RUN_CANCELLED:
-            abandon_request_for_cancellation(
-                conn, claim.request_id, attempt_id=claim.attempt_id, now=current
+            finalized = abandon_request_for_cancellation(
+                conn, claim.request_id, attempt_id=claim.attempt_id
             )
-            return "CANCELLED"
+            return "CANCELLED" if finalized else "STALE"
         finalized = finalize_authorization_denial(
             conn,
             claim.request_id,
             claim.attempt_id,
             decision=exc.decision,
-            now=current,
         )
         return "DENIED" if finalized else "STALE"
     except StaleOwnership:
-        current = db_utc_now(conn)
         if run_is_cancelled(conn, run_id):
             # §18: the fence refused a late acquisition commit; outputs were
             # rolled back before this exact-attempt cancellation transition.
-            abandon_request_for_cancellation(
-                conn, claim.request_id, attempt_id=claim.attempt_id, now=current
+            finalized = abandon_request_for_cancellation(
+                conn, claim.request_id, attempt_id=claim.attempt_id
             )
-            return "CANCELLED"
+            return "CANCELLED" if finalized else "STALE"
         # Lease expiry can be reclaimed immediately.  Epoch-stale ownership is
         # recovered by the service-epoch coordinator on the next claim/startup.
-        reclaim_expired(conn, now=current)
+        reclaim_expired(conn)
         return "STALE"
 
 
@@ -617,7 +610,7 @@ def _execute_plan(
             # more.  Nothing is terminalized from a stopped enumeration.
             break
         claim = claim_next_request(
-            conn, worker_id, now=db_utc_now(conn), types=frozenset(allowed),
+            conn, worker_id, types=frozenset(allowed),
             run_source_plan_id=plan_id, guard=guard,
         )
         if claim is None:
@@ -912,15 +905,15 @@ def _execute_plan(
             break
         except AuthorizationDenied as exc:
             if exc.decision.reason is AuthorizationReason.RUN_CANCELLED:
-                abandon_request_for_cancellation(
+                finalized = abandon_request_for_cancellation(
                     conn, claim.request_id, attempt_id=claim.attempt_id,
-                    now=db_utc_now(conn),
                 )
-                cancelled = True
+                cancelled = finalized
+                deferred = not finalized
             else:
                 finalized = finalize_authorization_denial(
                     conn, claim.request_id, claim.attempt_id,
-                    decision=exc.decision, now=db_utc_now(conn),
+                    decision=exc.decision,
                 )
                 if finalized:
                     run_degraded = True

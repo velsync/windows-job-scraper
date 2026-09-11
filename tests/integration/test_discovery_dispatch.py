@@ -280,10 +280,15 @@ def test_lease_expiry_between_claim_and_dispatch_blocks_io(
     T1 = NOW
     T2 = "2026-09-10T07:30:00.000000Z"  # T1 + 1h, past the 120s lease window
     T3 = "2026-09-10T09:30:00.000000Z"  # past the reclaim retry window
-    monkeypatch.setattr(discovery_module, "db_utc_now", lambda conn: T1)
-    monkeypatch.setattr(dispatch_module, "db_utc_now", lambda conn: T2)
-    monkeypatch.setattr(envelope_module, "db_utc_now", lambda conn: T2)
-    monkeypatch.setattr(claims_module, "db_utc_now", lambda conn: T2)
+    from jobscraper.runtime import fence as fence_module
+    clock = _event_time_machine(monkeypatch, claim_ts=T1, event_ts=T2)
+    real_dispatch = discovery_module.dispatch_http
+
+    def advance_before_dispatch(conn, envelope, policy, **kwargs):
+        clock['t'] = T2
+        return real_dispatch(conn, envelope, policy, **kwargs)
+
+    monkeypatch.setattr(discovery_module, 'dispatch_http', advance_before_dispatch)
 
     db = _database(tmp_path / "lease.db")
     try:
@@ -320,6 +325,8 @@ def test_lease_expiry_between_claim_and_dispatch_blocks_io(
 
         # resumability: advance past next_retry_at and redrive; the normal
         # path completes and the run/group terminalize instead of stranding
+        monkeypatch.setattr(discovery_module, "dispatch_http", real_dispatch)
+        monkeypatch.setattr(fence_module, "db_utc_now", lambda conn: T3)
         monkeypatch.setattr(discovery_module, "db_utc_now", lambda conn: T3)
         monkeypatch.setattr(dispatch_module, "db_utc_now", lambda conn: T3)
         monkeypatch.setattr(envelope_module, "db_utc_now", lambda conn: T3)
@@ -395,26 +402,19 @@ def test_epoch_stale_live_request_leaves_discovery_run_open(
 
 
 def _event_time_machine(monkeypatch, *, claim_ts, event_ts):
-    """Shared mutable clock for ownership-time regressions.
+    """One DB time source, advanced explicitly at the dispatch boundary.
 
-    The discovery seam starts at `claim_ts` (claim/run-start history);
-    wrappers advance it to `event_ts` inside the dispatch window, so
-    post-claim handlers observe event time — the production analogue of
-    time passing, without touching the system clock. All other ownership
-    namespaces are fixed at `event_ts` (they are only read post-claim).
+    Transaction owners now sample time themselves, including claims. All
+    namespaces must therefore observe the same timeline.
     """
-    from jobscraper.acquisition import envelope as envelope_module
-    from jobscraper.runtime import claims as claims_module
-    from jobscraper.runtime import discovery as discovery_module
-    from jobscraper.runtime import dispatch as dispatch_module
-    from jobscraper.runtime import fence as fence_module
+    from jobscraper.acquisition import envelope
+    from jobscraper.runtime import authorization, cancellation, claim_control
+    from jobscraper.runtime import claims, discovery, dispatch, fence
 
     state = {"t": claim_ts}
-    monkeypatch.setattr(discovery_module, "db_utc_now", lambda conn: state["t"])
-    monkeypatch.setattr(dispatch_module, "db_utc_now", lambda conn: event_ts)
-    monkeypatch.setattr(envelope_module, "db_utc_now", lambda conn: event_ts)
-    monkeypatch.setattr(claims_module, "db_utc_now", lambda conn: event_ts)
-    monkeypatch.setattr(fence_module, "db_utc_now", lambda conn: event_ts)
+    for module in (envelope, authorization, cancellation, claim_control,
+                   claims, discovery, dispatch, fence):
+        monkeypatch.setattr(module, "db_utc_now", lambda conn: state["t"])
     return state
 
 

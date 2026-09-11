@@ -471,6 +471,7 @@ def _terminalize_discovery_denied(
     failure_kind: str,
     detail: dict,
     now: str,
+    ownership_now: str | None = None,
 ) -> None:
     """Record a terminal discovery denial without request-owned outputs.
 
@@ -497,7 +498,7 @@ def _terminalize_discovery_denied(
             conn,
             claim.request_id,
             claim.attempt_id,
-            now=now,
+            now=ownership_now,
             outcome="FAILED",
             failure_kind=failure_kind,
             failure_json=json.dumps(detail, sort_keys=True),
@@ -513,7 +514,7 @@ def _terminalize_discovery_denied(
     )
 
 
-def _discovery_local_retry(conn, claim, budget, *, now: str):
+def _discovery_local_retry(conn, claim, budget, *, now: str, ownership_now: str | None = None):
     """Open a retry window for a local executor failure, if budget remains.
 
     Returns the retry delay when the request was parked RETRY_WAIT, else
@@ -563,7 +564,7 @@ def _discovery_local_retry(conn, claim, budget, *, now: str):
         conn,
         claim.request_id,
         claim.attempt_id,
-        now=now,
+        now=ownership_now,
         outcome="RETRY_WAIT",
         retry_delay_s=decision.delay_s,
         failure_kind=FailureKind.WORKER_CRASH.value,
@@ -574,12 +575,14 @@ def _discovery_local_retry(conn, claim, budget, *, now: str):
     return decision.delay_s
 
 
-def _handle_discovery_authorization_denied(conn, queued, claim, exc, *, now: str) -> None:
+def _handle_discovery_authorization_denied(conn, queued, claim, exc, *, now: str, ownership_now: str | None = None) -> None:
     """Typed handling for a discovery authorization denial: never strand RUNNING."""
     if exc.decision.reason is AuthorizationReason.RUN_CANCELLED:
-        abandon_request_for_cancellation(
-            conn, claim.request_id, attempt_id=claim.attempt_id, now=now
+        finalized = abandon_request_for_cancellation(
+            conn, claim.request_id, attempt_id=claim.attempt_id, now=ownership_now
         )
+        if not finalized:
+            return
         _terminalize_discovery_run(
             conn, queued, run_status="CANCELLED", group_outcome="CANCELLED",
             now=now,
@@ -587,7 +590,7 @@ def _handle_discovery_authorization_denied(conn, queued, claim, exc, *, now: str
         return
     finalized = finalize_authorization_denial(
         conn, claim.request_id, claim.attempt_id,
-        decision=exc.decision, now=now,
+        decision=exc.decision, now=ownership_now,
     )
     if finalized:
         _terminalize_discovery_run(
@@ -628,7 +631,7 @@ def execute_source_discovery(
     claim = claim_next_request(
         conn,
         worker_id,
-        now=claim_ts,
+        now=now,
         types=frozenset({"SOURCE_DISCOVERY"}),
         run_source_plan_id=queued.run_source_plan_id,
         guard=guard,
@@ -676,7 +679,7 @@ def execute_source_discovery(
         # claim timestamp) proves the lease is still live for the refund.
         yield_unstarted_claim(
             conn, claim.request_id, claim.attempt_id,
-            reason="CAPACITY_UNAVAILABLE", now=_event_now(),
+            reason="CAPACITY_UNAVAILABLE", now=now,
         )
         raise DiscoveryError(
             "discovery dispatch deferred: no provider capacity"
@@ -689,7 +692,7 @@ def execute_source_discovery(
             yield_unstarted_claim(
                 conn, claim.request_id, claim.attempt_id,
                 reason="RATE_COOLDOWN", next_retry_at=exc.next_retry_at,
-                now=_event_now(),
+                now=now,
             )
             raise DiscoveryError(
                 "discovery dispatch deferred: source cooldown active"
@@ -698,7 +701,7 @@ def execute_source_discovery(
             conn, queued, claim,
             failure_kind=exc.failure_kind or "BLOCKED",
             detail={"reason": exc.reason},
-            now=_event_now(),
+            now=_event_now(), ownership_now=now,
         )
         raise DiscoveryError(
             f"discovery dispatch refused: {exc.reason}"
@@ -709,7 +712,7 @@ def execute_source_discovery(
             failure_kind="POLICY_REJECTED",
             detail={"reason": "DISPATCH_PLAN_INVALID",
                     "error_type": type(exc).__name__},
-            now=_event_now(),
+            now=_event_now(), ownership_now=now,
         )
         raise DiscoveryError(
             f"discovery dispatch rejected: {type(exc).__name__}"
@@ -720,7 +723,7 @@ def execute_source_discovery(
         # The retry/failure fence uses fresh post-I/O event time so an
         # executor error cannot create retry evidence after its lease expired.
         try:
-            local_retry = _discovery_local_retry(conn, claim, budget, now=_event_now())
+            local_retry = _discovery_local_retry(conn, claim, budget, now=_event_now(), ownership_now=now)
         except StaleOwnership:
             raise DiscoveryError(
                 "discovery executor error committed nothing: lease expired"
@@ -730,7 +733,7 @@ def execute_source_discovery(
                 conn, queued, claim,
                 failure_kind="WORKER_CRASH",
                 detail={"error_type": exc.error_type},
-                now=_event_now(),
+                now=_event_now(), ownership_now=now,
             )
             raise DiscoveryError(
                 f"discovery executor error, budget exhausted: {exc.error_type}"
@@ -739,7 +742,7 @@ def execute_source_discovery(
             f"discovery executor error, retry open: {exc.error_type}"
         ) from None
     except AuthorizationDenied as exc:
-        _handle_discovery_authorization_denied(conn, queued, claim, exc, now=_event_now())
+        _handle_discovery_authorization_denied(conn, queued, claim, exc, now=_event_now(), ownership_now=now)
         raise DiscoveryError(
             f"discovery authorization denied: {exc.decision.reason.value}"
         ) from None
@@ -907,7 +910,7 @@ def execute_source_discovery(
             conn,
             claim.request_id,
             claim.attempt_id,
-            now=commit_ts,
+            now=now,
             outcome=retry_transition[0],
             retry_delay_s=retry_transition[1],
             failure_kind=retry_decision.failure_kind,

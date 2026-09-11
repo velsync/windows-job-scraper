@@ -21,7 +21,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
-from jobscraper.runtime.clock import current_service_epoch
+from jobscraper.runtime.clock import current_service_epoch, db_utc_now
 from jobscraper.runtime.requests import ACQUISITION_REQUEST_TYPES
 
 
@@ -314,7 +314,7 @@ def finalize_authorization_denial(
     attempt_id: str,
     *,
     decision: AuthorizationDecision,
-    now: str,
+    now: str | None = None,
 ) -> bool:
     """Record a live-policy denial without committing request-owned outputs.
 
@@ -326,6 +326,7 @@ def finalize_authorization_denial(
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        now = now or db_utc_now(conn)
         epoch = current_service_epoch(conn)
         if epoch is None:
             conn.execute("ROLLBACK")

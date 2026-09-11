@@ -111,7 +111,10 @@ def db(tmp_path):
 
 
 def test_guarded_heartbeat_detects_backward_clock_jump_before_lease_renewal(db):
-    ticks = iter((0.0, 1.0))
+    # Three observations: claim preflight baseline, heartbeat preflight
+    # (detects the anomaly and rotates), and the post-rotation resample
+    # after the writer is reacquired (lease-expiry race correction).
+    ticks = iter((0.0, 1.0, 2.0))
     epoch = begin_service_epoch(db.conn, now=FUTURE)
     guard = ServiceClockGuard(epoch, tolerance_s=5.0, monotonic=lambda: next(ticks))
     request_id = _enqueue(db)
