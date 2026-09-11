@@ -110,26 +110,30 @@ def db(tmp_path):
         pass
 
 
-def test_guarded_heartbeat_detects_clock_jump_before_lease_renewal(db):
+def test_guarded_heartbeat_detects_backward_clock_jump_before_lease_renewal(db):
     ticks = iter((0.0, 1.0))
-    epoch = begin_service_epoch(db.conn, now=NOW)
+    epoch = begin_service_epoch(db.conn, now=FUTURE)
     guard = ServiceClockGuard(epoch, tolerance_s=5.0, monotonic=lambda: next(ticks))
     request_id = _enqueue(db)
 
-    # The guarded claim establishes the clock baseline at NOW.
-    claim = claim_next_request(db.conn, "worker-1", now=NOW, guard=guard)
+    # The guarded claim establishes the clock baseline at FUTURE. Its lease
+    # expires after FUTURE, so when the wall clock jumps backward to NOW the
+    # lease still appears unexpired to a naive DB-time-only heartbeat.
+    claim = claim_next_request(db.conn, "worker-1", now=FUTURE, guard=guard)
     assert claim is not None and claim.request_id == request_id
     old_lease = claim.lease_until
+    assert old_lease > FUTURE
 
     # No intervening claim occurs. The heartbeat itself must observe the
-    # material +1h wall-clock jump and invalidate the old epoch before any
-    # renewal can be persisted.
+    # material backward jump, rotate the epoch and reject this old owner.
+    # Without the guard seam this heartbeat would be accepted because
+    # old_lease > NOW, silently preserving ownership across the anomaly.
     with pytest.raises(StaleOwnership):
         heartbeat(
             db.conn,
             request_id,
             claim.attempt_id,
-            now=FUTURE,
+            now=NOW,
             guard=guard,
         )
 
@@ -142,7 +146,7 @@ def test_guarded_heartbeat_detects_clock_jump_before_lease_renewal(db):
     ).fetchone()
     assert row["lease_until"] == old_lease
     assert guard.claims_halted
-    assert old_epoch["end_reason"] == "CLOCK_ANOMALY_FORWARD"
+    assert old_epoch["end_reason"] == "CLOCK_ANOMALY_BACKWARD"
 
 
 def test_run_service_fails_closed_when_restart_recovery_fails(tmp_path, monkeypatch):
@@ -224,5 +228,3 @@ def test_run_service_fails_closed_when_restart_recovery_fails(tmp_path, monkeypa
 
     assert code == 4
     assert sock.closed
-
-# RED checkpoint: production code intentionally unchanged in this commit.
