@@ -279,6 +279,7 @@ def test_lease_expiry_between_claim_and_dispatch_blocks_io(
 
     T1 = NOW
     T2 = "2026-09-10T07:30:00.000000Z"  # T1 + 1h, past the 120s lease window
+    T3 = "2026-09-10T09:30:00.000000Z"  # past the reclaim retry window
     monkeypatch.setattr(discovery_module, "db_utc_now", lambda conn: T1)
     monkeypatch.setattr(dispatch_module, "db_utc_now", lambda conn: T2)
     monkeypatch.setattr(envelope_module, "db_utc_now", lambda conn: T2)
@@ -287,7 +288,7 @@ def test_lease_expiry_between_claim_and_dispatch_blocks_io(
     db = _database(tmp_path / "lease.db")
     try:
         queued = _queue(db, server)
-        with pytest.raises(DiscoveryError, match="attempt consumed"):
+        with pytest.raises(DiscoveryError, match="still open"):
             execute_source_discovery(db.conn, queued, worker_id="w", now=None)
 
         # bind rejected ownership before network I/O
@@ -300,7 +301,7 @@ def test_lease_expiry_between_claim_and_dispatch_blocks_io(
             "SELECT COUNT(*) FROM acquisition_evidence WHERE request_id = ?",
             (queued.request_id,),
         ).fetchone()[0] == 0
-        # the expired lease was consumed for retry; the run mirrors it
+        # retryable request under an open run: no false terminalization
         request = db.conn.execute(
             "SELECT status, next_retry_at FROM scrape_requests WHERE id = ?",
             (queued.request_id,),
@@ -310,6 +311,83 @@ def test_lease_expiry_between_claim_and_dispatch_blocks_io(
         run = db.conn.execute(
             "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
         ).fetchone()
-        assert run["status"] == "FAILED"
+        assert run["status"] == "RUNNING"
+        group = db.conn.execute(
+            "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
+            (queued.run_id,),
+        ).fetchone()
+        assert group["group_outcome"] is None
+
+        # resumability: advance past next_retry_at and redrive; the normal
+        # path completes and the run/group terminalize instead of stranding
+        monkeypatch.setattr(discovery_module, "db_utc_now", lambda conn: T3)
+        monkeypatch.setattr(dispatch_module, "db_utc_now", lambda conn: T3)
+        monkeypatch.setattr(envelope_module, "db_utc_now", lambda conn: T3)
+        monkeypatch.setattr(claims_module, "db_utc_now", lambda conn: T3)
+        outcome = execute_source_discovery(db.conn, queued, worker_id="w2", now=None)
+        assert _Handler.hits == 1
+        assert outcome.run_status in ("SUCCEEDED", "PARTIAL")
+        request = db.conn.execute(
+            "SELECT status FROM scrape_requests WHERE id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert request["status"] in ("SUCCEEDED", "FAILED")
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
+        ).fetchone()
+        assert run["status"] in ("SUCCEEDED", "PARTIAL", "FAILED")
+        group = db.conn.execute(
+            "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
+            (queued.run_id,),
+        ).fetchone()
+        assert group["group_outcome"] is not None
+    finally:
+        db.close()
+
+
+def test_epoch_stale_live_request_leaves_discovery_run_open(
+    tmp_path, server, monkeypatch
+):
+    """Epoch invalidation with a live lease cannot close the discovery run.
+
+    The epoch rotates inside the dispatch window (after claim, before the
+    bind fence): the attempt is epoch-stale but its lease is live, so
+    reclamation consumes nothing and the request stays RUNNING under an
+    open RUNNING run with a NULL group outcome.
+    """
+    from jobscraper.runtime import discovery as discovery_module
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    real_dispatch = discovery_module.dispatch_http
+
+    db = _database(tmp_path / "epoch.db")
+    try:
+        queued = _queue(db, server)
+
+        def _rotate_then_dispatch(conn, envelope, policy, **kwargs):
+            begin_service_epoch(conn, now=NOW)
+            return real_dispatch(conn, envelope, policy, **kwargs)
+
+        monkeypatch.setattr(discovery_module, "dispatch_http", _rotate_then_dispatch)
+
+        with pytest.raises(DiscoveryError, match="still open"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=NOW)
+
+        assert _Handler.hits == 0
+        request = db.conn.execute(
+            "SELECT status, current_attempt_id FROM scrape_requests WHERE id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert request["status"] == "RUNNING"
+        assert request["current_attempt_id"] is not None
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
+        ).fetchone()
+        assert run["status"] == "RUNNING"
+        group = db.conn.execute(
+            "SELECT group_outcome FROM run_source_plans WHERE run_id = ?",
+            (queued.run_id,),
+        ).fetchone()
+        assert group["group_outcome"] is None
     finally:
         db.close()

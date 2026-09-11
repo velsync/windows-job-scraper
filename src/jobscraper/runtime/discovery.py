@@ -728,20 +728,25 @@ def execute_source_discovery(
             f"discovery authorization denied: {exc.decision.reason.value}"
         ) from None
     except StaleOwnership:
-        # Pre-I/O ownership loss: reclaim, then inspect durable state. A
-        # still-live attempt stays open for redrive; only a consumed attempt
-        # lets the run terminalize below.  Reclamation and terminalization
-        # use the original injected `now` (fresh database UTC in production),
-        # never the stale claim timestamp.
+        # Pre-I/O ownership loss: reclaim, then inspect the durable request
+        # state. A retryable/open request (PENDING, RETRY_WAIT, RUNNING) must
+        # never live under a terminal run: leave the run RUNNING and the
+        # plan/group open so a later service pass can redrive it. Only a
+        # request that is itself terminal lets the run mirror FAILED.
+        # Reclamation and terminalization use the original injected `now`
+        # (fresh database UTC in production), never the stale claim timestamp.
         reclaim_expired(conn, now=now)
-        live = conn.execute(
-            "SELECT 1 FROM scrape_requests WHERE id = ?"
-            " AND status = 'RUNNING' AND current_attempt_id = ?",
-            (claim.request_id, claim.attempt_id),
+        state = conn.execute(
+            "SELECT status FROM scrape_requests WHERE id = ?",
+            (claim.request_id,),
         ).fetchone()
-        if live is not None:
+        if state is not None and state["status"] in (
+            "PENDING",
+            "RETRY_WAIT",
+            "RUNNING",
+        ):
             raise DiscoveryError(
-                "discovery ownership advanced before dispatch; still open"
+                "discovery ownership lost before dispatch; request still open"
             ) from None
         _terminalize_discovery_run(
             conn, queued, run_status="FAILED", group_outcome="FAILED",
