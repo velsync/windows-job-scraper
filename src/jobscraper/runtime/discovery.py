@@ -654,7 +654,13 @@ def execute_source_discovery(
             attempt_count=int(budget["attempt_count"]),
             max_attempts=int(budget["max_attempts"]),
             expect="LIST",
-            now=claim_ts,
+            # Original injected `now` semantics: an explicit test timestamp
+            # stays deterministic, while production (`now is None`) lets
+            # dispatch/bind sample fresh database UTC at each authority
+            # boundary.  Propagating the captured claim timestamp here would
+            # let an expired lease pass the pre-I/O fence and perform I/O
+            # after ownership was already lost (lease_until <= database_now).
+            now=now,
         )
     except CapacityUnavailable:
         # No network request happened and the provider attempt budget is
@@ -724,8 +730,10 @@ def execute_source_discovery(
     except StaleOwnership:
         # Pre-I/O ownership loss: reclaim, then inspect durable state. A
         # still-live attempt stays open for redrive; only a consumed attempt
-        # lets the run terminalize below.
-        reclaim_expired(conn, now=claim_ts)
+        # lets the run terminalize below.  Reclamation and terminalization
+        # use the original injected `now` (fresh database UTC in production),
+        # never the stale claim timestamp.
+        reclaim_expired(conn, now=now)
         live = conn.execute(
             "SELECT 1 FROM scrape_requests WHERE id = ?"
             " AND status = 'RUNNING' AND current_attempt_id = ?",
@@ -737,7 +745,7 @@ def execute_source_discovery(
             ) from None
         _terminalize_discovery_run(
             conn, queued, run_status="FAILED", group_outcome="FAILED",
-            now=claim_ts,
+            now=now if now is not None else db_utc_now(conn),
         )
         raise DiscoveryError(
             "discovery ownership was lost before dispatch; attempt consumed"

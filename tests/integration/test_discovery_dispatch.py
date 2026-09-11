@@ -256,3 +256,60 @@ def test_cancellation_between_claim_and_dispatch_abandons_probe(
         assert run["status"] == "CANCELLED"
     finally:
         db.close()
+
+
+def test_lease_expiry_between_claim_and_dispatch_blocks_io(
+    tmp_path, server, monkeypatch
+):
+    """A lease that expires after claim must fail the pre-I/O fence.
+
+    Production-style call (`now=None`): the claim samples T1 and the
+    dispatch seam samples T2 (past the 120s lease window) through
+    monkeypatched DB-clock seams — the analogue of wall-clock time passing
+    between claim and dispatch, without touching the system clock or
+    sleeping. `bind_execution_plan` must reject ownership before any
+    network I/O: zero HTTP hits, zero fetch evidence. The truly expired
+    lease is consumed (RETRY_WAIT) and the run mirrors it; nothing
+    commits request-owned outputs.
+    """
+    from jobscraper.acquisition import envelope as envelope_module
+    from jobscraper.runtime import claims as claims_module
+    from jobscraper.runtime import discovery as discovery_module
+    from jobscraper.runtime import dispatch as dispatch_module
+
+    T1 = NOW
+    T2 = "2026-09-10T07:30:00.000000Z"  # T1 + 1h, past the 120s lease window
+    monkeypatch.setattr(discovery_module, "db_utc_now", lambda conn: T1)
+    monkeypatch.setattr(dispatch_module, "db_utc_now", lambda conn: T2)
+    monkeypatch.setattr(envelope_module, "db_utc_now", lambda conn: T2)
+    monkeypatch.setattr(claims_module, "db_utc_now", lambda conn: T2)
+
+    db = _database(tmp_path / "lease.db")
+    try:
+        queued = _queue(db, server)
+        with pytest.raises(DiscoveryError, match="attempt consumed"):
+            execute_source_discovery(db.conn, queued, worker_id="w", now=None)
+
+        # bind rejected ownership before network I/O
+        assert _Handler.hits == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM fetch_attempts WHERE request_id = ?",
+            (queued.request_id,),
+        ).fetchone()[0] == 0
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM acquisition_evidence WHERE request_id = ?",
+            (queued.request_id,),
+        ).fetchone()[0] == 0
+        # the expired lease was consumed for retry; the run mirrors it
+        request = db.conn.execute(
+            "SELECT status, next_retry_at FROM scrape_requests WHERE id = ?",
+            (queued.request_id,),
+        ).fetchone()
+        assert request["status"] == "RETRY_WAIT"
+        assert request["next_retry_at"] > T2
+        run = db.conn.execute(
+            "SELECT status FROM scrape_runs WHERE id = ?", (queued.run_id,)
+        ).fetchone()
+        assert run["status"] == "FAILED"
+    finally:
+        db.close()
