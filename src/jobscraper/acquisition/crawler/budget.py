@@ -136,7 +136,8 @@ def load_usage(conn: sqlite3.Connection, run_source_plan_id: str, *, now: str) -
              JOIN fetch_attempts f ON f.request_id = r.id
             WHERE r.run_source_plan_id = ? AND r.request_type IN ({enum})
               AND NOT (r.request_type = 'SOURCE_CRAWL'
-                       AND r.payload_json LIKE '%\"role\":\"ROBOTS\"%')) AS pages_completed,
+                       AND (r.payload_json LIKE '%\"role\":\"ROBOTS\"%'
+                            OR r.payload_json LIKE '%\"role\":\"SITEMAP\"%'))) AS pages_completed,
           (SELECT COUNT(*) FROM scrape_requests r
             WHERE r.run_source_plan_id = ? AND r.request_type IN ({acq})) AS requests_created,
           (SELECT COUNT(*) FROM scrape_requests r

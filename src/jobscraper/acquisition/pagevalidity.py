@@ -150,9 +150,29 @@ def classify_page(
             marker in lowered for marker in _SPA_MARKERS
         ):
             return PageClassification(PageClass.JS_SHELL, evidence)
+        if expect == "SITEMAP":
+            # A sitemap endpoint returning ordinary HTML is not a valid
+            # sitemap document. Login/challenge/JS-shell handling above still
+            # wins before this refusal.
+            return PageClassification(PageClass.UNEXPECTED_CONTENT, evidence)
         # Valid HTML for the expected page kind.
         state = PageClass.VALID_JOB if expect == "JOB" else PageClass.VALID_LIST
         return PageClassification(state, evidence)
+
+    if expect == "SITEMAP":
+        stripped = body.lstrip().lower()
+        if (
+            "xml" in content_type
+            or stripped.startswith(b"<?xml")
+            or stripped.startswith(b"<urlset")
+            or stripped.startswith(b"<sitemapindex")
+        ):
+            # Structural XML safety/shape is checked by crawler.sitemap after
+            # dispatch. The canonical classifier has no sitemap-specific state,
+            # so a transport-valid sitemap document enters that host parser as
+            # VALID_LIST and never reaches an adapter parser.
+            return PageClassification(PageClass.VALID_LIST, evidence)
+        return PageClassification(PageClass.UNEXPECTED_CONTENT, evidence)
 
     if "json" in content_type or content_type == "":
         try:

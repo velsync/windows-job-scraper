@@ -67,6 +67,13 @@ from jobscraper.acquisition.crawler.robots import (
     load_robots_gate,
     parse_robots_result,
 )
+from jobscraper.acquisition.crawler.sitemap import (
+    build_sitemap_request_plan,
+    discover_sitemaps_from_robots,
+    enqueue_robots_sitemaps,
+    enqueue_sitemap_result,
+    parse_sitemap,
+)
 from jobscraper.acquisition.crawler.scope import check_scope, scope_from_plan
 from jobscraper.acquisition.pagevalidity import PageClass, classify_page
 from jobscraper.adapters.contract import (
@@ -722,12 +729,23 @@ def _execute_plan(
         ).fetchone()
         claim_depth = int(request_meta["depth"] if request_meta is not None else 0)
         claim_priority = int(request_meta["priority"] if request_meta is not None else 0)
+        claim_payload = dict(claim.payload or {})
+        crawl_role = str(claim_payload.get("role") or "").upper()
         is_robots = (
-            claim.request_type == "SOURCE_CRAWL"
-            and str(dict(claim.payload or {}).get("role") or "").upper() == "ROBOTS"
+            claim.request_type == "SOURCE_CRAWL" and crawl_role == "ROBOTS"
         )
+        is_sitemap = (
+            claim.request_type == "SOURCE_CRAWL" and crawl_role == "SITEMAP"
+        )
+        raw_sitemap_depth = claim_payload.get("sitemap_depth", 0)
+        try:
+            sitemap_depth = max(0, int(raw_sitemap_depth))
+        except (TypeError, ValueError):
+            sitemap_depth = 0
         is_enumeration = (
-            claim.request_type in _ENUMERATION_REQUEST_TYPES and not is_robots
+            claim.request_type in _ENUMERATION_REQUEST_TYPES
+            and not is_robots
+            and not is_sitemap
         )
         if is_enumeration or not listing_identity_sufficient:
             # 03 §40: coverage links the requests/pages that contributed to
@@ -742,7 +760,7 @@ def _execute_plan(
         cursor = None
         pagination_guard = PaginationGuardState()
         plan_refusal: str | None = None
-        if task_kind in _CURSOR_TASK_KINDS and not is_robots:
+        if task_kind in _CURSOR_TASK_KINDS and not is_robots and not is_sitemap:
             try:
                 loaded_cursor = load_crawl_cursor(
                     conn, run_source_plan_id=plan_id, plan_row=plan_row
@@ -752,7 +770,7 @@ def _execute_plan(
                     pagination_guard = loaded_cursor.guard_state
             except CursorCompatibilityError as exc:
                 plan_refusal = f"CursorCompatibilityError: {exc}"
-        task = AdapterTask(kind=task_kind, payload=dict(claim.payload or {}))
+        task = AdapterTask(kind=task_kind, payload=claim_payload)
         # 02 ACQ-09: planning receives the host-resolved pins, never mutable
         # host state.  Snapshots that do not exist durably yet stay None.
         planning_ctx = PlanningContext(
@@ -769,6 +787,8 @@ def _execute_plan(
                 request_plan = (
                     build_robots_request_plan(source["entry_url"])
                     if is_robots
+                    else build_sitemap_request_plan(target_reference)
+                    if is_sitemap
                     else adapter.plan(task, cursor, ctx=planning_ctx)
                 )
             except (ValueError, TypeError) as exc:
@@ -995,7 +1015,11 @@ def _execute_plan(
                 policy,
                 attempt_count=int(budget["attempt_count"]),
                 max_attempts=int(budget["max_attempts"]),
-                expect="JOB" if task_kind is AdapterTaskKind.DETAIL else "LIST",
+                expect=(
+                    "SITEMAP"
+                    if is_sitemap
+                    else "JOB" if task_kind is AdapterTaskKind.DETAIL else "LIST"
+                ),
                 detail_closure_allowed=(task_kind is AdapterTaskKind.DETAIL),
             )
         except CapacityUnavailable:
@@ -1191,6 +1215,20 @@ def _execute_plan(
             if is_robots and retry_decision.action is RetryAction.SUCCEED
             else None
         )
+        robots_sitemap_discovery = (
+            discover_sitemaps_from_robots(robots_policy.lines)
+            if robots_policy is not None
+            else None
+        )
+        sitemap_parse_result = (
+            parse_sitemap(
+                result.body or b"",
+                sitemap_url=result.final_url or request_plan.url,
+                index_depth=sitemap_depth,
+            )
+            if is_sitemap and retry_decision.action is RetryAction.SUCCEED
+            else None
+        )
         if page_robots_decision is not None:
             result.robots_decision = page_robots_decision.kind.value
         elif robots_policy is not None:
@@ -1293,6 +1331,7 @@ def _execute_plan(
 
             clean_rate_success = (
                 is_robots
+                or is_sitemap
                 or classification.state in NORMAL_PARSE_CLASSES
                 or (
                     task_kind is AdapterTaskKind.DETAIL
@@ -1318,7 +1357,94 @@ def _execute_plan(
                     content_hash=result.normalized_content_hash,
                     now=ts,
                 )
+                if robots_sitemap_discovery is not None:
+                    sitemap_enqueued = enqueue_robots_sitemaps(
+                        cursor_conn,
+                        discovery=robots_sitemap_discovery,
+                        run_id=run_id,
+                        plan_row=plan_row,
+                        parent_request_id=claim.request_id,
+                        scope=crawl_scope,
+                        budget=crawl_budget,
+                        base_url=result.final_url or request_plan.url,
+                        now=ts,
+                    )
+                    _record_sitemap_diagnostics(
+                        cursor_conn,
+                        request_id=claim.request_id,
+                        attempt_id=claim.attempt_id,
+                        fetch_attempt_id=fetch_attempt_id,
+                        diagnostics=(
+                            *robots_sitemap_discovery.diagnostics,
+                            *sitemap_enqueued.diagnostics,
+                        ),
+                        content_hash=result.normalized_content_hash,
+                        now=ts,
+                    )
+                    if (
+                        robots_sitemap_discovery.candidates
+                        or robots_sitemap_discovery.diagnostics
+                        or sitemap_enqueued.diagnostics
+                    ):
+                        _record_evidence(
+                            cursor_conn,
+                            request_id=claim.request_id,
+                            attempt_id=claim.attempt_id,
+                            fetch_attempt_id=fetch_attempt_id,
+                            kind="REVIEW",
+                            ref="sitemap://ROBOTS_DISCOVERY",
+                            detail={
+                                "candidate_count": len(robots_sitemap_discovery.candidates),
+                                **sitemap_enqueued.as_dict(),
+                            },
+                            content_hash=result.normalized_content_hash,
+                            now=ts,
+                        )
                 signal["value"] = "ROBOTS_POLICY"
+                return
+            if is_sitemap:
+                # Sitemap XML is host-owned discovery metadata. It never reaches
+                # adapter.parse(), never becomes a coverage-contributing page,
+                # and never grants absence authority. Every derived URL still
+                # enters the ordinary scoped/budgeted durable frontier.
+                parsed = sitemap_parse_result
+                if parsed is None:
+                    signal["value"] = "SITEMAP_DIAGNOSTIC"
+                    return
+                sitemap_enqueued = enqueue_sitemap_result(
+                    cursor_conn,
+                    parsed=parsed,
+                    current_sitemap_depth=sitemap_depth,
+                    run_id=run_id,
+                    plan_row=plan_row,
+                    parent_request_id=claim.request_id,
+                    scope=crawl_scope,
+                    budget=crawl_budget,
+                    base_url=result.final_url or request_plan.url,
+                    now=ts,
+                    page_depth=max(1, claim_depth + 1),
+                )
+                _record_sitemap_diagnostics(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    fetch_attempt_id=fetch_attempt_id,
+                    diagnostics=(*parsed.diagnostics, *sitemap_enqueued.diagnostics),
+                    content_hash=result.normalized_content_hash,
+                    now=ts,
+                )
+                _record_evidence(
+                    cursor_conn,
+                    request_id=claim.request_id,
+                    attempt_id=claim.attempt_id,
+                    fetch_attempt_id=fetch_attempt_id,
+                    kind="REVIEW",
+                    ref="sitemap://DOCUMENT",
+                    detail={**parsed.as_dict(), **sitemap_enqueued.as_dict()},
+                    content_hash=result.normalized_content_hash,
+                    now=ts,
+                )
+                signal["value"] = "SITEMAP_PROCESSED"
                 return
             if classification.state in NORMAL_PARSE_CLASSES:
                 # EMPTY is a recognized non-job outcome (§21): the adapter parse
@@ -1685,7 +1811,11 @@ def _execute_plan(
         if value in (
             "INVALID", "FAILURE", "PARTIAL", "REFUSED", "RETRY",
             "PAGINATION_STOP", "BUDGET_STOP",
-        ):
+        ) and not is_sitemap:
+            # Sitemap acquisition is advisory discovery metadata. A failed or
+            # malformed sitemap is durable diagnostic evidence, but it cannot
+            # invalidate an otherwise complete enumeration or create/restore
+            # absence authority.
             run_degraded = True
             if is_enumeration or not listing_identity_sufficient:
                 coverage_degraded = True
@@ -1830,6 +1960,31 @@ def posting_host_matches_source(source_row, observation) -> bool:
         if candidate and host_of(candidate) == entry:
             return True
     return False
+
+
+def _record_sitemap_diagnostics(
+    conn,
+    *,
+    request_id: str,
+    attempt_id: str | None,
+    fetch_attempt_id: str | None,
+    diagnostics,
+    content_hash: str | None,
+    now: str,
+) -> None:
+    # Persist bounded sitemap diagnostics as explicitly non-authoritative evidence.
+    for diagnostic in diagnostics:
+        _record_evidence(
+            conn,
+            request_id=request_id,
+            attempt_id=attempt_id,
+            fetch_attempt_id=fetch_attempt_id,
+            kind="REVIEW",
+            ref=f"sitemap://{diagnostic.code}",
+            detail=diagnostic.as_dict(),
+            content_hash=content_hash,
+            now=now,
+        )
 
 
 def _record_evidence(

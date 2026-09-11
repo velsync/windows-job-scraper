@@ -31,6 +31,21 @@ from .robots import (
     load_robots_gate,
     parse_robots_result,
 )
+from .sitemap import (
+    SitemapCandidate,
+    SitemapDiagnostic,
+    SitemapDiscovery,
+    SitemapDocumentKind,
+    SitemapEnqueueResult,
+    SitemapLimits,
+    SitemapParseResult,
+    build_sitemap_request_plan,
+    discover_sitemaps_from_robots,
+    enqueue_robots_sitemaps,
+    enqueue_sitemap_result,
+    parse_sitemap,
+    prioritized_candidates,
+)
 from .scope import CrawlScope, ScopeDecision, check_scope, scope_from_plan
 
 __all__ = [
@@ -42,5 +57,9 @@ __all__ = [
     "RobotsDecision", "RobotsDecisionKind", "RobotsGate", "RobotsPolicy", "RobotsPolicyStatus",
     "build_robots_request_plan", "ensure_robots_request", "evaluate_robots_policy", "evaluate_robots_result",
     "load_robots_gate", "parse_robots_result",
+    "SitemapCandidate", "SitemapDiagnostic", "SitemapDiscovery", "SitemapDocumentKind",
+    "SitemapEnqueueResult", "SitemapLimits", "SitemapParseResult",
+    "build_sitemap_request_plan", "discover_sitemaps_from_robots",
+    "enqueue_robots_sitemaps", "enqueue_sitemap_result", "parse_sitemap", "prioritized_candidates",
     "CrawlScope", "ScopeDecision", "check_scope", "scope_from_plan",
 ]

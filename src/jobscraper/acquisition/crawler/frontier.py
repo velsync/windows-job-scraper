@@ -39,6 +39,8 @@ def enqueue_discovered_task(
     usage: CrawlUsage,
     base_url: str | None,
     now: str,
+    role: str | None = None,
+    payload_extra: Mapping[str, object] | None = None,
 ) -> FrontierDecision:
     request_type = _TASK_REQUEST_TYPE.get(str(discovered.kind).upper())
     if request_type is None:
@@ -78,6 +80,24 @@ def enqueue_discovered_task(
             None, False, False, f"BUDGET_{budget_decision.reason}", request_type,
             target_identity,
         )
+    if role is not None and request_type != "SOURCE_CRAWL":
+        raise ValueError("frontier role is valid only for SOURCE_CRAWL work")
+    payload = {
+        "kind": str(discovered.kind).upper(),
+        "target_reference": target_identity,
+        "logical_key": discovered.logical_key,
+        "depth": int(discovered.depth),
+        "parent_reference": discovered.parent_reference,
+        "role": (str(role).upper() if role is not None else "PAGE")
+        if request_type == "SOURCE_CRAWL"
+        else None,
+    }
+    if payload_extra:
+        collisions = sorted(set(payload).intersection(payload_extra))
+        if collisions:
+            raise ValueError(f"frontier payload_extra may not replace reserved keys: {collisions}")
+        payload.update(dict(payload_extra))
+
     request_id, created = enqueue_request(
         conn,
         run_id=run_id,
@@ -86,14 +106,7 @@ def enqueue_discovered_task(
         binding_id=str(plan_row["binding_id"]),
         request_type=request_type,
         target_identity=target_identity,
-        payload={
-            "kind": str(discovered.kind).upper(),
-            "target_reference": target_identity,
-            "logical_key": discovered.logical_key,
-            "depth": int(discovered.depth),
-            "parent_reference": discovered.parent_reference,
-            "role": "PAGE" if request_type == "SOURCE_CRAWL" else None,
-        },
+        payload=payload,
         strategy=str(plan_row["strategy"]),
         execution_class=str(plan_row["execution_class"]),
         priority=int(discovered.priority),
