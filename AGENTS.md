@@ -32,6 +32,10 @@ This repository is the authoritative implementation workspace for Windows Job Sc
    - `docs/plans/slice-3-windows-acceptance-strategy-v0313.md`
    - `docs/reviews/slice-3-planning-corrective-review-r2-2026-09-10.md` (**controlling corrective record**)
    - `docs/reviews/slice-3-planning-audit-2026-09-10.md` (historical first planning audit; superseded by R2 where they differ)
+9. Post-S3.13 Corrective A authority:
+   - `docs/reviews/post-s3.13-corrective-a-enumeration-lifecycle-authority-2026-09-13.md` (**approved controlling architecture amendment for Corrective A**)
+   - `docs/reviews/post-s3.13-corrective-a-design-corrective-review-2026-09-13.md`
+   - `docs/superpowers/plans/2026-09-13-post-s3.13-corrective-a-a0-contract-lock.md` (**A0 execution plan; no production behavior change**)
 
 Later authority controls where an earlier plan/status note conflicts with an explicit corrective or promotion record. In particular, old Slice-2 records that say a later S2.x package is blocked, has not started, or packaged/native promotion is pending are historical snapshots, not current execution authority. For Slice 3 planning, the R2 corrective review controls where it changes or narrows the base worker plan, Windows acceptance strategy, or first planning audit. Do not rewrite sealed historical review records to erase earlier states; update living authority documents or add a later controlling corrective record instead.
 
@@ -51,7 +55,8 @@ Do not redesign the architecture unless a genuine contradiction or implementatio
 - GitHub Actions run `34474624862` at the exact frozen candidate passed on Ubuntu and Windows. Ubuntu: 1331 passed / 5 skipped. Windows: 1336 passed, dependency consistency clean, pywin32 primitives importable, Chromium installation PASS, inert browser smoke PASS.
 - The controlling promotion decision is `docs/reviews/slice-2-native-promotion-closure-2026-09-10.md`.
 - Slice 3 planning is complete as **14 bounded packages (S3.0–S3.13)** with an intermediate N3-A checkpoint after S3.4 and final W3 packaged/native acceptance after S3.13. The R2 planning corrective review above is controlling for the corrected handoff details.
-- **Slice 3 implementation has not been started or authorized by the planning documents themselves. Do not begin S3.0 or any later Slice-3 package without explicit user authorization.**
+- Slice 3 S3.0-S3.13 implementation reached the frozen candidate `c1cc7b07af9ce74f5629aa2de6332709e1739c1a`, but that candidate is **NOT PROMOTED**. Final W3 calibration exposed a real W3-05 correctness defect plus additional required packaged-surface blockers.
+- The **Post-S3.13 Corrective A** architecture was user-approved on 2026-09-13. **A0 only** is authorized as the documentation/contract-lock checkpoint. Do not begin Corrective A A1-A5, Corrective B, rebuild/package/promotion, or any newly named "S3.14" package without the next explicit review/authorization.
 - Do not import, cherry-pick, or count divergent experimental-branch future-slice code as accepted implementation authority unless it is explicitly reviewed and reconciled.
 
 ## Worker boundary

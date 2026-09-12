@@ -1,0 +1,100 @@
+{
+  "checkpoint": "A0",
+  "checkpoint_rule": "A0 changes documentation and contract locks only; no src/jobscraper production behavior changes.",
+  "contract_version": 1,
+  "corrective_name": "Post-S3.13 Corrective A",
+  "enumeration_contract": {
+    "coverage_authority_values": [
+      "AUTHORITATIVE_FULL_SOURCE",
+      "AUTHORITATIVE_DECLARED_SCOPE",
+      "NON_AUTHORITATIVE_QUERY",
+      "DETAIL_ONLY",
+      "NO_ABSENCE_INFERENCE"
+    ],
+    "fields": [
+      "enumeration_contract_version",
+      "coverage_authority",
+      "coverage_scope_key",
+      "pagination_stability",
+      "listing_identity_sufficient"
+    ],
+    "json_api_feed_default": {
+      "coverage_authority": "NO_ABSENCE_INFERENCE",
+      "pagination_stability": "UNKNOWN"
+    },
+    "pagination_stability_values": [
+      "SINGLE_RESPONSE",
+      "STABLE_SNAPSHOT",
+      "UNKNOWN"
+    ],
+    "provider_authority_preserved": [
+      "greenhouse",
+      "ashby",
+      "lever"
+    ]
+  },
+  "lifetime_owners": {
+    "cache_representation": "CROSS_RUN_EXACT_COMPATIBILITY",
+    "coverage_generation": "EXACT_RUN_SOURCE_PLAN",
+    "future_incremental_checkpoint": "SEPARATE_EXPLICIT_ABSTRACTION",
+    "ordinary_pagination_cursor": "EXACT_RUN_SOURCE_PLAN",
+    "pagination_guard": "EXACT_RUN_SOURCE_PLAN",
+    "rate_protection": "CROSS_RUN_BINDING_HOST"
+  },
+  "migration_immutability": {
+    "frozen_versions": "1-21",
+    "rule": "v1-v21 migration bytes remain immutable"
+  },
+  "next_schema_migration": 22,
+  "non_goals": [
+    "service acquisition coordinator",
+    "scheduler cadence",
+    "browser acquisition",
+    "W3-04 generic packaged crawl surface",
+    "W3-07 fallback-group operator surface",
+    "W3-09 native reverse-order injection surface",
+    "speculative generic cross-run incremental framework",
+    "migration edits to v1-v21"
+  ],
+  "required_future_behavior_tests": {
+    "A1": [
+      "test_same_plan_restart_loads_exact_cursor_and_guard",
+      "test_fresh_plan_does_not_inherit_compatible_prior_plan_cursor",
+      "test_two_plans_same_binding_persist_independent_cursor_rows",
+      "test_v22_unfinished_pre_v22_coverage_loses_absence_authority",
+      "test_v22_finalized_pre_v22_coverage_remains_historical"
+    ],
+    "A2": [
+      "test_json_feed_without_stability_declaration_has_no_absence_authority",
+      "test_greenhouse_enumeration_contract_remains_full_source",
+      "test_ashby_enumeration_contract_remains_full_source",
+      "test_lever_enumeration_contract_remains_full_source",
+      "test_run_source_plan_pins_enumeration_contract"
+    ],
+    "A3": [
+      "test_fresh_run_starts_seed_page_and_sends_exact_conditional_validator",
+      "test_accepted_304_restores_membership_into_new_coverage",
+      "test_accepted_304_does_not_increment_content_revision",
+      "test_fresh_run_without_validator_discovers_new_first_page_job",
+      "test_incompatible_304_never_authorizes_empty_or_absence"
+    ],
+    "A4": [
+      "test_continuation_request_target_identity_matches_next_planned_target",
+      "test_claim_fails_closed_when_durable_target_disagrees_with_planned_target",
+      "test_overlapping_plans_advance_cursors_and_guards_independently"
+    ],
+    "A5": [
+      "test_unchanged_reobservation_reports_zero_jobs_updated",
+      "test_meaningful_existing_job_change_reports_one_job_updated",
+      "test_new_job_is_saved_not_double_counted_as_updated",
+      "test_stale_observation_has_no_saved_or_updated_current_effect"
+    ]
+  },
+  "run_effect_values": [
+    "NEW_JOB",
+    "UPDATED_JOB",
+    "UNCHANGED_JOB",
+    "STALE_IGNORED"
+  ],
+  "status": "APPROVED_ARCHITECTURE_LOCK"
+}
