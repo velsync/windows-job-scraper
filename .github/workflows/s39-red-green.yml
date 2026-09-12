@@ -16,15 +16,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Apply corrective patch once
-        shell: bash
-        run: |
-          if git apply --check scripts/s39_terminal_work_barrier.patch; then
-            git apply scripts/s39_terminal_work_barrier.patch
-            echo "applied=true" >> "$GITHUB_ENV"
-          else
-            echo "applied=false" >> "$GITHUB_ENV"
-          fi
+      - name: Apply corrective edits deterministically
+        run: python scripts/apply_s39_terminal_work_barrier.py
       - run: python -m venv .venv
       - run: .venv/bin/python -m pip install -r requirements/dev.lock.txt
       - run: .venv/bin/python -m pip install --no-deps .
@@ -33,9 +26,12 @@ jobs:
           .venv/bin/python -m pytest tests/integration/test_s39_terminal_work_barrier_red.py -q
           .venv/bin/python -m pytest tests/integration/test_s39_fallback_groups.py -q
       - name: Commit verified corrective files
-        if: env.applied == 'true'
         shell: bash
         run: |
+          if git diff --quiet -- src/jobscraper/runtime/runs.py tests/integration/test_s39_fallback_groups.py; then
+            echo "Corrective files already applied."
+            exit 0
+          fi
           git config user.name "velsync"
           git config user.email "velsync@gmail.com"
           git add src/jobscraper/runtime/runs.py tests/integration/test_s39_fallback_groups.py
