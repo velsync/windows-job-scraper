@@ -6,7 +6,7 @@ on:
       - "repair/s39-terminal-work-barrier"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   focused:
@@ -16,7 +16,28 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Apply corrective patch once
+        shell: bash
+        run: |
+          if git apply --check scripts/s39_terminal_work_barrier.patch; then
+            git apply scripts/s39_terminal_work_barrier.patch
+            echo "applied=true" >> "$GITHUB_ENV"
+          else
+            echo "applied=false" >> "$GITHUB_ENV"
+          fi
       - run: python -m venv .venv
       - run: .venv/bin/python -m pip install -r requirements/dev.lock.txt
       - run: .venv/bin/python -m pip install --no-deps .
-      - run: .venv/bin/python -m pytest tests/integration/test_s39_terminal_work_barrier_red.py -q
+      - name: Run focused corrective tests
+        run: |
+          .venv/bin/python -m pytest tests/integration/test_s39_terminal_work_barrier_red.py -q
+          .venv/bin/python -m pytest tests/integration/test_s39_fallback_groups.py -q
+      - name: Commit verified corrective files
+        if: env.applied == 'true'
+        shell: bash
+        run: |
+          git config user.name "velsync"
+          git config user.email "velsync@gmail.com"
+          git add src/jobscraper/runtime/runs.py tests/integration/test_s39_fallback_groups.py
+          git commit -m "fix(slice3): preserve pending retry/run terminal barrier"
+          git push origin HEAD:repair/s39-terminal-work-barrier
