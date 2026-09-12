@@ -144,7 +144,7 @@ def test_same_run_restart_drains_pending_details_without_refetching_listing(db, 
     original_budget = driver_module.MAX_DETAIL_REQUESTS_PER_RUN
     driver_module.MAX_DETAIL_REQUESTS_PER_RUN = 0
     try:
-        assert execute_run(db.conn, run_id) == "PARTIAL"
+        assert execute_run(db.conn, run_id) is None
     finally:
         driver_module.MAX_DETAIL_REQUESTS_PER_RUN = original_budget
 

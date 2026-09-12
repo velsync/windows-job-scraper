@@ -944,9 +944,13 @@ def test_an_open_detail_child_blocks_terminalization_until_drained(db, server):
     original = driver_module.MAX_DETAIL_REQUESTS_PER_RUN
     driver_module.MAX_DETAIL_REQUESTS_PER_RUN = 0
     try:
-        assert execute_run(db.conn, run_id) == "PARTIAL"
+        assert execute_run(db.conn, run_id) is None
     finally:
         driver_module.MAX_DETAIL_REQUESTS_PER_RUN = original
+    run = db.conn.execute(
+        "SELECT status, finished_at FROM scrape_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    assert tuple(run) == ("RUNNING", None)
 
     requests = _requests(db, run_id)
     # the children exist durably (accepted work) but were never claimed
@@ -1135,7 +1139,7 @@ def test_restart_recovery_drains_the_same_run_without_duplicates(db, server):
     original = driver_module.MAX_DETAIL_REQUESTS_PER_RUN
     driver_module.MAX_DETAIL_REQUESTS_PER_RUN = 0
     try:
-        assert execute_run(db.conn, run_id) == "PARTIAL"
+        assert execute_run(db.conn, run_id) is None
         observations = db.conn.execute(
             "SELECT COUNT(*) FROM job_observations"
         ).fetchone()[0]
