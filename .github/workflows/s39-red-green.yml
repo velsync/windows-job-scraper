@@ -17,7 +17,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Apply corrective edits deterministically
-        run: python scripts/apply_s39_terminal_work_barrier.py
+        run: |
+          python scripts/apply_s39_terminal_work_barrier.py
+          python scripts/apply_s39_terminal_work_barrier_followup.py
       - run: python -m venv .venv
       - run: .venv/bin/python -m pip install -r requirements/dev.lock.txt
       - run: .venv/bin/python -m pip install --no-deps .
@@ -25,15 +27,38 @@ jobs:
         run: |
           .venv/bin/python -m pytest tests/integration/test_s39_terminal_work_barrier_red.py -q
           .venv/bin/python -m pytest tests/integration/test_s39_fallback_groups.py -q
+          .venv/bin/python -m pytest \
+            tests/integration/test_run_driver.py::test_driver_lease_loss_stops_cleanly \
+            tests/integration/test_greenhouse_e2e.py::test_an_open_detail_child_blocks_terminalization_until_drained \
+            tests/integration/test_greenhouse_e2e.py::test_restart_recovery_drains_the_same_run_without_duplicates \
+            tests/integration/test_lever_e2e.py::test_rate_limited_site_is_partial_and_never_terminal \
+            tests/integration/test_lever_e2e.py::test_challenge_page_site_is_partial_and_keeps_evidence \
+            tests/integration/test_lever_e2e.py::test_an_open_detail_child_blocks_terminalization_until_drained \
+            tests/integration/test_lever_e2e.py::test_restart_recovery_drains_the_same_run_without_duplicates \
+            tests/integration/test_s2_5_runtime_correctives.py::test_same_run_restart_drains_pending_details_without_refetching_listing -q
       - name: Commit verified corrective files
         shell: bash
         run: |
-          if git diff --quiet -- src/jobscraper/runtime/runs.py tests/integration/test_s39_fallback_groups.py; then
+          if git diff --quiet -- \
+            src/jobscraper/runtime/runs.py \
+            src/jobscraper/pipeline/driver.py \
+            tests/integration/test_s39_fallback_groups.py \
+            tests/integration/test_run_driver.py \
+            tests/integration/test_greenhouse_e2e.py \
+            tests/integration/test_lever_e2e.py \
+            tests/integration/test_s2_5_runtime_correctives.py; then
             echo "Corrective files already applied."
             exit 0
           fi
           git config user.name "velsync"
           git config user.email "velsync@gmail.com"
-          git add src/jobscraper/runtime/runs.py tests/integration/test_s39_fallback_groups.py
-          git commit -m "fix(slice3): preserve pending retry/run terminal barrier"
+          git add \
+            src/jobscraper/runtime/runs.py \
+            src/jobscraper/pipeline/driver.py \
+            tests/integration/test_s39_fallback_groups.py \
+            tests/integration/test_run_driver.py \
+            tests/integration/test_greenhouse_e2e.py \
+            tests/integration/test_lever_e2e.py \
+            tests/integration/test_s2_5_runtime_correctives.py
+          git commit -m "fix(slice3): close S3.9 terminal-work barrier integration"
           git push origin HEAD:repair/s39-terminal-work-barrier
