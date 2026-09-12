@@ -419,3 +419,283 @@ def test_s311_v21_adds_only_evaluation_order_coordinates(tmp_path):
         assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         db.close()
+# --- S3.13 final promoted-v14 -> Slice-3 migration acceptance proof ---
+
+def test_s313_promoted_v14_migrates_to_latest_with_integrity_and_effective_pragmas(
+    tmp_path,
+):
+    """Prove promoted v14 data crosses every Slice-3 migration intact.
+
+    The fixture deliberately occupies state touched by later Slice-3 migrations:
+    a legacy cursor (v16 rebuild), a coverage/run-plan row (v18 backfill and v19
+    logical-group derivation), an ACTIVE presence (v20 availability ordering),
+    and a canonical job whose presence revision seeds v21 evaluation ordering.
+    """
+    from jobscraper.db.connection import verify_sqlite_settings
+
+    db = Database(tmp_path / "s313-from-promoted-v14.db")
+    try:
+        migrate_schema(db.conn, PROMOTED_SLICE2_SCHEMA_VERSION)
+        assert current_schema_version(db.conn) == PROMOTED_SLICE2_SCHEMA_VERSION
+
+        # Real promoted-v14 authority graph.  Keep this fixture deliberately
+        # small, but place rows in every pre-existing table that a later
+        # Slice-3 migration rebuilds or backfills.
+        db.conn.execute(
+            "INSERT INTO sources("
+            "id,display_name,source_family,entry_url,created_at,updated_at"
+            ") VALUES('s313-src','Promoted v14 source','PUBLIC_FEED',"
+            "'https://example.test/jobs',?,?)",
+            (NOW, NOW),
+        )
+        db.conn.execute(
+            "INSERT INTO adapter_definitions("
+            "adapter_id,adapter_version,adapter_api_version,manifest_json,created_at"
+            ") VALUES('s313-adapter','1.0.0','1','{}',?)",
+            (NOW,),
+        )
+        db.conn.execute(
+            "INSERT INTO adapter_permission_profiles(id,display_name,created_at) "
+            "VALUES('s313-perm','Promoted v14 permission',?)",
+            (NOW,),
+        )
+        db.conn.execute(
+            "INSERT INTO adapter_permission_profile_revisions("
+            "id,permission_profile_id,revision,policy_json,created_at"
+            ") VALUES('s313-permrev','s313-perm',1,'{}',?)",
+            (NOW,),
+        )
+        db.conn.execute(
+            "INSERT INTO source_adapter_bindings("
+            "id,source_id,display_name,created_at"
+            ") VALUES('s313-bnd','s313-src','Promoted v14 binding',?)",
+            (NOW,),
+        )
+        db.conn.execute(
+            "INSERT INTO source_adapter_binding_revisions("
+            "id,binding_id,revision,adapter_id,adapter_version,strategy,"
+            "execution_class,permission_profile_id,permission_profile_revision,"
+            "config_json,created_at"
+            ") VALUES('s313-bndrev','s313-bnd',1,'s313-adapter','1.0.0',"
+            "'FEED_OR_PUBLIC_STRUCTURED_ENDPOINT','HTTP','s313-perm',1,'{}',?)",
+            (NOW,),
+        )
+        db.conn.execute(
+            "INSERT INTO scrape_runs(id,status,created_at,started_at,finished_at) "
+            "VALUES('s313-run','SUCCEEDED',?,?,?)",
+            (NOW, NOW, NOW),
+        )
+        db.conn.execute(
+            "INSERT INTO run_source_plans("
+            "id,run_id,source_id,source_plan_group_id,fallback_rank,binding_id,"
+            "binding_revision_id,adapter_id,adapter_version,adapter_api_version,"
+            "strategy,execution_class,cursor_schema_version,"
+            "crawl_policy_snapshot_json,rate_policy_snapshot_json,"
+            "permission_profile_id,permission_profile_revision,group_outcome,created_at"
+            ") VALUES('s313-plan','s313-run','s313-src','s313-group',0,'s313-bnd',"
+            "'s313-bndrev','s313-adapter','1.0.0','1',"
+            "'FEED_OR_PUBLIC_STRUCTURED_ENDPOINT','HTTP',1,'{}','{}',"
+            "'s313-perm',1,'SATISFIED',?)",
+            (NOW,),
+        )
+
+        # Pre-v18 coverage intentionally omits the denormalized group/revision
+        # pointers so the v18 migration must derive them from the immutable plan.
+        db.conn.execute(
+            "INSERT INTO enumeration_coverage("
+            "id,run_source_plan_id,source_plan_group_id,source_id,binding_id,"
+            "binding_revision_id,scope_key,generation_key,started_at,finished_at,"
+            "completion_state,coverage_authority,pages_completed,items_observed,"
+            "cursor_terminal,terminal_enumeration_proven,absence_inference_allowed,"
+            "finalized_at,applied_at,created_at"
+            ") VALUES('s313-cov','s313-plan',NULL,'s313-src','s313-bnd',NULL,"
+            "'FULL_SOURCE','legacy-generation',?,?,"
+            "'COMPLETE','AUTHORITATIVE_FULL_SOURCE',1,1,1,1,1,?,?,?)",
+            (NOW, NOW, NOW, NOW, NOW),
+        )
+
+        # v16 rebuilds this legacy cursor.  Its opaque state must survive while
+        # new provenance/guard fields are introduced conservatively.
+        db.conn.execute(
+            "INSERT INTO crawl_cursors("
+            "id,source_id,binding_id,adapter_id,adapter_version,"
+            "cursor_schema_version,state_json,checkpoint_at"
+            ") VALUES('s313-cursor','s313-src','s313-bnd','s313-adapter',"
+            "'1.0.0',1,?,?)",
+            ('{"page":4}', NOW),
+        )
+
+        db.conn.execute(
+            "INSERT INTO companies("
+            "id,name,normalized_name,domain,careers_url,ats_provider,ats_board,"
+            "first_seen_at,created_at,updated_at"
+            ") VALUES('s313-co','Promoted Co','promoted co','example.test',"
+            "'https://example.test/jobs','custom','board',?,?,?)",
+            (NOW, NOW, NOW),
+        )
+        db.conn.execute(
+            "INSERT INTO jobs("
+            "id,company_id,title,normalized_title,description_md,description_text,"
+            "discovered_at,first_seen_at,last_seen_at,listing_status,created_at,updated_at"
+            ") VALUES('s313-job','s313-co','Promoted Engineer','promoted engineer',"
+            "'# Promoted Engineer','Promoted Engineer',?,?,?,'ACTIVE',?,?)",
+            (NOW, NOW, NOW, NOW, NOW),
+        )
+        db.conn.execute(
+            "INSERT INTO job_sources("
+            "id,job_id,source_id,binding_id,source_job_id,discovery_url,raw_source_url,"
+            "first_seen_at,last_seen_at,presence_state,content_revision,"
+            "last_observation_id,source_rank,created_at,updated_at"
+            ") VALUES('s313-js','s313-job','s313-src','s313-bnd','native-1',"
+            "'https://example.test/jobs','https://example.test/jobs/native-1',"
+            "?,?,'ACTIVE',7,NULL,0,?,?)",
+            (NOW, NOW, NOW, NOW),
+        )
+        db.conn.execute(
+            "INSERT INTO events(at,level,kind,message) "
+            "VALUES(?,'INFO','S313_V14_FIXTURE','preserve across Slice 3')",
+            (NOW,),
+        )
+        db.conn.commit()
+
+        # Capture promoted values before migration so preservation is checked on
+        # content, not merely on row counts/schema_version.
+        cursor_before = tuple(
+            db.conn.execute(
+                "SELECT source_id,binding_id,adapter_id,adapter_version,"
+                "cursor_schema_version,state_json,checkpoint_at "
+                "FROM crawl_cursors WHERE id='s313-cursor'"
+            ).fetchone()
+        )
+        presence_before = tuple(
+            db.conn.execute(
+                "SELECT job_id,source_id,binding_id,source_job_id,presence_state,"
+                "content_revision,last_seen_at,created_at,updated_at "
+                "FROM job_sources WHERE id='s313-js'"
+            ).fetchone()
+        )
+
+        backup_kinds: list[str] = []
+
+        def create_backup(*, kind: str):
+            backup_kinds.append(kind)
+            path = tmp_path / "s313-pre-migration-backup"
+            path.mkdir(exist_ok=True)
+            return path
+
+        report = migrate_database_with_backup(
+            db,
+            create_backup=create_backup,
+            target_version=LATEST_SCHEMA_VERSION,
+        )
+
+        assert backup_kinds == ["PRE_MIGRATION"]
+        assert report["ok"] is True
+        assert report["pre_checks"]["ok"] is True
+        assert report["checks"]["ok"] is True
+        assert report["checks"]["integrity_check"] == "ok"
+        assert report["checks"]["foreign_key_check"] == 0
+        assert report["applied"] == list(
+            range(
+                PROMOTED_SLICE2_SCHEMA_VERSION + 1,
+                LATEST_SCHEMA_VERSION + 1,
+            )
+        )
+        assert current_schema_version(db.conn) == LATEST_SCHEMA_VERSION
+        assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION
+
+        # v16: legacy cursor payload survives; new provenance remains unknown
+        # rather than being guessed during migration.
+        cursor = db.conn.execute(
+            "SELECT source_id,binding_id,adapter_id,adapter_version,"
+            "cursor_schema_version,state_json,checkpoint_at,binding_revision_id,"
+            "guard_state_json,checkpoint_run_source_plan_id "
+            "FROM crawl_cursors WHERE id='s313-cursor'"
+        ).fetchone()
+        assert tuple(cursor[:7]) == cursor_before
+        assert cursor["binding_revision_id"] is None
+        assert cursor["guard_state_json"] == "{}"
+        assert cursor["checkpoint_run_source_plan_id"] is None
+
+        # v18: denormalized coverage identity comes only from its immutable
+        # RunSourcePlan and the historical COMPLETE result remains complete.
+        coverage = db.conn.execute(
+            "SELECT source_plan_group_id,source_id,binding_id,binding_revision_id,"
+            "generation_order_key,listing_identity_sufficient,completion_state,"
+            "coverage_authority,finalized_at "
+            "FROM enumeration_coverage WHERE id='s313-cov'"
+        ).fetchone()
+        assert tuple(coverage[:4]) == (
+            "s313-group",
+            "s313-src",
+            "s313-bnd",
+            "s313-bndrev",
+        )
+        assert coverage["generation_order_key"] == f"{NOW}|s313-cov"
+        assert coverage["listing_identity_sufficient"] == 0
+        assert coverage["completion_state"] == "COMPLETE"
+        assert coverage["coverage_authority"] == "AUTHORITATIVE_FULL_SOURCE"
+        assert coverage["finalized_at"] == NOW
+
+        # v19: pre-existing plan truth is deterministically materialized into
+        # the new logical fallback-group owner.
+        group = db.conn.execute(
+            "SELECT active_fallback_rank,group_outcome "
+            "FROM source_plan_group_state "
+            "WHERE run_id='s313-run' AND source_plan_group_id='s313-group'"
+        ).fetchone()
+        assert tuple(group) == (0, "SATISFIED")
+
+        # v20: historical ACTIVE presence remains ACTIVE and receives a
+        # comparable legacy evidence coordinate without losing old columns.
+        presence = db.conn.execute(
+            "SELECT job_id,source_id,binding_id,source_job_id,presence_state,"
+            "content_revision,last_seen_at,created_at,updated_at,"
+            "availability_effective_at,availability_received_at,"
+            "availability_evidence_kind,availability_evidence_ref,"
+            "availability_revision FROM job_sources WHERE id='s313-js'"
+        ).fetchone()
+        assert tuple(presence[:9]) == presence_before
+        assert presence["availability_effective_at"] == NOW
+        assert presence["availability_received_at"] == NOW
+        assert presence["availability_evidence_kind"] == "LEGACY_ACTIVE"
+        assert presence["availability_evidence_ref"] is None
+        assert presence["availability_revision"] == 1
+
+        # v21: canonical evaluation ordering starts at the maximum historical
+        # per-presence content revision, not an arbitrary reset to one.
+        job = db.conn.execute(
+            "SELECT title,normalized_title,listing_status,evaluation_revision "
+            "FROM jobs WHERE id='s313-job'"
+        ).fetchone()
+        assert tuple(job[:3]) == (
+            "Promoted Engineer",
+            "promoted engineer",
+            "ACTIVE",
+        )
+        assert job["evaluation_revision"] == 7
+
+        event = db.conn.execute(
+            "SELECT message FROM events WHERE kind='S313_V14_FIXTURE'"
+        ).fetchone()
+        assert event[0] == "preserve across Slice 3"
+
+        # Re-check effective settings on the live migrated connection.  The
+        # production migration report's pre/post `ok` flags also include its
+        # application-consistency checks.
+        settings = verify_sqlite_settings(db.conn)
+        assert settings.foreign_keys == 1
+        assert settings.journal_mode == "WAL"
+        assert settings.synchronous == 2
+        assert settings.busy_timeout_ms > 0
+        assert db.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+        # S3.13 re-proves the immutable promoted migration bytes at the final
+        # boundary rather than trusting an earlier package's report.
+        for version, pinned in PROMOTED_STEP_SHA256.items():
+            assert _digest(_step(version)[1]) == pinned
+    finally:
+        db.close()
+
+# --- end S3.13 final promoted-v14 -> Slice-3 migration acceptance proof ---
