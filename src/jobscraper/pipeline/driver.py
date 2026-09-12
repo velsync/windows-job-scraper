@@ -2097,10 +2097,11 @@ def _execute_plan(
                 signal["value"] = "TERMINAL" if is_enumeration else "JOBS"
                 return
             if task_kind is AdapterTaskKind.DETAIL and classification.state in _CLOSURE_CLASSES:
-                # ACQ-02: a typed closure/missing outcome is durable evidence
-                # that this identity is gone at the provider.  It is *not* a
-                # failure, *not* an observation, and *not* absence authority
-                # for any other identity.
+                # ACQ-02 + S3.10: typed DETAIL close/missing is durable direct
+                # evidence for this exact target.  It is never blanket absence
+                # authority.  Only an unambiguous trusted employer/ATS presence may
+                # advance to CLOSED; unresolved/weak evidence remains review evidence
+                # without mutating availability.
                 _record_evidence(
                     cursor_conn,
                     request_id=claim.request_id,
@@ -2119,8 +2120,25 @@ def _execute_plan(
                     content_hash=result.normalized_content_hash,
                     now=ts,
                 )
+                from jobscraper.pipeline.availability import apply_trusted_detail_closure
+                from jobscraper.pipeline.obligations import reconcile_job
+
+                closure = apply_trusted_detail_closure(
+                    cursor_conn,
+                    source_id=str(plan_row["source_id"]),
+                    target_reference=target_reference,
+                    effective_at=ts,
+                    received_at=ts,
+                    evidence_ref=(
+                        f"request:{claim.request_id}:closure:"
+                        f"{classification.state.value}"
+                    ),
+                )
+                if closure is not None and closure.accepted:
+                    reconcile_job(cursor_conn, closure.job_id, now=ts)
                 signal["value"] = "CLOSURE"
                 return
+
             signal["value"] = "INVALID"
 
         commit_status = _commit_fenced(

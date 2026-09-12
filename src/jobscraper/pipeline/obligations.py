@@ -33,50 +33,80 @@ from jobscraper.runtime.fence import fenced_commit
 
 OBLIGATION_TYPES = frozenset({"RECONCILE", "ELIGIBILITY", "SCORE"})
 
-_LISTING_PRECEDENCE = ("CLOSED", "EXPIRED", "WITHDRAWN", "UNCERTAIN", "ACTIVE", "UNKNOWN")
-
-
 def reconcile_job(conn: sqlite3.Connection, job_id: str, *, now: str) -> str:
-    """Derive jobs.listing_status from current presence evidence (RUN-14)."""
+    """Derive ``jobs.listing_status`` under RUN-14/RUN-14A.
+
+    Source-presence state remains fully inspectable.  The canonical projection
+    is conservative and source-quality aware: a weak aggregator disappearance
+    cannot close a job that current trusted employer/ATS evidence still says is
+    active, while temporally newer explicit trusted closure may defeat older
+    trusted active evidence.
+    """
+
+    from jobscraper.ids import new_id
+    from jobscraper.pipeline.availability import resolve_canonical_availability
+
     prior = conn.execute(
         "SELECT listing_status FROM jobs WHERE id = ?", (job_id,)
     ).fetchone()
     prior_status = prior["listing_status"] if prior else "UNKNOWN"
-    states = [
-        row["presence_state"]
-        for row in conn.execute(
-            "SELECT presence_state FROM job_sources WHERE job_id = ?", (job_id,)
-        )
-    ]
-    if not states:
+
+    resolution = resolve_canonical_availability(conn, job_id)
+    derived = resolution.status
+    # The physical jobs CHECK has no UNKNOWN.  A canonical job is expected to
+    # have at least one presence; if a damaged/legacy row violates that
+    # invariant, leave durable state unchanged and surface UNKNOWN to caller.
+    if derived == "UNKNOWN":
         return "UNKNOWN"
-    if "ACTIVE" in states:
-        derived = "ACTIVE"
-    else:
-        derived = next(
-            (state for state in _LISTING_PRECEDENCE if state in states), "UNKNOWN"
-        )
+
+    if prior is None:
+        return derived
+
+    if derived == prior_status:
+        return derived
+
     conn.execute(
-        "UPDATE jobs SET listing_status = ?, updated_at = ? WHERE id = ?",
-        (derived, now, job_id),
+        """
+        UPDATE jobs
+           SET listing_status = ?, last_changed_at = ?, updated_at = ?
+         WHERE id = ?
+        """,
+        (derived, now, now, job_id),
     )
-    if derived == "CLOSED":
+
+    detail = json.dumps(
+        {
+            "availability_presence_id": resolution.presence_id,
+            "availability_source_id": resolution.source_id,
+            "availability_evidence_kind": resolution.evidence_kind,
+            "conflict": resolution.conflict,
+        },
+        sort_keys=True,
+    )
+
+    if derived == "CLOSED" and prior_status != "CLOSED":
+        history_id = new_id("jh")
+        conn.execute(
+            """
+            INSERT INTO job_history (
+                id, job_id, at, change_class, detail_json, evidence_ref)
+            VALUES (?, ?, ?, 'JOB_CLOSED', ?, ?)
+            """,
+            (history_id, job_id, now, detail, resolution.evidence_ref),
+        )
         from jobscraper.applications.core import record_listing_closed_if_applicable
 
         record_listing_closed_if_applicable(conn, job_id, now=now, commit=False)
-    if (
-        derived == "ACTIVE"
-        and prior_status in ("CLOSED", "EXPIRED", "WITHDRAWN")
-    ):
-        # a trusted active sighting superseded older closure evidence
-        # (RUN-14A): record the reopen and surface it per profile.
-        from jobscraper.ids import new_id
 
+    if derived == "ACTIVE" and prior_status in ("CLOSED", "EXPIRED", "WITHDRAWN"):
         history_id = new_id("jh")
         conn.execute(
-            "INSERT INTO job_history (id, job_id, at, change_class, detail_json)"
-            " VALUES (?, ?, ?, 'JOB_REOPENED', '{}')",
-            (history_id, job_id, now),
+            """
+            INSERT INTO job_history (
+                id, job_id, at, change_class, detail_json, evidence_ref)
+            VALUES (?, ?, ?, 'JOB_REOPENED', ?, ?)
+            """,
+            (history_id, job_id, now, detail, resolution.evidence_ref),
         )
         for profile_row in list_profiles(conn):
             maybe_emit_inbox_event(
@@ -89,7 +119,6 @@ def reconcile_job(conn: sqlite3.Connection, job_id: str, *, now: str) -> str:
                 commit=False,
             )
     return derived
-
 
 def _evaluate_for_profiles(conn: sqlite3.Connection, job_id: str, *, now: str) -> None:
     job = conn.execute(

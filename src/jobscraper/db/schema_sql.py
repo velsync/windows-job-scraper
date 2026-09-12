@@ -1684,6 +1684,252 @@ UPDATE run_source_plans
     return sql
 
 
+# ------------------------ v20 S3.10 evidence-ordered presence availability
+# v1-v19 are released/frozen. S3.10 appends the durable current-evidence
+# coordinates needed by RUN-14A/RUN-21; observations/coverage remain immutable.
+@_step(20, "s3_10_presence_availability_order")
+def _(sql: str = '''
+-- S3.10 evidence-ordered per-source availability projection.
+-- v1-v19 are released/frozen; append only.
+
+ALTER TABLE job_sources
+    ADD COLUMN availability_effective_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE job_sources
+    ADD COLUMN availability_received_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE job_sources
+    ADD COLUMN availability_evidence_kind TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN';
+ALTER TABLE job_sources
+    ADD COLUMN availability_evidence_ref TEXT;
+ALTER TABLE job_sources
+    ADD COLUMN availability_revision INTEGER NOT NULL DEFAULT 0
+    CHECK (availability_revision >= 0);
+
+-- Backfill a comparable current-evidence coordinate without rewriting the
+-- historical presence state in a schema migration.  S3.8 absence rows carry
+-- their authority pointer; S3.7 may have advanced last_verified_at later via
+-- retained 304 membership without repairing the old state.  In that case the
+-- v20 evidence order records the later positive verification as current, while
+-- S3.12 recovery remains the owner of any one-time legacy projection repair.
+UPDATE job_sources
+   SET availability_effective_at = CASE
+           WHEN presence_state IN ('UNCERTAIN', 'EXPIRED') THEN
+               CASE
+                   WHEN last_absence_coverage_id IS NOT NULL
+                        AND COALESCE(
+                            (SELECT cpa.applied_at
+                               FROM coverage_presence_application cpa
+                              WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                                AND cpa.job_source_id = job_sources.id
+                              ORDER BY cpa.applied_at DESC
+                              LIMIT 1),
+                            (SELECT ec.applied_at
+                               FROM enumeration_coverage ec
+                              WHERE ec.id = job_sources.last_absence_coverage_id),
+                            ''
+                        ) <> ''
+                        AND CASE
+                            WHEN COALESCE(last_verified_at, '') > COALESCE(last_seen_at, '')
+                            THEN COALESCE(last_verified_at, '')
+                            ELSE COALESCE(last_seen_at, '')
+                        END > COALESCE(
+                            (SELECT cpa.applied_at
+                               FROM coverage_presence_application cpa
+                              WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                                AND cpa.job_source_id = job_sources.id
+                              ORDER BY cpa.applied_at DESC
+                              LIMIT 1),
+                            (SELECT ec.applied_at
+                               FROM enumeration_coverage ec
+                              WHERE ec.id = job_sources.last_absence_coverage_id),
+                            ''
+                        )
+                   THEN CASE
+                            WHEN COALESCE(last_verified_at, '') > COALESCE(last_seen_at, '')
+                            THEN COALESCE(last_verified_at, '')
+                            ELSE COALESCE(last_seen_at, '')
+                        END
+                   ELSE COALESCE(
+                       (SELECT COALESCE(ec.started_at, ec.created_at)
+                          FROM enumeration_coverage ec
+                         WHERE ec.id = job_sources.last_absence_coverage_id),
+                       NULLIF(last_changed_at, ''),
+                       NULLIF(updated_at, ''),
+                       NULLIF(last_verified_at, ''),
+                       NULLIF(last_seen_at, ''),
+                       NULLIF(created_at, ''),
+                       ''
+                   )
+               END
+           WHEN presence_state IN ('CLOSED', 'WITHDRAWN') THEN COALESCE(
+               NULLIF(last_changed_at, ''),
+               NULLIF(updated_at, ''),
+               NULLIF(last_verified_at, ''),
+               NULLIF(last_seen_at, ''),
+               NULLIF(created_at, ''),
+               ''
+           )
+           ELSE COALESCE(
+               CASE
+                   WHEN COALESCE(last_verified_at, '') > COALESCE(last_seen_at, '')
+                   THEN NULLIF(last_verified_at, '')
+                   ELSE NULLIF(last_seen_at, '')
+               END,
+               NULLIF(updated_at, ''),
+               NULLIF(created_at, ''),
+               ''
+           )
+       END,
+       availability_received_at = CASE
+           WHEN presence_state IN ('UNCERTAIN', 'EXPIRED')
+                AND last_absence_coverage_id IS NOT NULL
+                AND COALESCE(
+                        (SELECT cpa.applied_at
+                           FROM coverage_presence_application cpa
+                          WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                            AND cpa.job_source_id = job_sources.id
+                          ORDER BY cpa.applied_at DESC
+                          LIMIT 1),
+                        (SELECT ec.applied_at
+                           FROM enumeration_coverage ec
+                          WHERE ec.id = job_sources.last_absence_coverage_id),
+                        ''
+                    ) <> ''
+                AND CASE
+                        WHEN COALESCE(last_verified_at, '') > COALESCE(last_seen_at, '')
+                        THEN COALESCE(last_verified_at, '')
+                        ELSE COALESCE(last_seen_at, '')
+                    END > COALESCE(
+                        (SELECT cpa.applied_at
+                           FROM coverage_presence_application cpa
+                          WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                            AND cpa.job_source_id = job_sources.id
+                          ORDER BY cpa.applied_at DESC
+                          LIMIT 1),
+                        (SELECT ec.applied_at
+                           FROM enumeration_coverage ec
+                          WHERE ec.id = job_sources.last_absence_coverage_id),
+                        ''
+                    )
+           THEN COALESCE(
+               NULLIF(updated_at, ''),
+               NULLIF(last_verified_at, ''),
+               NULLIF(last_seen_at, ''),
+               NULLIF(created_at, ''),
+               ''
+           )
+           WHEN presence_state IN ('UNCERTAIN', 'EXPIRED') THEN COALESCE(
+               (SELECT cpa.applied_at
+                  FROM coverage_presence_application cpa
+                 WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                   AND cpa.job_source_id = job_sources.id
+                 ORDER BY cpa.applied_at DESC
+                 LIMIT 1),
+               (SELECT ec.applied_at
+                  FROM enumeration_coverage ec
+                 WHERE ec.id = job_sources.last_absence_coverage_id),
+               NULLIF(updated_at, ''),
+               NULLIF(created_at, ''),
+               ''
+           )
+           ELSE COALESCE(
+               NULLIF(updated_at, ''),
+               NULLIF(last_changed_at, ''),
+               NULLIF(created_at, ''),
+               ''
+           )
+       END,
+       availability_evidence_kind = CASE
+           WHEN presence_state IN ('UNCERTAIN', 'EXPIRED')
+                AND last_absence_coverage_id IS NOT NULL
+                AND COALESCE(
+                        (SELECT cpa.applied_at
+                           FROM coverage_presence_application cpa
+                          WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                            AND cpa.job_source_id = job_sources.id
+                          ORDER BY cpa.applied_at DESC
+                          LIMIT 1),
+                        (SELECT ec.applied_at
+                           FROM enumeration_coverage ec
+                          WHERE ec.id = job_sources.last_absence_coverage_id),
+                        ''
+                    ) <> ''
+                AND CASE
+                        WHEN COALESCE(last_verified_at, '') > COALESCE(last_seen_at, '')
+                        THEN COALESCE(last_verified_at, '')
+                        ELSE COALESCE(last_seen_at, '')
+                    END > COALESCE(
+                        (SELECT cpa.applied_at
+                           FROM coverage_presence_application cpa
+                          WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                            AND cpa.job_source_id = job_sources.id
+                          ORDER BY cpa.applied_at DESC
+                          LIMIT 1),
+                        (SELECT ec.applied_at
+                           FROM enumeration_coverage ec
+                          WHERE ec.id = job_sources.last_absence_coverage_id),
+                        ''
+                    )
+               THEN 'LEGACY_ACTIVE'
+           WHEN presence_state = 'ACTIVE' THEN 'LEGACY_ACTIVE'
+           WHEN presence_state IN ('UNCERTAIN', 'EXPIRED') THEN 'LEGACY_ABSENCE'
+           WHEN presence_state IN ('CLOSED', 'WITHDRAWN') THEN 'LEGACY_CLOSE'
+           ELSE 'LEGACY_UNKNOWN'
+       END,
+       availability_evidence_ref = CASE
+           -- A legacy positive verification newer than absence may have come
+           -- from S3.7 retained 304 membership rather than a new observation.
+           -- Do not attach an old observation id to a newer effective time.
+           WHEN presence_state IN ('UNCERTAIN', 'EXPIRED')
+                AND last_absence_coverage_id IS NOT NULL
+                AND COALESCE(
+                        (SELECT cpa.applied_at
+                           FROM coverage_presence_application cpa
+                          WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                            AND cpa.job_source_id = job_sources.id
+                          ORDER BY cpa.applied_at DESC
+                          LIMIT 1),
+                        (SELECT ec.applied_at
+                           FROM enumeration_coverage ec
+                          WHERE ec.id = job_sources.last_absence_coverage_id),
+                        ''
+                    ) <> ''
+                AND CASE
+                        WHEN COALESCE(last_verified_at, '') > COALESCE(last_seen_at, '')
+                        THEN COALESCE(last_verified_at, '')
+                        ELSE COALESCE(last_seen_at, '')
+                    END > COALESCE(
+                        (SELECT cpa.applied_at
+                           FROM coverage_presence_application cpa
+                          WHERE cpa.coverage_id = job_sources.last_absence_coverage_id
+                            AND cpa.job_source_id = job_sources.id
+                          ORDER BY cpa.applied_at DESC
+                          LIMIT 1),
+                        (SELECT ec.applied_at
+                           FROM enumeration_coverage ec
+                          WHERE ec.id = job_sources.last_absence_coverage_id),
+                        ''
+                    )
+               THEN NULL
+           WHEN presence_state IN ('UNCERTAIN', 'EXPIRED')
+               THEN last_absence_coverage_id
+           WHEN presence_state IN ('CLOSED', 'WITHDRAWN')
+               THEN NULL
+           WHEN presence_state = 'ACTIVE' THEN last_observation_id
+           ELSE NULL
+       END,
+       availability_revision = 1;
+
+CREATE INDEX idx_job_sources_availability_order
+    ON job_sources(
+        job_id,
+        availability_effective_at,
+        availability_received_at,
+        availability_revision
+    );
+'''
+) -> None:
+    return sql
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1698,6 +1944,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10, 16})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 19, (
-    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18; S3.9 appends v19"
+assert LATEST_SCHEMA_VERSION == 20, (
+    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18; S3.9 appends v19; S3.10 appends v20"
 )

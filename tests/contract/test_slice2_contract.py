@@ -271,6 +271,10 @@ def test_registry_has_no_dynamic_import_path():
 # exclusively to the verification-timestamp columns (monotonic CASE-guarded)
 # and the module never INSERTs into or DELETEs from job_sources.
 _VERIFICATION_TIMESTAMP_ONLY_COLUMNS = frozenset({"last_verified_at", "updated_at"})
+# Schema migrations execute under the migration gate, not as an independent
+# runtime writer. They may backfill newly-added projection columns. The exact
+# v20 backfill target set is separately pinned in test_schema_slice3.py.
+_SCHEMA_MIGRATION_OWNER = "src/jobscraper/db/schema_sql.py"
 
 
 def _job_sources_writes_are_verification_timestamp_only(text: str) -> bool:
@@ -314,6 +318,8 @@ def test_only_pipeline_writes_canonical_and_observation_state(table: str):
             writers.append(path.relative_to(REPO_ROOT).as_posix())
     for w in writers:
         if w.startswith("src/jobscraper/pipeline/"):
+            continue
+        if table == "job_sources" and w == _SCHEMA_MIGRATION_OWNER:
             continue
         assert table == "job_sources" and _job_sources_writes_are_verification_timestamp_only(
             (REPO_ROOT / w).read_text(encoding="utf-8")

@@ -467,10 +467,14 @@ def _upsert_presence(
     strategy: str | None = None,
     same_host_as_source: bool | None = None,
     source_family: str | None = None,
-) -> str:
+) -> tuple[str, bool]:
+    from jobscraper.pipeline.availability import (
+        ACTIVE_OBSERVATION,
+        apply_presence_evidence,
+    )
+
     if existing is None:
         presence_id = new_id("js")
-        updated = True
         conn.execute(
             """
             INSERT INTO job_sources (
@@ -503,19 +507,53 @@ def _upsert_presence(
                 observed_at,
                 observation_id,
                 *_origin_fields(origin, resolved_at=observed_at),
-                *_quality_fields(origin, content_kind=content_kind, strategy=strategy,
-                                 same_host_as_source=same_host_as_source,
-                                 source_family=source_family),
+                *_quality_fields(
+                    origin,
+                    content_kind=content_kind,
+                    strategy=strategy,
+                    same_host_as_source=same_host_as_source,
+                    source_family=source_family,
+                ),
                 now,
                 now,
             ),
         )
-        return presence_id, updated
+        # v20 current-evidence coordinates are written only after entity
+        # resolution has established the canonical job/presence identity.
+        conn.execute(
+            """
+            UPDATE job_sources
+               SET availability_effective_at = ?,
+                   availability_received_at = ?,
+                   availability_evidence_kind = ?,
+                   availability_evidence_ref = ?,
+                   availability_revision = 1
+             WHERE id = ?
+            """,
+            (
+                observed_at,
+                now,
+                ACTIVE_OBSERVATION,
+                f"observation:{observation_id}",
+                presence_id,
+            ),
+        )
+        return presence_id, True
 
-    # RUN-21: an older observation processed late must not regress the
-    # presence projection.
-    if observed_at < (existing["last_seen_at"] or ""):
-        return existing["id"], False
+    # RUN-14A/RUN-21: make the availability comparator the single freshness
+    # gate for mutable per-source projection.  An old worker may still append
+    # its immutable JobObservation, but it cannot rewrite current presence or
+    # canonical presentation merely because it finished later.
+    evidence = apply_presence_evidence(
+        conn,
+        presence_id=str(existing["id"]),
+        evidence_kind=ACTIVE_OBSERVATION,
+        effective_at=observed_at,
+        received_at=now,
+        evidence_ref=f"observation:{observation_id}",
+    )
+    if not evidence.accepted:
+        return str(existing["id"]), False
 
     previous_hash = None
     if existing["last_observation_id"]:
@@ -526,7 +564,9 @@ def _upsert_presence(
         previous_hash = row["parse_evidence_ref"] if row else None
     content_changed = previous_hash != normalized.content_hash
 
-    if (observation.application_url_candidate or None) != (existing["application_url"] or None):
+    if (observation.application_url_candidate or None) != (
+        existing["application_url"] or None
+    ):
         record_change(conn, job_id, "APPLY_URL_CHANGED", now)
 
     conn.execute(
@@ -546,8 +586,6 @@ def _upsert_presence(
             application_url = COALESCE(?, application_url),
             content_revision = CASE WHEN ? THEN content_revision + 1
                                     ELSE content_revision END,
-            presence_state = CASE WHEN presence_state IN ('UNCERTAIN', 'UNKNOWN')
-                                  THEN 'ACTIVE' ELSE presence_state END,
             last_observation_id = ?, updated_at = ?
         WHERE id = ?
         """,
@@ -556,9 +594,13 @@ def _upsert_presence(
             observed_at,
             observed_at,
             *_origin_fields(origin, resolved_at=observed_at),
-            *_quality_fields(origin, content_kind=content_kind, strategy=strategy,
-                             same_host_as_source=same_host_as_source,
-                             source_family=source_family),
+            *_quality_fields(
+                origin,
+                content_kind=content_kind,
+                strategy=strategy,
+                same_host_as_source=same_host_as_source,
+                source_family=source_family,
+            ),
             observation.canonical_url_candidate,
             observation.application_url_candidate,
             content_changed,
@@ -567,8 +609,7 @@ def _upsert_presence(
             existing["id"],
         ),
     )
-    return existing["id"], True
-
+    return str(existing["id"]), True
 
 def _quality_fields(
     origin,

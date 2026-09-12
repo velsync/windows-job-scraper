@@ -466,6 +466,63 @@ def test_reverse_completion_of_older_absence_cannot_intensify_newer_absence(db):
     assert decision == "SKIPPED_NEWER_ABSENCE"
 
 
+def test_terminal_presence_newer_absence_is_not_mislabeled_as_newer_presence(db):
+    # S3.10 absence advances last_verified_at even when CLOSED is preserved.
+    # A still-older coverage generation must therefore be attributed to the
+    # newer absence, not mistaken for newer positive presence merely because
+    # the terminal semantic evidence kind remains the original close marker.
+    from jobscraper.pipeline.availability import (
+        EXPLICIT_TRUSTED_CLOSE,
+        apply_presence_evidence,
+    )
+
+    _presence(db.conn, "B", now=T0)
+    db.conn.execute(
+        "UPDATE job_sources SET source_quality_class='EMPLOYER_CAREERS_PAGE' "
+        "WHERE id='js-B'"
+    )
+    db.conn.commit()
+
+    run0, plan0 = _plan(db.conn, "terminal-baseline", now=T0)
+    base = _coverage(db.conn, plan0, scope="full-source", generation="base", now=T0)
+    _successful_contributor(db.conn, base, run0, plan0, "terminal-base", now=T0)
+    record_seen_identity(db.conn, base, "B", now=T0)
+    _finalize_complete(db.conn, base, now=T0)
+
+    close = apply_presence_evidence(
+        db.conn,
+        presence_id="js-B",
+        evidence_kind=EXPLICIT_TRUSTED_CLOSE,
+        effective_at=T1,
+        received_at=T1,
+        evidence_ref="detail:terminal-close",
+    )
+    assert close.accepted and close.new_state == "CLOSED"
+
+    run_old, plan_old = _plan(db.conn, "terminal-old", now=T2)
+    old = _coverage(db.conn, plan_old, scope="full-source", generation="old", now=T2)
+    _successful_contributor(db.conn, old, run_old, plan_old, "terminal-old", now=T2)
+
+    run_new, plan_new = _plan(db.conn, "terminal-new", now=T3)
+    new = _coverage(db.conn, plan_new, scope="full-source", generation="new", now=T3)
+    _successful_contributor(db.conn, new, run_new, plan_new, "terminal-new", now=T3)
+
+    _finalize_complete(db.conn, new, now=T4)
+    row = db.conn.execute(
+        "SELECT presence_state,availability_evidence_kind,last_verified_at "
+        "FROM job_sources WHERE id='js-B'"
+    ).fetchone()
+    assert tuple(row) == ("CLOSED", EXPLICIT_TRUSTED_CLOSE, T3)
+
+    _finalize_complete(db.conn, old, now=T4)
+    decision = db.conn.execute(
+        "SELECT decision FROM coverage_presence_application "
+        "WHERE coverage_id=? AND job_source_id='js-B'",
+        (old,),
+    ).fetchone()[0]
+    assert decision == "SKIPPED_NEWER_ABSENCE"
+
+
 def test_reverse_completion_of_old_missing_generation_cannot_regress_newer_presence(db):
     _presence(db.conn, "B", now=T0)
     run0, plan0 = _plan(db.conn, "baseline-active", now=T0)

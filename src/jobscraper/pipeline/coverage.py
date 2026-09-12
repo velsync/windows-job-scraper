@@ -761,10 +761,19 @@ def _apply_absence(
 ) -> None:
     """Apply one COMPLETE authoritative generation to explicit same-scope members.
 
-    One missing generation yields UNCERTAIN; a later same-scope authoritative
-    miss may yield EXPIRED. An older generation that finishes later is recorded
-    as skipped and cannot intensify or regress newer presence/absence state.
+    S3.8 remains the absence-authority owner; S3.10 supplies the one comparable
+    per-presence evidence order.  Coverage generation time is the effective
+    source time and ``now`` is local receipt/application time, so an old
+    generation finishing late cannot overwrite newer accepted evidence.
     """
+
+    from jobscraper.pipeline.availability import (
+        AUTHORITATIVE_ABSENCE,
+        LEGACY_ABSENCE,
+        apply_presence_evidence,
+    )
+    from jobscraper.pipeline.obligations import reconcile_job
+
     seen = {
         (str(r["stable_source_identity"]), int(r["source_identity_generation"]))
         for r in conn.execute(
@@ -776,11 +785,13 @@ def _apply_absence(
         )
     }
     current_order = _order_key(coverage)
+    effective_at = str(coverage["started_at"] or coverage["created_at"] or now)
     members = conn.execute(
         """
-        SELECT m.*, js.source_id, js.source_job_id, js.source_identity_generation,
-               js.presence_state, js.last_seen_at, js.last_verified_at,
-               js.last_absence_coverage_id
+        SELECT m.*, js.job_id, js.source_id, js.source_job_id,
+               js.source_identity_generation, js.presence_state,
+               js.last_seen_at, js.last_verified_at,
+               js.last_absence_coverage_id, js.availability_evidence_kind
           FROM source_presence_scope_membership m
           JOIN job_sources js ON js.id = m.job_source_id
          WHERE m.binding_revision_id = ?
@@ -823,38 +834,57 @@ def _apply_absence(
         new_state = prior_state
         last_absence_order = str(presence["last_absence_order_key"] or "")
 
+        # Keep the S3.8 scope-generation safeguards.  The S3.10 availability
+        # comparator below is the cross-scope/current-evidence authority.
         if str(presence["last_seen_order_key"]) > current_order:
             decision = "SKIPPED_NEWER_PRESENCE"
-        elif _newer_presence_than_generation(presence, coverage):
+            result = None
+        elif (
+            last_absence_order
+            and last_absence_order > current_order
+            and prior_state in {"CLOSED", "WITHDRAWN"}
+        ):
+            # S3.10 can accept newer absence while preserving the semantic
+            # terminal evidence kind that originally established CLOSED or
+            # WITHDRAWN. That accepted absence also advances last_verified_at,
+            # so the generic timestamp guard below would otherwise mislabel an
+            # older generation as newer positive presence. A genuinely newer
+            # accepted positive would have reopened the presence to ACTIVE.
+            decision = "SKIPPED_NEWER_ABSENCE"
+            result = None
+        elif _newer_presence_than_generation(presence, coverage) and str(
+            presence["availability_evidence_kind"] or ""
+        ) not in {AUTHORITATIVE_ABSENCE, LEGACY_ABSENCE}:
             # Cross-scope/cross-binding current presence is still current
-            # presence. S3.8 must not make an older scope generation win merely
-            # because it finalized late; S3.10 later generalizes the evidence
-            # ordering model beyond coverage.
+            # presence.  But S3.10 advances last_verified_at when it accepts an
+            # absence, so absence-driven verification must not read as newer
+            # presence: when the current evidence itself is absence-kind, the
+            # absence-order check below owns the attribution.
             decision = "SKIPPED_NEWER_PRESENCE"
+            result = None
         elif last_absence_order and last_absence_order > current_order:
             decision = "SKIPPED_NEWER_ABSENCE"
-        elif prior_state == "ACTIVE":
-            decision = "UNCERTAIN"
-            new_state = "UNCERTAIN"
-        elif prior_state == "UNCERTAIN":
-            decision = "EXPIRED"
-            new_state = "EXPIRED"
-
-        if new_state != prior_state:
-            conn.execute(
-                """
-                UPDATE job_sources
-                   SET presence_state = ?, last_absence_coverage_id = ?, updated_at = ?
-                 WHERE id = ? AND presence_state = ?
-                """,
-                (
-                    new_state,
-                    coverage["id"],
-                    now,
-                    presence["job_source_id"],
-                    prior_state,
-                ),
+            result = None
+        else:
+            result = apply_presence_evidence(
+                conn,
+                presence_id=str(presence["job_source_id"]),
+                evidence_kind=AUTHORITATIVE_ABSENCE,
+                effective_at=effective_at,
+                received_at=now,
+                evidence_ref=f"coverage:{coverage['id']}",
+                coverage_id=str(coverage["id"]),
+                scope_key=str(coverage["scope_key"]),
             )
+            new_state = result.new_state
+            if not result.accepted:
+                decision = (
+                    "SKIPPED_NEWER_ABSENCE"
+                    if result.current_kind in {"AUTHORITATIVE_ABSENCE", "LEGACY_ABSENCE"}
+                    else "SKIPPED_NEWER_PRESENCE"
+                )
+            elif new_state in {"UNCERTAIN", "EXPIRED"} and new_state != prior_state:
+                decision = new_state
 
         if decision not in {"SKIPPED_NEWER_PRESENCE", "SKIPPED_NEWER_ABSENCE"}:
             conn.execute(
@@ -887,6 +917,11 @@ def _apply_absence(
             now=now,
         )
 
+        # Missing identities produce no observation and therefore no ordinary
+        # RECONCILE obligation.  Recompute locally inside the same coverage
+        # transaction whenever S3.10 accepted a new absence revision.
+        if result is not None and result.accepted:
+            reconcile_job(conn, str(presence["job_id"]), now=now)
 
 __all__ = [
     "CoverageFinalizationError",

@@ -715,32 +715,44 @@ def restore_membership(
             commit=False,
         )
         inserted += 1 if was_inserted else 0
-        # Verification advances independently of content revision. This is a
-        # conservative source-native identity update only; S3.10 still owns
-        # broader temporal/presence ordering.
-        conn.execute(
+        # S3.10 owns the current presence projection for retained-membership
+        # verification as well. A 304 is positive current evidence, but it still
+        # passes the same temporal comparator as parsed observations.
+        from jobscraper.pipeline.availability import (
+            ACTIVE_REVALIDATION,
+            apply_presence_evidence,
+        )
+        from jobscraper.pipeline.obligations import reconcile_job
+
+        presence = conn.execute(
             """
-            UPDATE job_sources
-               SET last_verified_at = CASE
-                       WHEN last_verified_at IS NULL OR last_verified_at < ?
-                       THEN ? ELSE last_verified_at END,
-                   updated_at = CASE
-                       WHEN last_verified_at IS NULL OR last_verified_at < ?
-                       THEN ? ELSE updated_at END
+            SELECT id
+              FROM job_sources
              WHERE source_id = ?
                AND source_job_id = ?
                AND source_identity_generation = ?
             """,
             (
-                now,
-                now,
-                now,
-                now,
                 representation["source_id"],
                 member["stable_source_identity"],
                 member["source_identity_generation"],
             ),
-        )
+        ).fetchone()
+        if presence is not None:
+            result = apply_presence_evidence(
+                conn,
+                presence_id=str(presence["id"]),
+                evidence_kind=ACTIVE_REVALIDATION,
+                effective_at=now,
+                received_at=now,
+                evidence_ref=(
+                    member["evidence_ref"]
+                    or f"cache-membership://{representation_id}"
+                ),
+            )
+            if result.accepted:
+                reconcile_job(conn, result.job_id, now=now)
+
     if commit:
         conn.commit()
     return inserted

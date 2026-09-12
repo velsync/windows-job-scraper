@@ -119,13 +119,40 @@ def _conn():
             updated_at TEXT NOT NULL,
             PRIMARY KEY(job_source_id,binding_revision_id,scope_key)
         );
+        CREATE TABLE sources(
+            id TEXT PRIMARY KEY,
+            source_family TEXT NOT NULL
+        );
+        CREATE TABLE job_observations(
+            id TEXT PRIMARY KEY,
+            strategy TEXT
+        );
+        CREATE TABLE jobs(
+            id TEXT PRIMARY KEY,
+            listing_status TEXT NOT NULL DEFAULT 'ACTIVE',
+            last_changed_at TEXT,
+            updated_at TEXT
+        );
         CREATE TABLE job_sources(
             id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
             source_id TEXT NOT NULL,
             source_job_id TEXT,
             source_identity_generation INTEGER NOT NULL DEFAULT 1,
+            last_seen_at TEXT,
             last_verified_at TEXT,
+            last_changed_at TEXT,
+            presence_state TEXT NOT NULL DEFAULT 'ACTIVE',
+            last_absence_coverage_id TEXT,
+            last_authoritative_scope_key TEXT,
+            last_observation_id TEXT,
+            availability_effective_at TEXT NOT NULL DEFAULT '',
+            availability_received_at TEXT NOT NULL DEFAULT '',
+            availability_evidence_kind TEXT NOT NULL DEFAULT 'LEGACY_UNKNOWN',
+            availability_evidence_ref TEXT,
+            availability_revision INTEGER NOT NULL DEFAULT 0,
             content_revision INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT,
             updated_at TEXT
         );
         """
@@ -372,9 +399,28 @@ def test_304_membership_advances_verification_without_content_revision():
         """,
         (NOW, NOW, f"{NOW}|cov"),
     )
+    conn.execute("INSERT INTO sources VALUES ('src','ATS_PROVIDER_API')")
     conn.execute(
-        "INSERT INTO job_sources VALUES "
-        "('js','src','A',1,'2026-09-10T00:00:00Z',7,'2026-09-10T00:00:00Z')"
+        "INSERT INTO jobs(id,listing_status,updated_at) VALUES ('job-js','ACTIVE',?)",
+        ("2026-09-10T00:00:00Z",),
+    )
+    conn.execute(
+        """
+        INSERT INTO job_sources(
+            id,job_id,source_id,source_job_id,source_identity_generation,
+            last_seen_at,last_verified_at,presence_state,
+            availability_effective_at,availability_received_at,
+            availability_evidence_kind,content_revision,created_at,updated_at)
+        VALUES ('js','job-js','src','A',1,?,?, 'ACTIVE',?,?, 'LEGACY_ACTIVE',7,?,?)
+        """,
+        (
+            "2026-09-10T00:00:00Z",
+            "2026-09-10T00:00:00Z",
+            "2026-09-10T00:00:00Z",
+            "2026-09-10T00:00:00Z",
+            "2026-09-10T00:00:00Z",
+            "2026-09-10T00:00:00Z",
+        ),
     )
     restore_membership(
         conn,
