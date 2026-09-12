@@ -802,7 +802,7 @@ def test_detail_identity_mismatch_is_refused_and_recorded(db, server):
 def test_rate_limited_site_is_partial_and_never_terminal(db, server):
     """A 429 is a typed page class, not a parser failure and not an empty site."""
     run_id, _ = _run_board(db, server, board="ratelimited")
-    assert execute_run(db.conn, run_id) == "PARTIAL"
+    assert execute_run(db.conn, run_id) is None
 
     requests = _requests(db, run_id)
     assert [r["request_type"] for r in requests] == ["LIST_FETCH"]
@@ -818,7 +818,7 @@ def test_rate_limited_site_is_partial_and_never_terminal(db, server):
 
 def test_challenge_page_site_is_partial_and_keeps_evidence(db, server):
     run_id, _ = _run_board(db, server, board="challenge")
-    assert execute_run(db.conn, run_id) == "PARTIAL"
+    assert execute_run(db.conn, run_id) is None
 
     requests = _requests(db, run_id)
     assert requests[0]["page_class"] == "CHALLENGE_PAGE"
@@ -1028,7 +1028,7 @@ def test_an_open_detail_child_blocks_terminalization_until_drained(db, server):
     original = driver_module.MAX_DETAIL_REQUESTS_PER_RUN
     driver_module.MAX_DETAIL_REQUESTS_PER_RUN = 0
     try:
-        assert execute_run(db.conn, run_id) == "PARTIAL"
+        assert execute_run(db.conn, run_id) is None
     finally:
         driver_module.MAX_DETAIL_REQUESTS_PER_RUN = original
 
@@ -1068,7 +1068,7 @@ def test_restart_recovery_drains_the_same_run_without_duplicates(db, server):
     original = driver_module.MAX_DETAIL_REQUESTS_PER_RUN
     driver_module.MAX_DETAIL_REQUESTS_PER_RUN = 0
     try:
-        assert execute_run(db.conn, run_id) == "PARTIAL"
+        assert execute_run(db.conn, run_id) is None
         observations = db.conn.execute("SELECT COUNT(*) FROM job_observations").fetchone()[0]
         jobs = {job["id"] for job in _jobs(db)}
         companies = db.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0]

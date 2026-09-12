@@ -56,24 +56,14 @@ _OPEN_REQUEST_STATUSES = ("PENDING", "RUNNING", "RETRY_WAIT")
 def _claimable_or_inflight_sql(alias: str | None = None) -> str:
     """SQL fragment matching acquisition work that still blocks terminal truth.
 
-    Mirrors the claim path exactly: ``PENDING`` is always claimable,
-    ``RUNNING`` is in flight under a lease, and ``RETRY_WAIT`` is claimable
-    only with a valid durable ``next_retry_at`` that is already due.  A
-    dormant retry (not-yet-due, NULL, or empty timestamp) is neither
-    claimable nor in flight: nothing in the bounded pass can act on it, so
-    it must not wedge plan terminalization or run finalization (RUN-01
-    liveness; RUN-07 lease-loss recovery keeps the retry row durable for a
-    later pass via the terminal-plan re-drive path).  The caller binds the
-    authoritative timestamp once.
+    Terminal truth is stricter than immediate claimability: ``PENDING`` and
+    ``RUNNING`` are open now, while every ``RETRY_WAIT`` is durable promised
+    future work even when ``next_retry_at`` is not due yet.  Claim selection
+    still applies the due-time predicate; this barrier only prevents a plan or
+    run from becoming terminal while accepted retry work remains outstanding.
     """
     prefix = f"{alias}." if alias else ""
-    return (
-        f"({prefix}status IN ('PENDING', 'RUNNING')"
-        f" OR ({prefix}status = 'RETRY_WAIT'"
-        f" AND {prefix}next_retry_at IS NOT NULL"
-        f" AND {prefix}next_retry_at <> ''"
-        f" AND {prefix}next_retry_at <= ?))"
-    )
+    return f"{prefix}status IN ('PENDING', 'RUNNING', 'RETRY_WAIT')"
 
 
 def plan_actionable_open_work(
@@ -87,7 +77,7 @@ def plan_actionable_open_work(
             " WHERE run_source_plan_id = ?"
             f" AND request_type IN ({acquisition_types})"
             f" AND {_claimable_or_inflight_sql()}",
-            (plan_id, *sorted(ACQUISITION_REQUEST_TYPES), now),
+            (plan_id, *sorted(ACQUISITION_REQUEST_TYPES)),
         ).fetchone()[0]
     )
 
@@ -581,12 +571,11 @@ def _relevant_open_work(conn: sqlite3.Connection, run_id: str, *, now: str) -> i
     group closure.
 
     Acquisition work counts only while its owning plan can still drive it:
-    the plan is undecided or partial, and the request is claimable or in
-    flight.  A dormant retry is actionable by nothing in the bounded pass,
-    and leftovers owned by a finally-terminal plan are claimable by nobody,
-    so neither wedges finalization while their rows stay durable.  Only
-    acquisition work belonging to an explicitly skipped plan was already
-    irrelevant to further collection.
+    the plan is undecided or partial, and the request is pending, in flight,
+    or waiting for its durable retry time.  Deferred retry work therefore
+    keeps the run non-terminal even though it is not claimable yet.  Leftovers
+    owned by a finally-terminal/skipped plan remain diagnostic rows and do not
+    wedge finalization because that plan can no longer drive them.
     """
     acquisition = ",".join("?" for _ in ACQUISITION_REQUEST_TYPES)
     actionable = _claimable_or_inflight_sql("req")
@@ -607,7 +596,6 @@ def _relevant_open_work(conn: sqlite3.Connection, run_id: str, *, now: str) -> i
                 run_id,
                 *sorted(ACQUISITION_REQUEST_TYPES),
                 *sorted(ACQUISITION_REQUEST_TYPES),
-                now,
             ),
         ).fetchone()[0]
     )
@@ -666,14 +654,10 @@ def aggregate_run(
             else:
                 status = "SUCCEEDED"
 
-        # An explicitly incomplete verdict (PARTIAL/CANCELLED) honestly reports
-        # unfinished collection, so open acquisition work does not block it;
-        # accepted host-native obligations must still drain first.  A verdict
-        # of SUCCEEDED/FAILED claims nothing is left actionable.
-        if status in ("PARTIAL", "CANCELLED"):
-            blocking = _relevant_native_open_work(conn, run_id)
-        else:
-            blocking = _relevant_open_work(conn, run_id, now=ts)
+        # Group truth may be visibly partial while accepted work remains, but
+        # RUN-01 does not permit the run itself to become terminal until every
+        # relevant acquisition and host-native obligation has drained.
+        blocking = _relevant_open_work(conn, run_id, now=ts)
         if blocking:
             conn.execute("COMMIT")
             return None

@@ -2194,6 +2194,11 @@ def _execute_plan(
         # reclaimed attempt was consumed, so the pass terminalizes below.
         return
     open_child_work = _open_acquisition_requests(conn, plan_id)
+    if open_child_work and not (pages or details or terminal or cancelled):
+        # A consumed/lost attempt can be reclaimed into RETRY_WAIT.  That is
+        # still accepted future work, not a terminal failure.  Leave the plan
+        # and coverage generation open so a later pass can claim the retry.
+        return
     if not (state_changed or pages or details or terminal or cancelled or ownership_lost):
         # This pass consumed and produced nothing (e.g. only epoch-orphaned
         # RUNNING work remains, still live under an unexpired lease): stay

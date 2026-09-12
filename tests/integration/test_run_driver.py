@@ -409,7 +409,15 @@ def test_driver_lease_loss_stops_cleanly(db, server):
 
     status = execute_run(db.conn, run_id)
 
-    assert status == "FAILED"  # nothing committed (page budget consumed by loss)
+    assert status is None  # reclaimed RETRY_WAIT keeps terminal run truth open
+    run = db.conn.execute(
+        "SELECT status, finished_at FROM scrape_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    assert tuple(run) == ("RUNNING", None)
+    plan = db.conn.execute(
+        "SELECT group_outcome FROM run_source_plans WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    assert plan["group_outcome"] is None
     req = db.conn.execute(
         "SELECT status, last_failure_kind FROM scrape_requests WHERE run_id = ?",
         (run_id,),
