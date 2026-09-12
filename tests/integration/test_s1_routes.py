@@ -356,7 +356,11 @@ def test_job_detail_404(service):
 
 def test_application_crud_via_api(service):
     client = _client(service)
-    profile = client.post("/api/profiles", json={"name": "P", "min_score_inbox": 0}).json()
+    # S3.11 (CR-5): Inbox triggers are evaluated after the exact
+    # eligibility/score pair is persisted, so the predicate observes the true
+    # score. The fixture job has unknown salary (true score -5.0); the floor
+    # must admit it for the applications flow below to have an inbox job.
+    profile = client.post("/api/profiles", json={"name": "P", "min_score_inbox": -10}).json()
     client.post("/api/runs", json={"profile_id": profile["id"]})
     job_id = client.get(f"/api/inbox?profile_id={profile['id']}").json()["inbox"][0]["job_id"]
 

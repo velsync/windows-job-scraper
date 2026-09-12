@@ -36,26 +36,55 @@ def create_profile(conn: sqlite3.Connection, *, snapshot: dict, now: str) -> tup
 
 
 def edit_profile(conn: sqlite3.Connection, profile_id: str, *, snapshot: dict, now: str) -> str:
-    """Edit = append a new immutable revision; history stays resolvable."""
-    row = conn.execute(
-        "SELECT MAX(revision) FROM profile_revisions WHERE profile_id = ?",
-        (profile_id,),
-    ).fetchone()
-    next_revision = (row[0] or 0) + 1
-    revision_id = new_id("profrev")
-    conn.execute(
-        "INSERT INTO profile_revisions (id, profile_id, revision, profile_snapshot_json,"
-        " content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (revision_id, profile_id, next_revision,
-         json.dumps(snapshot, sort_keys=True, default=str), _hash(snapshot), now),
-    )
-    conn.execute(
-        "UPDATE search_profiles SET name = ?, current_revision_id = ?, updated_at = ?"
-        " WHERE id = ?",
-        (str(snapshot.get("name") or "Profile"), revision_id, now, profile_id),
-    )
-    conn.commit()
-    return revision_id
+    """Append one immutable profile revision and materialize its evaluations.
+
+    RUN-21 makes the profile pointer and all newly-current eligibility/score
+    rows one local all-or-nothing operation. When called inside an existing
+    transaction, ownership stays with the caller; otherwise this function owns
+    a short BEGIN IMMEDIATE boundary.
+    """
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT MAX(revision) FROM profile_revisions WHERE profile_id = ?",
+            (profile_id,),
+        ).fetchone()
+        next_revision = (row[0] or 0) + 1
+        revision_id = new_id("profrev")
+        conn.execute(
+            "INSERT INTO profile_revisions (id, profile_id, revision, profile_snapshot_json,"
+            " content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                revision_id,
+                profile_id,
+                next_revision,
+                json.dumps(snapshot, sort_keys=True, default=str),
+                _hash(snapshot),
+                now,
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE search_profiles SET name = ?, current_revision_id = ?, updated_at = ?"
+            " WHERE id = ?",
+            (str(snapshot.get("name") or "Profile"), revision_id, now, profile_id),
+        )
+        if updated.rowcount != 1:
+            raise KeyError(profile_id)
+
+        # Lazy import avoids a module cycle: evaluation uses profile readers,
+        # while profile mutation owns the revision-advance trigger.
+        from jobscraper.pipeline.evaluation import materialize_profile_revision
+
+        materialize_profile_revision(conn, profile_id, revision_id, now=now)
+        if owns_transaction:
+            conn.execute("COMMIT")
+        return revision_id
+    except BaseException:
+        if owns_transaction and conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def current_snapshot(conn: sqlite3.Connection, profile_id: str) -> dict | None:

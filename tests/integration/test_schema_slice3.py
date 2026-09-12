@@ -125,10 +125,10 @@ def test_s39_v19_is_frozen_after_s310_append():
     assert _digest(_step(18)[1]) == "6075470c2667d581472d8c47ef1baaa8e30fda87d05dbfe996c2c948d4e2c3cf"
 
 
-def test_s310_v20_is_next_unused_sequential_and_pinned():
+def test_s310_v20_is_frozen_after_s311_append():
     versions = [version for version, _name, _sql in MIGRATION_STEPS]
-    assert versions == list(range(1, 21))
-    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 20
+    assert versions[:20] == list(range(1, 21))
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == max(versions)
     name, sql = _step(20)
     assert name == "s3_10_presence_availability_order"
     assert _digest(sql) == "bd4c690eab18938604f49fd894c4b25c2cdda1a29f62d14d6c678f211faf6c9b"
@@ -364,5 +364,58 @@ def test_v15_does_not_precreate_s39_group_storage(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table'")}
         assert after - before == {"service_clock_epochs", "binding_host_rate_state"}
         assert "source_plan_group_state" not in after
+    finally:
+        db.close()
+
+
+def test_s311_v21_is_next_unused_sequential_and_pinned():
+    versions = [version for version, _name, _sql in MIGRATION_STEPS]
+    assert versions == list(range(1, 22))
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 21
+    name, sql = _step(21)
+    assert name == "s3_11_evaluation_input_order"
+    assert _digest(sql) == "d340b7c34362b2b4b2d5b7fd6aaa229a2460a98bc81dc817a6c8ba26db2b2305"
+    assert _digest(_step(20)[1]) == "bd4c690eab18938604f49fd894c4b25c2cdda1a29f62d14d6c678f211faf6c9b"
+    assert "ADD COLUMN evaluation_revision" in sql
+    assert "ADD COLUMN eligibility_evaluator_version" in sql
+
+    # The db/schema_sql.py migration owner is allowed to backfill the
+    # newly-added coordinate during an exclusive upgrade, but v21 must touch
+    # only jobs.evaluation_revision. This keeps the runtime single-writer
+    # contract strong rather than granting migrations an unbounded exception.
+    update = sql.split("UPDATE jobs", 1)[1].split("ALTER TABLE", 1)[0]
+    assigned = set(
+        re.findall(r"(?m)^\s*(?:SET\s+)?([a-z_][a-z0-9_]*)\s*=", update)
+    )
+    assert assigned == {"evaluation_revision"}
+
+
+def test_s311_v21_adds_only_evaluation_order_coordinates(tmp_path):
+    db = Database(tmp_path / "s311-v21.db")
+    try:
+        migrate_schema(db.conn, 20)
+        jobs_before = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(jobs)")
+        }
+        scores_before = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(job_scores)")
+        }
+        eligibility_before = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(job_eligibility)")
+        }
+        migrate_schema(db.conn, 21)
+        jobs_after = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(jobs)")
+        }
+        scores_after = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(job_scores)")
+        }
+        eligibility_after = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(job_eligibility)")
+        }
+        assert jobs_after - jobs_before == {"evaluation_revision"}
+        assert scores_after - scores_before == {"eligibility_evaluator_version"}
+        assert eligibility_after == eligibility_before
+        assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         db.close()

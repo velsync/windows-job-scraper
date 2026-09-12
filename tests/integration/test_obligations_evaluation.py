@@ -289,3 +289,575 @@ def test_obligations_not_stranded_by_crash(db):
         " IN ('RECONCILE','ELIGIBILITY','SCORE') AND status != 'SUCCEEDED'"
     ).fetchone()[0]
     assert remaining == 0
+# -------------------------------------------------------- Slice 3 S3.11 RUN-21
+
+S311_LATER = "2026-09-08T11:00:00.000000Z"
+S311_LATEST = "2026-09-08T12:00:00.000000Z"
+
+
+def _s311_prepare_observation(
+    db,
+    *,
+    at: str,
+    title: str = "Backend Engineer",
+    locations=("Berlin", "Remote"),
+    salary=None,
+    source_job_id: str = "s311-100",
+):
+    plan = dict(
+        source_id="src-feed", source_plan_group_id="s311-grp", fallback_rank=0,
+        binding_id="bnd-feed", binding_revision_id="bndrev-feed",
+        adapter_id="json_api_feed", adapter_version="1.0.0", adapter_api_version="1",
+        strategy="FEED_OR_PUBLIC_STRUCTURED_ENDPOINT", execution_class="HTTP",
+        permission_profile_id="perm-1", permission_profile_revision=1,
+    )
+    run_id, plans = create_run(db.conn, profile_id=None, plans=[plan], now=at)
+    _rid, _ = enqueue_request(
+        db.conn,
+        run_id=run_id,
+        run_source_plan_id=plans[0],
+        source_id="src-feed",
+        binding_id="bnd-feed",
+        request_type="LIST_FETCH",
+        target_identity="https://jobs.example.test/api/jobs?page=1",
+        strategy=plan["strategy"],
+        execution_class="HTTP",
+        now=at,
+    )
+    claim = claim_next_request(
+        db.conn, "s311-worker", now=at, types=frozenset({"LIST_FETCH"})
+    )
+    assert claim is not None
+    fields = {
+        "source_job_id": source_job_id,
+        "title": title,
+        "company": "Fixture Corp",
+        "description": "<p>Python backend work</p>",
+        "job_url": f"https://jobs.example.test/jobs/{source_job_id}",
+        "apply_url": f"https://jobs.example.test/jobs/{source_job_id}/apply",
+        "locations": list(locations),
+    }
+    if salary:
+        fields["salary"] = salary
+    observation = ObservationRecord(
+        source_job_id=source_job_id,
+        raw_url="https://jobs.example.test/api/jobs?page=1",
+        canonical_url_candidate=fields["job_url"],
+        application_url_candidate=fields["apply_url"],
+        fields=fields,
+    )
+    return run_id, plans[0], claim, observation
+
+
+def _s311_ingest_job(db, **kwargs):
+    at = kwargs.pop("at")
+    run_id, plan_id, claim, observation = _s311_prepare_observation(
+        db, at=at, **kwargs
+    )
+
+    def mutate(conn):
+        ingest_observation(
+            conn,
+            request_id=claim.request_id,
+            attempt_id=claim.attempt_id,
+            observation=observation,
+            source_id="src-feed",
+            binding_id="bnd-feed",
+            adapter_id="json_api_feed",
+            adapter_version="1.0.0",
+            strategy="FEED_OR_PUBLIC_STRUCTURED_ENDPOINT",
+            execution_class="HTTP",
+            observed_at=at,
+            now=at,
+        )
+
+    with fenced_commit(
+        db.conn, claim.request_id, claim.attempt_id, now=at, mutate=mutate
+    ):
+        pass
+    job_id = db.conn.execute(
+        "SELECT job_id FROM job_sources WHERE source_id='src-feed' AND source_job_id=?"
+        " ORDER BY source_identity_generation DESC LIMIT 1",
+        (observation.source_job_id,),
+    ).fetchone()["job_id"]
+    return run_id, plan_id, str(job_id), observation
+
+
+def test_s311_profile_reverse_completion_cannot_replace_newer_current_rows(db):
+    from jobscraper.pipeline.evaluation import (
+        CURRENT_NOOP,
+        STALE_INPUT,
+        capture_evaluation_snapshot,
+        evaluate_snapshot,
+        persist_eligibility_result,
+        persist_score_result,
+    )
+
+    _run, _plan, job_id, _observation = _s311_ingest_job(db, at=NOW)
+    profile_id, rev1 = create_profile(db.conn, snapshot=PROFILE, now=NOW)
+    old = capture_evaluation_snapshot(db.conn, job_id, profile_id)
+    assert old is not None and old.profile_revision_id == rev1
+    old_eligibility, old_score = evaluate_snapshot(old)
+
+    strict = dict(PROFILE, name="Backend EU strict", keywords=["rust"])
+    rev2 = edit_profile(db.conn, profile_id, snapshot=strict, now=LATER)
+    current = capture_evaluation_snapshot(db.conn, job_id, profile_id)
+    assert current is not None and current.profile_revision_id == rev2
+    # edit_profile owns the RUN-21 profile-advance rematerialization.
+    current_eligibility, current_score = evaluate_snapshot(current)
+    assert persist_eligibility_result(
+        db.conn, current, current_eligibility, now=S311_LATER
+    ) == CURRENT_NOOP
+    assert persist_score_result(
+        db.conn, current, current_score, now=S311_LATER
+    ) == CURRENT_NOOP
+
+    before_elig = dict(db.conn.execute(
+        "SELECT * FROM job_eligibility WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone())
+    before_score = dict(db.conn.execute(
+        "SELECT * FROM job_scores WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone())
+
+    assert persist_eligibility_result(
+        db.conn, old, old_eligibility, now=S311_LATEST
+    ) == STALE_INPUT
+    assert persist_score_result(db.conn, old, old_score, now=S311_LATEST) == STALE_INPUT
+    assert dict(db.conn.execute(
+        "SELECT * FROM job_eligibility WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()) == before_elig
+    assert dict(db.conn.execute(
+        "SELECT * FROM job_scores WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()) == before_score
+
+    assert persist_eligibility_result(
+        db.conn, current, current_eligibility, now=S311_LATEST
+    ) == CURRENT_NOOP
+    assert persist_score_result(
+        db.conn, current, current_score, now=S311_LATEST
+    ) == CURRENT_NOOP
+    assert db.conn.execute(
+        "SELECT evaluated_at FROM job_eligibility WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == LATER
+    assert db.conn.execute(
+        "SELECT scored_at FROM job_scores WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == LATER
+
+
+def test_s311_content_reverse_completion_uses_canonical_evaluation_revision(db):
+    from jobscraper.pipeline.evaluation import (
+        STALE_INPUT,
+        capture_evaluation_snapshot,
+        evaluate_snapshot,
+        persist_eligibility_result,
+        persist_score_result,
+    )
+
+    _run1, _plan1, job_id, _obs1 = _s311_ingest_job(
+        db, at=NOW, title="Backend Engineer", source_job_id="s311-content"
+    )
+    profile_id, _rev = create_profile(db.conn, snapshot=PROFILE, now=NOW)
+    old = capture_evaluation_snapshot(db.conn, job_id, profile_id)
+    assert old is not None
+
+    _run2, _plan2, same_job_id, _obs2 = _s311_ingest_job(
+        db,
+        at=LATER,
+        title="Senior Python Backend Engineer",
+        source_job_id="s311-content",
+    )
+    assert same_job_id == job_id
+    current = capture_evaluation_snapshot(db.conn, job_id, profile_id)
+    assert current is not None
+    assert current.job_content_revision == old.job_content_revision + 1
+
+    current_eligibility, current_score = evaluate_snapshot(current)
+    assert persist_eligibility_result(
+        db.conn, current, current_eligibility, now=S311_LATER
+    ) == "WRITTEN"
+    assert persist_score_result(db.conn, current, current_score, now=S311_LATER) == "WRITTEN"
+
+    old_eligibility, old_score = evaluate_snapshot(old)
+    assert persist_eligibility_result(
+        db.conn, old, old_eligibility, now=S311_LATEST
+    ) == STALE_INPUT
+    assert persist_score_result(db.conn, old, old_score, now=S311_LATEST) == STALE_INPUT
+    assert db.conn.execute(
+        "SELECT job_content_revision FROM job_eligibility WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == current.job_content_revision
+    assert db.conn.execute(
+        "SELECT job_content_revision FROM job_scores WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == current.job_content_revision
+
+
+def test_s311_identical_canonical_input_does_not_advance_evaluation_revision(db):
+    _run1, _plan1, job_id, _obs1 = _s311_ingest_job(
+        db, at=NOW, title="Backend Engineer", source_job_id="s311-same"
+    )
+    first = db.conn.execute(
+        "SELECT evaluation_revision FROM jobs WHERE id=?", (job_id,)
+    ).fetchone()[0]
+    _run2, _plan2, same_job_id, _obs2 = _s311_ingest_job(
+        db, at=LATER, title="Backend Engineer", source_job_id="s311-same"
+    )
+    assert same_job_id == job_id
+    assert db.conn.execute(
+        "SELECT evaluation_revision FROM jobs WHERE id=?", (job_id,)
+    ).fetchone()[0] == first
+
+
+def test_s311_rows_pin_exact_inputs_and_inbox_waits_for_matching_pair(db):
+    from jobscraper.pipeline.eligibility import EVALUATOR_VERSION
+    from jobscraper.pipeline.evaluation import (
+        CURRENT_NOOP,
+        capture_evaluation_snapshot,
+        emit_inbox_if_current_pair,
+        evaluate_snapshot,
+        persist_eligibility_result,
+        persist_score_result,
+    )
+    from jobscraper.pipeline.normalize import NORMALIZATION_VERSION
+    from jobscraper.pipeline.scoring import RULES_VERSION
+
+    _run, _plan, job_id, _observation = _s311_ingest_job(db, at=NOW)
+    profile = dict(PROFILE, min_score_inbox=0)
+    profile_id, profile_revision_id = create_profile(
+        db.conn, snapshot=profile, now=NOW
+    )
+    assert drain_all_obligations(db.conn, now=LATER) >= 3
+
+    current_revision = db.conn.execute(
+        "SELECT evaluation_revision FROM jobs WHERE id=?", (job_id,)
+    ).fetchone()[0]
+    elig = db.conn.execute(
+        "SELECT * FROM job_eligibility WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()
+    score = db.conn.execute(
+        "SELECT * FROM job_scores WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()
+    assert elig["job_content_revision"] == score["job_content_revision"] == current_revision
+    assert elig["profile_revision_id"] == score["profile_revision_id"] == profile_revision_id
+    assert elig["rules_revision_id"] is score["rules_revision_id"] is None
+    assert elig["normalization_version"] == score["normalization_version"] == NORMALIZATION_VERSION
+    assert elig["evaluator_version"] == EVALUATOR_VERSION
+    assert score["eligibility_evaluator_version"] == EVALUATOR_VERSION
+    assert score["scorer_version"] == SCORER_VERSION
+    assert score["rule_version"] == RULES_VERSION
+
+    event_count = db.conn.execute(
+        "SELECT COUNT(*) FROM job_profile_inbox_events WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0]
+    assert event_count >= 1
+
+    snapshot = capture_evaluation_snapshot(db.conn, job_id, profile_id)
+    assert snapshot is not None
+    eligibility_result, score_result = evaluate_snapshot(snapshot)
+    assert persist_eligibility_result(
+        db.conn, snapshot, eligibility_result, now=S311_LATEST
+    ) == CURRENT_NOOP
+    assert persist_score_result(
+        db.conn, snapshot, score_result, now=S311_LATEST
+    ) == CURRENT_NOOP
+    assert emit_inbox_if_current_pair(db.conn, snapshot, now=S311_LATEST)
+    assert emit_inbox_if_current_pair(db.conn, snapshot, now=S311_LATEST)
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM job_profile_inbox_events WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == event_count
+
+
+def test_s311_cancel_and_quarantine_do_not_strand_accepted_local_obligations(db):
+    run_id, _plan_id, _job_id, _observation = _s311_ingest_job(db, at=NOW)
+    create_profile(db.conn, snapshot=PROFILE, now=NOW)
+    request_run_cancellation(db.conn, run_id, now=LATER)
+    db.conn.execute(
+        "UPDATE sources SET administrative_state='QUARANTINED' WHERE id='src-feed'"
+    )
+    db.conn.execute(
+        "UPDATE source_adapter_bindings SET administrative_state='QUARANTINED'"
+        " WHERE id='bnd-feed'"
+    )
+    db.conn.commit()
+
+    assert drain_all_obligations(db.conn, now=LATER) >= 3
+    rows = db.conn.execute(
+        "SELECT status FROM scrape_requests WHERE run_id=? AND request_type"
+        " IN ('RECONCILE','ELIGIBILITY','SCORE')",
+        (run_id,),
+    ).fetchall()
+    assert rows and {row["status"] for row in rows} == {"SUCCEEDED"}
+    assert db.conn.execute(
+        """
+        SELECT COUNT(*)
+          FROM request_attempts a
+          JOIN scrape_requests r ON r.id=a.request_id
+         WHERE r.run_id=? AND r.request_type IN ('RECONCILE','ELIGIBILITY','SCORE')
+           AND a.execution_plan_id IS NOT NULL
+        """,
+        (run_id,),
+    ).fetchone()[0] == 0
+
+
+def test_s311_host_native_request_cannot_bind_source_network_execution_plan(db):
+    from jobscraper.acquisition.envelope import (
+        ExecutionPlanEnvelope,
+        RequestPlan,
+        bind_execution_plan,
+        policy_snapshot_reference,
+    )
+
+    _run, plan_id, _job_id, _observation = _s311_ingest_job(db, at=NOW)
+    claim = claim_next_request(
+        db.conn, "s311-local", now=LATER, types=frozenset({"ELIGIBILITY"})
+    )
+    assert claim is not None
+    plan = db.conn.execute(
+        "SELECT * FROM run_source_plans WHERE id=?", (plan_id,)
+    ).fetchone()
+    envelope = ExecutionPlanEnvelope(
+        plan_id="forbidden-network-plan",
+        request_id=claim.request_id,
+        attempt_id=claim.attempt_id,
+        run_id=claim.run_id,
+        run_source_plan_id=claim.run_source_plan_id,
+        source_id=plan["source_id"],
+        binding_id=plan["binding_id"],
+        binding_revision_id=plan["binding_revision_id"],
+        adapter_id=plan["adapter_id"],
+        adapter_version=plan["adapter_version"],
+        strategy=plan["strategy"],
+        execution_class=plan["execution_class"],
+        policy_snapshot_ref=policy_snapshot_reference(plan),
+        permission_profile_id=plan["permission_profile_id"],
+        permission_profile_revision=plan["permission_profile_revision"],
+        payload_kind="REQUEST",
+        payload=RequestPlan(
+            "GET", "https://jobs.example.test/forbidden", purpose="ELIGIBILITY"
+        ),
+    )
+    with pytest.raises(ValueError, match="host-native"):
+        bind_execution_plan(db.conn, envelope, now=LATER)
+    assert db.conn.execute(
+        "SELECT execution_plan_id FROM request_attempts WHERE attempt_id=?",
+        (claim.attempt_id,),
+    ).fetchone()[0] is None
+
+
+def test_s311_run_terminalization_waits_for_local_obligations(db):
+    from jobscraper.runtime.runs import aggregate_run, set_group_outcome
+
+    run_id, plan_id, _job_id, _observation = _s311_ingest_job(db, at=NOW)
+    create_profile(db.conn, snapshot=PROFILE, now=NOW)
+    set_group_outcome(db.conn, plan_id, "SATISFIED", now=LATER)
+    assert aggregate_run(db.conn, run_id, now=LATER) is None
+    assert db.conn.execute(
+        "SELECT status FROM scrape_runs WHERE id=?", (run_id,)
+    ).fetchone()[0] != "SUCCEEDED"
+
+    assert drain_all_obligations(db.conn, now=LATER) >= 3
+    assert aggregate_run(db.conn, run_id, now=S311_LATER) == "SUCCEEDED"
+
+
+def test_s311_failure_after_observation_insert_rolls_back_observation_and_obligations(db, monkeypatch):
+    import jobscraper.pipeline.ingest as ingest_module
+
+    run_id, _plan_id, claim, observation = _s311_prepare_observation(
+        db, at=NOW, source_job_id="s311-crash"
+    )
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("synthetic crash after immutable observation insert")
+
+    monkeypatch.setattr(ingest_module, "normalize_observation", explode)
+
+    def mutate(conn):
+        ingest_observation(
+            conn,
+            request_id=claim.request_id,
+            attempt_id=claim.attempt_id,
+            observation=observation,
+            source_id="src-feed",
+            binding_id="bnd-feed",
+            adapter_id="json_api_feed",
+            adapter_version="1.0.0",
+            strategy="FEED_OR_PUBLIC_STRUCTURED_ENDPOINT",
+            execution_class="HTTP",
+            observed_at=NOW,
+            now=NOW,
+        )
+
+    with pytest.raises(RuntimeError, match="synthetic crash"):
+        with fenced_commit(
+            db.conn, claim.request_id, claim.attempt_id, now=NOW, mutate=mutate
+        ):
+            pass
+
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM job_observations WHERE request_id=?",
+        (claim.request_id,),
+    ).fetchone()[0] == 0
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM scrape_requests WHERE run_id=? AND request_type"
+        " IN ('RECONCILE','ELIGIBILITY','SCORE')",
+        (run_id,),
+    ).fetchone()[0] == 0
+
+
+def test_s311_reopen_database_drains_each_durable_local_obligation_once(db):
+    from jobscraper.runtime.clock import begin_service_epoch
+
+    run_id, _plan_id, _job_id, _observation = _s311_ingest_job(db, at=NOW)
+    create_profile(db.conn, snapshot=PROFILE, now=NOW)
+    before = db.conn.execute(
+        "SELECT id FROM scrape_requests WHERE run_id=? AND request_type"
+        " IN ('RECONCILE','ELIGIBILITY','SCORE') ORDER BY id",
+        (run_id,),
+    ).fetchall()
+    assert len(before) == 3
+    request_ids = [row["id"] for row in before]
+
+    path = db.path
+    db.close()
+    reopened = Database(path)
+    try:
+        begin_service_epoch(reopened.conn, now=LATER)
+        assert drain_all_obligations(reopened.conn, now=LATER) == 3
+        after = reopened.conn.execute(
+            "SELECT id,status FROM scrape_requests WHERE run_id=? AND request_type"
+            " IN ('RECONCILE','ELIGIBILITY','SCORE') ORDER BY id",
+            (run_id,),
+        ).fetchall()
+        assert [row["id"] for row in after] == request_ids
+        assert {row["status"] for row in after} == {"SUCCEEDED"}
+        assert drain_all_obligations(reopened.conn, now=S311_LATER) == 0
+        assert reopened.conn.execute("SELECT COUNT(*) FROM job_eligibility").fetchone()[0] == 1
+        assert reopened.conn.execute("SELECT COUNT(*) FROM job_scores").fetchone()[0] == 1
+    finally:
+        reopened.close()
+
+
+def test_s311_profile_advance_between_eval_obligations_never_leaves_mixed_pair(db):
+    from jobscraper.pipeline.obligations import _evaluate_for_profiles
+
+    _run, _plan_id, job_id, _observation = _s311_ingest_job(db, at=NOW)
+    profile_id, rev1 = create_profile(db.conn, snapshot=PROFILE, now=NOW)
+
+    score_claim = claim_next_request(
+        db.conn, "s311-score-first", now=LATER, types=frozenset({"SCORE"})
+    )
+    assert score_claim is not None
+    with fenced_commit(
+        db.conn,
+        score_claim.request_id,
+        score_claim.attempt_id,
+        now=LATER,
+        mutate=lambda conn: _evaluate_for_profiles(
+            conn, job_id, request_type="SCORE", now=LATER
+        ),
+    ):
+        pass
+    assert db.conn.execute(
+        "SELECT profile_revision_id FROM job_eligibility WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == rev1
+    assert db.conn.execute(
+        "SELECT profile_revision_id FROM job_scores WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == rev1
+
+    rev2 = edit_profile(
+        db.conn, profile_id, snapshot=dict(PROFILE, keywords=["python"]), now=S311_LATER
+    )
+    eligibility_claim = claim_next_request(
+        db.conn, "s311-elig-second", now=S311_LATER, types=frozenset({"ELIGIBILITY"})
+    )
+    assert eligibility_claim is not None
+    with fenced_commit(
+        db.conn,
+        eligibility_claim.request_id,
+        eligibility_claim.attempt_id,
+        now=S311_LATER,
+        mutate=lambda conn: _evaluate_for_profiles(
+            conn, job_id, request_type="ELIGIBILITY", now=S311_LATER
+        ),
+    ):
+        pass
+    assert db.conn.execute(
+        "SELECT profile_revision_id FROM job_eligibility WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == rev2
+    assert db.conn.execute(
+        "SELECT profile_revision_id FROM job_scores WHERE job_id=? AND profile_id=?",
+        (job_id, profile_id),
+    ).fetchone()[0] == rev2
+
+
+def test_s311_profile_edit_and_evaluation_rematerialization_are_atomic(db, monkeypatch):
+    import jobscraper.pipeline.evaluation as evaluation_module
+
+    _run, _plan_id, _job_id, _observation = _s311_ingest_job(db, at=NOW)
+    profile_id, rev1 = create_profile(db.conn, snapshot=PROFILE, now=NOW)
+    assert drain_all_obligations(db.conn, now=LATER) >= 3
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("synthetic profile rematerialization crash")
+
+    monkeypatch.setattr(evaluation_module, "materialize_profile_revision", explode)
+    with pytest.raises(RuntimeError, match="profile rematerialization crash"):
+        edit_profile(
+            db.conn,
+            profile_id,
+            snapshot=dict(PROFILE, name="must roll back"),
+            now=S311_LATER,
+        )
+
+    assert db.conn.execute(
+        "SELECT current_revision_id FROM search_profiles WHERE id=?", (profile_id,)
+    ).fetchone()[0] == rev1
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM profile_revisions WHERE profile_id=?", (profile_id,)
+    ).fetchone()[0] == 1
+
+
+def test_s311_duplicate_logical_obligation_enqueue_reuses_one_durable_request(db):
+    run_id, _plan_id, _job_id, _observation = _s311_ingest_job(db, at=NOW)
+    existing = db.conn.execute(
+        "SELECT * FROM scrape_requests WHERE run_id=? AND request_type='ELIGIBILITY'",
+        (run_id,),
+    ).fetchone()
+    assert existing is not None
+    payload = json.loads(existing["payload_json"])
+    observation = db.conn.execute(
+        "SELECT id,parse_evidence_ref FROM job_observations WHERE id=?",
+        (payload["observation_id"],),
+    ).fetchone()
+    request_id, created = enqueue_request(
+        db.conn,
+        run_id=existing["run_id"],
+        run_source_plan_id=existing["run_source_plan_id"],
+        source_id=existing["source_id"],
+        binding_id=existing["binding_id"],
+        request_type="ELIGIBILITY",
+        target_identity=observation["id"],
+        logical_key=observation["parse_evidence_ref"],
+        payload=payload,
+        priority=-10,
+        now=LATER,
+    )
+    assert not created
+    assert request_id == existing["id"]
+    assert db.conn.execute(
+        "SELECT COUNT(*) FROM scrape_requests WHERE run_id=? AND request_type='ELIGIBILITY'",
+        (run_id,),
+    ).fetchone()[0] == 1

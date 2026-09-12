@@ -18,6 +18,7 @@ from jobscraper.net.destination import DestinationPolicy, check_url
 from jobscraper.runtime.authorization import require_request_authorized
 from jobscraper.runtime.claims import StaleOwnership
 from jobscraper.runtime.clock import current_service_epoch, db_utc_now
+from jobscraper.runtime.requests import ACQUISITION_REQUEST_TYPES
 
 _ALLOWED_METHODS = frozenset({"GET"})
 _FORBIDDEN_HEADER_NAMES = frozenset(
@@ -196,6 +197,13 @@ def bind_execution_plan(
         if row is None:
             raise StaleOwnership(
                 envelope.request_id, "claimed request/attempt/run-plan identity is not resolvable"
+            )
+        if row["request_type"] not in ACQUISITION_REQUEST_TYPES:
+            # R2-F3 / S3.11: LOCAL_PROCESSING claimability is deliberately
+            # independent of source-network authority.  A host-native request
+            # can never turn that local authority into an HTTP/browser plan.
+            raise ValueError(
+                "host-native request cannot bind a source-network execution plan"
             )
         if (row["lease_until"] or "") <= ts:
             raise StaleOwnership(envelope.request_id, "lease already expired")

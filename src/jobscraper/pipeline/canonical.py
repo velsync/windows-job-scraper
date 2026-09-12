@@ -152,6 +152,46 @@ def refresh_canonical_presentation(
         if location_changed:
             changes.append("LOCATION_CHANGED")
 
+    # S3.11 RUN-21: one canonical monotonic coordinate owns eligibility/score
+    # freshness. Per-source content revisions are not globally comparable, so
+    # advance only when an input actually consumed by those evaluators changes.
+    next_normalized_title = (
+        (winner_norm.normalized_title if winner_norm else None)
+        or job["normalized_title"]
+    )
+    next_salary_min = (
+        winner_norm.salary_min
+        if winner_norm is not None and winner_norm.salary_min is not None
+        else job["salary_min"]
+    )
+    next_salary_max = (
+        winner_norm.salary_max
+        if winner_norm is not None and winner_norm.salary_max is not None
+        else job["salary_max"]
+    )
+    next_salary_currency = (
+        (winner_norm.salary_currency if winner_norm else None)
+        or job["salary_currency"]
+    )
+    next_salary_period = (
+        (winner_norm.salary_period if winner_norm else None)
+        or job["salary_period"]
+    )
+    next_remote_worldwide = (
+        winner_norm.remote_worldwide if winner_norm else job["remote_worldwide"]
+    )
+    evaluation_changed = location_changed or any(
+        (
+            new_title != job["title"],
+            next_normalized_title != job["normalized_title"],
+            next_salary_min != job["salary_min"],
+            next_salary_max != job["salary_max"],
+            next_salary_currency != job["salary_currency"],
+            next_salary_period != job["salary_period"],
+            int(bool(next_remote_worldwide)) != int(job["remote_worldwide"]),
+        )
+    )
+
     conn.execute(
         """
         UPDATE jobs SET
@@ -164,6 +204,7 @@ def refresh_canonical_presentation(
             employment_type = ?, experience_level = ?,
             location_rules_version = ?, provenance_selector_version = ?,
             content_cleaning_version = ?,
+            evaluation_revision = evaluation_revision + ?,
             canonical_provenance_id = ?, updated_at = ?
         WHERE id = ?
         """,
@@ -199,6 +240,7 @@ def refresh_canonical_presentation(
             PROVENANCE_SELECTOR_VERSION,
             (winner_norm.content_cleaning_version if winner_norm else None)
             or job["content_cleaning_version"],
+            1 if evaluation_changed else 0,
             winner["id"],
             now,
             job_id,

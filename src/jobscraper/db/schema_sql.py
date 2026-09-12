@@ -1930,6 +1930,42 @@ CREATE INDEX idx_job_sources_availability_order
 ) -> None:
     return sql
 
+
+# ------------------------ v21 S3.11 exact evaluation input ordering
+# v1-v20 are released/frozen. S3.11 appends the canonical evaluation
+# revision and the eligibility-evaluator pin consumed by scores.
+@_step(21, "s3_11_evaluation_input_order")
+def _(sql: str = '''
+-- S3.11 exact-input ordering for current eligibility/score projections.
+-- v1-v20 are released/frozen; append only.
+
+ALTER TABLE jobs
+    ADD COLUMN evaluation_revision INTEGER NOT NULL DEFAULT 1
+    CHECK (evaluation_revision >= 1);
+
+-- Seed the new canonical monotonic coordinate conservatively from the largest
+-- historical per-presence revision.  From v21 onward only canonical changes
+-- to evaluation-relevant inputs advance this value.
+UPDATE jobs
+   SET evaluation_revision = MAX(
+       1,
+       COALESCE(
+           (SELECT MAX(js.content_revision)
+              FROM job_sources js
+             WHERE js.job_id = jobs.id),
+           1
+       )
+   );
+
+-- A score consumes the eligibility evaluator's verdict as an input, so record
+-- that code pin explicitly rather than letting a score look current after the
+-- evaluator changes.
+ALTER TABLE job_scores
+    ADD COLUMN eligibility_evaluator_version TEXT;
+'''
+) -> None:
+    return sql
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1944,6 +1980,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10, 16})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 20, (
-    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18; S3.9 appends v19; S3.10 appends v20"
+assert LATEST_SCHEMA_VERSION == 21, (
+    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18; S3.9 appends v19; S3.10 appends v20; S3.11 appends v21"
 )

@@ -296,6 +296,30 @@ def _job_sources_writes_are_verification_timestamp_only(text: str) -> bool:
     return found
 
 
+# S3.11 (RUN-21) narrow exception: the v21 migration seeds the newly-added
+# ``jobs.evaluation_revision`` once during the exclusive upgrade. The exact
+# assigned-column set is pinned in test_schema_slice3.py; the migration owner
+# may not INSERT into, DELETE from, or otherwise UPDATE ``jobs``.
+_V21_JOBS_BACKFILL_COLUMNS = frozenset({"evaluation_revision"})
+
+
+def _migration_jobs_writes_are_v21_backfill_only(text: str) -> bool:
+    if re.search(r"INSERT INTO jobs\b", text):
+        return False
+    if re.search(r"DELETE FROM jobs\b", text):
+        return False
+    updates = list(re.finditer(r"UPDATE jobs\b(.*?);", text, re.S))
+    if not updates:
+        return False
+    for match in updates:
+        assigned = set(
+            re.findall(r"(?m)^\s*(?:SET\s+)?([a-z_][a-z0-9_]*)\s*=", match.group(1))
+        )
+        if assigned != set(_V21_JOBS_BACKFILL_COLUMNS):
+            return False
+    return True
+
+
 @pytest.mark.parametrize(
     "table", ["jobs", "job_sources", "job_locations", "companies", "job_observations"]
 )
@@ -320,6 +344,14 @@ def test_only_pipeline_writes_canonical_and_observation_state(table: str):
         if w.startswith("src/jobscraper/pipeline/"):
             continue
         if table == "job_sources" and w == _SCHEMA_MIGRATION_OWNER:
+            continue
+        if (
+            table == "jobs"
+            and w == _SCHEMA_MIGRATION_OWNER
+            and _migration_jobs_writes_are_v21_backfill_only(
+                (REPO_ROOT / w).read_text(encoding="utf-8")
+            )
+        ):
             continue
         assert table == "job_sources" and _job_sources_writes_are_verification_timestamp_only(
             (REPO_ROOT / w).read_text(encoding="utf-8")
