@@ -1230,9 +1230,7 @@ class Harness:
             self.record("W1-03", FAIL, f"dedupe check failed: {exc}")
 
     def _w1_04_private_destination_denied(self, data_root: Path, feed_port: int, db) -> None:
-        """SSRF negative: the granted entry host is the loopback fixture,
-        but the binding template targets a TEST-NET address.  The packaged
-        app must fail closed — typed POLICY_REJECTED, no fetch attempt."""
+        """SSRF negative: reject a TEST-NET target before network dispatch."""
         try:
             self._w1_seed_source(
                 db, feed_port, source_id="src-2", binding_id="bnd-2",
@@ -1260,35 +1258,61 @@ class Harness:
                 run_status = run.get("status") if run else None
             finally:
                 self.stop_launcher(launcher)
+
             row = db.execute(
                 """
-                SELECT req.status, req.page_class, fa.failure_kind AS fetch_kind,
-                       fa.failure_json
+                SELECT req.id, req.status, req.last_failure_kind,
+                       req.last_failure_json, ra.attempt_id,
+                       ra.outcome AS attempt_outcome,
+                       ra.failure_kind AS attempt_failure_kind,
+                       ae.kind AS evidence_kind, ae.ref AS evidence_ref,
+                       ae.detail_json AS evidence_detail_json
                 FROM scrape_requests req
-                JOIN fetch_attempts fa ON fa.request_id = req.id
+                JOIN request_attempts ra ON ra.request_id = req.id
+                JOIN acquisition_evidence ae
+                  ON ae.request_id = req.id AND ae.attempt_id = ra.attempt_id
                 WHERE req.source_id = 'src-2'
-                ORDER BY req.created_at DESC LIMIT 1
+                  AND ae.ref = 'crawler://SCOPE_DENIED'
+                ORDER BY req.created_at DESC, ra.started_at DESC,
+                         ae.observed_at DESC
+                LIMIT 1
                 """
             ).fetchone()
-            failure = (
-                json.loads(row["failure_json"]) if row and row["failure_json"] else {}
+            request_failure = (
+                json.loads(row["last_failure_json"])
+                if row and row["last_failure_json"] else {}
+            )
+            evidence_detail = (
+                json.loads(row["evidence_detail_json"])
+                if row and row["evidence_detail_json"] else {}
             )
             policy_denied = (
                 row is not None
-                and row["status"] == "SUCCEEDED"  # definitive answer, no retry storm
-                and row["fetch_kind"] == "POLICY_REJECTED"
-                and failure.get("kind") == "POLICY_REJECTED"
-                and bool(
-                    (failure.get("details_redacted") or {}).get("reason_code")
-                )
+                and row["status"] == "FAILED"
+                and row["last_failure_kind"] == "POLICY_REJECTED"
+                and row["attempt_outcome"] == "FAILED"
+                and row["attempt_failure_kind"] == "POLICY_REJECTED"
+                and row["evidence_kind"] == "REVIEW"
+                and row["evidence_ref"] == "crawler://SCOPE_DENIED"
+                and bool(request_failure.get("reason"))
+                and request_failure.get("network_io_started") is False
+                and bool(evidence_detail.get("reason"))
+                and evidence_detail.get("network_io_started") is False
             )
+            fetch_count = db.execute(
+                "SELECT COUNT(*) FROM fetch_attempts fa "
+                "JOIN scrape_requests req ON req.id = fa.request_id "
+                "WHERE req.source_id = 'src-2'"
+            ).fetchone()[0]
+            observation_count = db.execute(
+                "SELECT COUNT(*) FROM job_observations WHERE source_id = 'src-2'"
+            ).fetchone()[0]
             ok = (
                 status == 200
                 and run_status == "PARTIAL"
                 and policy_denied
-                and db.execute(
-                    "SELECT COUNT(*) FROM job_observations WHERE source_id = 'src-2'"
-                ).fetchone()[0] == 0
+                and fetch_count == 0
+                and observation_count == 0
             )
             self.record(
                 "W1-04",
@@ -1297,13 +1321,14 @@ class Harness:
                 "(typed POLICY_REJECTED, nothing fetched)",
                 run_status=run_status,
                 request=(dict(row) if row else None),
+                fetch_count=fetch_count,
+                observation_count=observation_count,
             )
         except Exception as exc:  # noqa: BLE001
             self.record("W1-04", FAIL, f"SSRF destination check failed: {exc}")
 
     def _w1_05_redirect_hop_denied(self, data_root: Path, feed_port: int, db) -> None:
-        """SSRF negative: the granted entry host serves a redirect to an
-        unauthorized TEST-NET destination; each hop is policy-checked."""
+        """SSRF negative: deny each unauthorized redirect hop."""
         try:
             self._w1_repoint_binding(db, "bndrev-2", feed_port, "/redirect-jobs")
             launcher, url = self.launch_and_get_url(data_root)
@@ -1318,28 +1343,59 @@ class Harness:
                 self.stop_launcher(launcher)
             row = db.execute(
                 """
-                SELECT req.status, req.page_class, fa.failure_kind, fa.failure_json
+                SELECT req.status, req.page_class, req.last_failure_kind,
+                       req.last_failure_json,
+                       ra.outcome AS attempt_outcome,
+                       ra.failure_kind AS attempt_failure_kind,
+                       fa.failure_kind AS fetch_failure_kind,
+                       fa.failure_json AS fetch_failure_json
                 FROM scrape_requests req
-                JOIN fetch_attempts fa ON fa.request_id = req.id
+                JOIN request_attempts ra ON ra.request_id = req.id
+                JOIN fetch_attempts fa
+                  ON fa.request_id = req.id AND fa.attempt_id = ra.attempt_id
                 WHERE req.source_id = 'src-2'
-                ORDER BY req.created_at DESC LIMIT 1
+                ORDER BY req.created_at DESC, ra.started_at DESC,
+                         fa.fetched_at DESC
+                LIMIT 1
                 """
             ).fetchone()
-            failure = json.loads(row["failure_json"]) if row and row["failure_json"] else {}
+            fetch_failure = (
+                json.loads(row["fetch_failure_json"])
+                if row and row["fetch_failure_json"] else {}
+            )
+            request_failure = (
+                json.loads(row["last_failure_json"])
+                if row and row["last_failure_json"] else {}
+            )
+            observation_count = db.execute(
+                "SELECT COUNT(*) FROM job_observations WHERE source_id = 'src-2'"
+            ).fetchone()[0]
             ok = (
                 status == 200
                 and run_status == "PARTIAL"
                 and row is not None
-                and row["status"] == "SUCCEEDED"
-                and row["failure_kind"] == "POLICY_REJECTED"
-                and failure.get("kind") == "POLICY_REJECTED"
+                and row["status"] == "FAILED"
+                and row["page_class"] == "UNKNOWN"
+                and row["last_failure_kind"] == "POLICY_REJECTED"
+                and request_failure.get("kind") == "POLICY_REJECTED"
+                and row["attempt_outcome"] == "FAILED"
+                and row["attempt_failure_kind"] == "POLICY_REJECTED"
+                and row["fetch_failure_kind"] == "POLICY_REJECTED"
+                and fetch_failure.get("kind") == "POLICY_REJECTED"
+                and bool(
+                    (fetch_failure.get("details_redacted") or {}).get("reason_code")
+                )
+                and observation_count == 0
             )
             self.record(
                 "W1-05",
                 PASS if ok else FAIL,
                 "SSRF negative: redirect to unauthorized destination denied per hop",
                 run_status=run_status,
-                failure_kind=failure.get("kind"),
+                failure_kind=fetch_failure.get("kind"),
+                request_status=row["status"] if row else None,
+                request_failure_kind=row["last_failure_kind"] if row else None,
+                observation_count=observation_count,
             )
         except Exception as exc:  # noqa: BLE001
             self.record("W1-05", FAIL, f"redirect-hop check failed: {exc}")
