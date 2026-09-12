@@ -537,17 +537,20 @@ def _acquisition_retry(db: Database, run_id: str, plan_id: str, name: str, *, ne
     db.conn.commit()
 
 
-def test_dormant_retry_does_not_block_plan_or_run_terminalization(tmp_path):
-    """RUN-01 liveness: a not-yet-due retry is neither claimable (claim path
-    requires a valid due ``next_retry_at``) nor in flight, so it must not
-    wedge plan terminalization or run finalization.  The retry row stays
-    durable for a later pass (RUN-07 lease-loss shape)."""
+def test_future_retry_blocks_plan_and_run_terminalization(tmp_path):
+    """A not-yet-due retry is not claimable yet, but it remains accepted
+    durable work and therefore blocks terminal plan/run truth until resolved."""
     db = _db(tmp_path / "dormant.db")
     run_id, plan_ids = create_run(db.conn, profile_id=None, plans=_plans(1), now=NOW)
     _acquisition_retry(db, run_id, plan_ids[0], "dormant", next_retry_at=FAR_FUTURE)
-    set_group_outcome(db.conn, plan_ids[0], "FAILED", now=LATER)
-    assert _group(db, run_id)["group_outcome"] == "FAILED"
-    assert aggregate_run(db.conn, run_id, now=LATER) == "FAILED"
+    try:
+        set_group_outcome(db.conn, plan_ids[0], "FAILED", now=LATER)
+    except RunStateConflict:
+        pass
+    else:  # pragma: no cover - regression failure path
+        raise AssertionError("future retry incorrectly allowed plan terminalization")
+    assert _group(db, run_id)["group_outcome"] is None
+    assert aggregate_run(db.conn, run_id, now=LATER) is None
     assert db.conn.execute(
         "SELECT status FROM scrape_requests WHERE id='dormant'"
     ).fetchone()[0] == "RETRY_WAIT"
@@ -594,7 +597,7 @@ def test_partial_report_with_open_children_is_allowed_and_claimable(tmp_path):
     )
     set_group_outcome(db.conn, plan_ids[0], "SATISFIED_PARTIAL", now=LATER)
     assert _group(db, run_id)["group_outcome"] == "SATISFIED_PARTIAL"
-    assert aggregate_run(db.conn, run_id, now=LATER) == "PARTIAL"
+    assert aggregate_run(db.conn, run_id, now=LATER) is None
     claimed = claim_next_request(db.conn, "worker", now=LATER)
     assert claimed is not None and claimed.request_id == child_id
     db.close()
