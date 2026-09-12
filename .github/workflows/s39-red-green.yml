@@ -1,0 +1,22 @@
+name: S3.9 corrective gate
+
+on:
+  push:
+    branches:
+      - "repair/s39-terminal-work-barrier"
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m venv .venv
+      - run: .venv/bin/python -m pip install -r requirements/dev.lock.txt
+      - run: .venv/bin/python -m pip install --no-deps .
+      - run: .venv/bin/python -m pytest tests/integration/test_s39_terminal_work_barrier_red.py -q
