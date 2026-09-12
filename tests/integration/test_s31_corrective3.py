@@ -173,6 +173,11 @@ def test_run_service_fails_closed_when_restart_recovery_fails(tmp_path, monkeypa
             self.closed = True
 
     sock = FakeSocket()
+    bound = {"called": False}
+
+    def fake_bind(_host):
+        bound["called"] = True
+        return sock
 
     class FakeLifespan:
         def __init__(self, *args, **kwargs):
@@ -208,7 +213,7 @@ def test_run_service_fails_closed_when_restart_recovery_fails(tmp_path, monkeypa
             self.should_exit = True
 
     monkeypatch.setattr(runner, "open_service_database", lambda _config: database)
-    monkeypatch.setattr(runner, "_bind_loopback_socket", lambda _host: sock)
+    monkeypatch.setattr(runner, "_bind_loopback_socket", fake_bind)
     monkeypatch.setattr(
         runner,
         "create_service_app",
@@ -230,4 +235,7 @@ def test_run_service_fails_closed_when_restart_recovery_fails(tmp_path, monkeypa
     )
 
     assert code == 4
-    assert sock.closed
+    # S3.12 startup order is DB -> epoch/recovery -> coordinator -> bind, so a
+    # recovery failure must exit before any listener exists: the bind itself
+    # must never happen (there is no socket to close).
+    assert not bound["called"]

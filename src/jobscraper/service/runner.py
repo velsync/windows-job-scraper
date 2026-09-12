@@ -90,12 +90,90 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
     ensure_app_directories(paths)
     secret = install_secret or load_or_create_install_secret(paths)
 
-    # S3.3: install the one process-lifetime coordinator before opening any
-    # service resource.  A configuration refusal therefore cannot leak an
-    # already-open database connection. Executors receive reservations; they
-    # never own durable claims or capacity policy.
-    configure_service_capacity(config)
+    # S3.12 startup authority is intentionally layered:
+    #   database/migrations -> fresh service epoch + deterministic recovery
+    #   -> coordinator capacity -> socket/app/listener -> background work.
+    # No coordinator/listener can therefore claim or dispatch source-network
+    # work while prior-epoch durable state is still being reconciled.
     db = open_service_database(config)
+
+    from jobscraper.runtime.clock import begin_service_epoch
+    from jobscraper.runtime.recovery import recover_startup_state
+
+    try:
+        service_epoch = begin_service_epoch(db.conn)
+        recovered = recover_startup_state(db.conn)
+        if (
+            recovered["reclaimed"]
+            or recovered["released_local_retries"]
+            or recovered["finalized_cancelled_runs"]
+            or recovered["repaired_coverages"]
+            or recovered["repaired_plan_outcomes"]
+            or recovered["validated_resumable_plans"]
+            or recovered["drained_local_obligations"]
+            or recovered["reaggregated_terminal_runs"]
+        ):
+            append_event(
+                db.conn,
+                event(
+                    "INFO",
+                    "SERVICE_RECOVERY",
+                    "startup recovery reconciled durable work",
+                    data={
+                        "service_epoch_id": service_epoch.epoch_id,
+                        "reclaimed_requests": len(recovered["reclaimed"]),
+                        "released_local_retries": len(
+                            recovered["released_local_retries"]
+                        ),
+                        "finalized_cancelled_runs": len(
+                            recovered["finalized_cancelled_runs"]
+                        ),
+                        "repaired_coverages": len(recovered["repaired_coverages"]),
+                        "repaired_plan_outcomes": len(
+                            recovered["repaired_plan_outcomes"]
+                        ),
+                        "validated_resumable_plans": len(
+                            recovered["validated_resumable_plans"]
+                        ),
+                        "drained_local_obligations": int(
+                            recovered["drained_local_obligations"]
+                        ),
+                        "reaggregated_terminal_runs": len(
+                            recovered["reaggregated_terminal_runs"]
+                        ),
+                    },
+                ),
+            )
+    except Exception as exc:
+        try:
+            append_event(
+                db.conn,
+                event(
+                    "ERROR",
+                    "SERVICE_RECOVERY_FAILED",
+                    f"startup recovery failed: {exc}",
+                    data={"error_type": type(exc).__name__},
+                ),
+            )
+        except Exception:
+            # Recovery correctness dominates diagnostics. Even if the event
+            # write itself fails, startup still closes the database and exits
+            # before coordinator/listener/background work can exist.
+            pass
+        finally:
+            db.close()
+        return RECOVERY_FAILURE_EXIT_CODE
+
+    # S3.3 coordinator ownership still applies, but S3.12 deliberately creates
+    # it only after prior-epoch recovery is complete.  Keep the old
+    # configuration-refusal resource guarantee by closing the already-open
+    # database if capacity configuration itself refuses.
+    try:
+        configure_service_capacity(config)
+    except BaseException:
+        db.close()
+        raise
+
     try:
         sock = _bind_loopback_socket(config.loopback_host)
     except OSError as exc:
@@ -107,60 +185,11 @@ def run_service(config: AppConfig, *, install_secret: bytes | None = None) -> in
         return 3
     port = int(sock.getsockname()[1])
 
-    # Restart recovery (03 RUN-07/RUN-09, §18/§50): open the fresh service
-    # epoch FIRST (recording any still-open epoch as ended by
-    # SERVICE_RESTART). The service app requires a live service epoch —
-    # fail-closed (§50) — so the epoch must precede create_service_app;
-    # the guard minted there then covers every service claim for the
-    # lifetime of this process.
-    from jobscraper.runtime.clock import begin_service_epoch
-    from jobscraper.runtime.recovery import recover_interrupted_requests
-
-    service_epoch = begin_service_epoch(db.conn)
-
+    # create_service_app requires the fresh active service epoch.  It is now
+    # created only after deterministic recovery and coordinator installation.
     app, state = create_service_app(config, db, port=port, secret=secret)
     lifespan = ServiceLifespan(config, db, secret)
     app.state.lifespan = lifespan
-
-    # Then reclaim the orphaned RUNNING requests and finalize any
-    # cancellation the crash interrupted. This is a correctness gate, not
-    # best-effort diagnostics: after the epoch advances, old RUNNING owners
-    # are invalid and must be durably reclaimed before the service can serve
-    # or accept new acquisition work (§50/RUN-19).
-    try:
-        recovered = recover_interrupted_requests(db.conn)
-        if recovered["reclaimed"] or recovered["finalized_cancelled_runs"]:
-            append_event(
-                db.conn,
-                event(
-                    "INFO",
-                    "SERVICE_RECOVERY",
-                    "restart recovery reclaimed orphaned requests",
-                    data={
-                        "service_epoch_id": service_epoch.epoch_id,
-                        "reclaimed_requests": len(recovered["reclaimed"]),
-                        "finalized_cancelled_runs": len(
-                            recovered["finalized_cancelled_runs"]
-                        ),
-                    },
-                ),
-            )
-    except Exception as exc:
-        append_event(
-            db.conn,
-            event(
-                "ERROR",
-                "SERVICE_RECOVERY_FAILED",
-                f"restart recovery failed: {exc}",
-                data={"error_type": type(exc).__name__},
-            ),
-        )
-        # The socket is bound but uvicorn has not adopted/listened on it yet.
-        # Fail closed: do not provision/serve with invalidated prior-epoch
-        # RUNNING work still unreconciled.
-        sock.close()
-        db.close()
-        return RECOVERY_FAILURE_EXIT_CODE
 
     # S2.3 (01 §45): provision the search surface (FTS5 when the host has it,
     # an honest SUBSTRING_FALLBACK record otherwise).  Capability-gated and
