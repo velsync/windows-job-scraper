@@ -1,0 +1,117 @@
+diff --git a/src/jobscraper/runtime/runs.py b/src/jobscraper/runtime/runs.py
+--- a/src/jobscraper/runtime/runs.py
++++ b/src/jobscraper/runtime/runs.py
+@@ -56,25 +56,20 @@ _OPEN_REQUEST_STATUSES = ("PENDING", "RUNNING", "RETRY_WAIT")
+ def _claimable_or_inflight_sql(alias: str | None = None) -> str:
+     """SQL fragment matching acquisition work that still blocks terminal truth.
+ 
+-    Mirrors the claim path exactly: ``PENDING`` is always claimable,
+-    ``RUNNING`` is in flight under a lease, and ``RETRY_WAIT`` is claimable
+-    only with a valid durable ``next_retry_at`` that is already due.  A
+-    dormant retry (not-yet-due, NULL, or empty timestamp) is neither
+-    claimable nor in flight: nothing in the bounded pass can act on it, so
+-    it must not wedge plan terminalization or run finalization (RUN-01
+-    liveness; RUN-07 lease-loss recovery keeps the retry row durable for a
+-    later pass via the terminal-plan re-drive path).  The caller binds the
+-    authoritative timestamp once.
++    Terminal truth is stricter than immediate claimability: ``PENDING`` and
++    ``RUNNING`` are open now, while every ``RETRY_WAIT`` is durable promised
++    future work even when ``next_retry_at`` is not due yet.  Claim selection
++    still applies the due-time predicate; this barrier only prevents a plan or
++    run from becoming terminal while accepted retry work remains outstanding.
+     """
+     prefix = f"{alias}." if alias else ""
+-    return (
+-        f"({prefix}status IN ('PENDING', 'RUNNING')"
+-        f" OR ({prefix}status = 'RETRY_WAIT'"
+-        f" AND {prefix}next_retry_at IS NOT NULL"
+-        f" AND {prefix}next_retry_at <> ''"
+-        f" AND {prefix}next_retry_at <= ?))"
+-    )
++    return f"{prefix}status IN ('PENDING', 'RUNNING', 'RETRY_WAIT')"
+@@ -86,7 +81,7 @@ def plan_actionable_open_work(
+             " WHERE run_source_plan_id = ?"
+             f" AND request_type IN ({acquisition_types})"
+             f" AND {_claimable_or_inflight_sql()}",
+-            (plan_id, *sorted(ACQUISITION_REQUEST_TYPES), now),
++            (plan_id, *sorted(ACQUISITION_REQUEST_TYPES)),
+         ).fetchone()[0]
+     )
+@@ -466,11 +461,10 @@ def _relevant_open_work(conn: sqlite3.Connection, run_id: str, *, now: str) -> i
+     Acquisition work counts only while its owning plan can still drive it:
+-    the plan is undecided or partial, and the request is claimable or in
+-    flight.  A dormant retry is actionable by nothing in the bounded pass,
+-    and leftovers owned by a finally-terminal plan are claimable by nobody,
+-    so neither wedges finalization while their rows stay durable.  Only
+-    acquisition work belonging to an explicitly skipped plan was already
+-    irrelevant to further collection.
++    the plan is undecided or partial, and the request is pending, in flight,
++    or waiting for its durable retry time.  Deferred retry work therefore
++    keeps the run non-terminal even though it is not claimable yet.  Leftovers
++    owned by a finally-terminal/skipped plan remain diagnostic rows and do not
++    wedge finalization because that plan can no longer drive them.
+@@ -491,7 +485,6 @@ def _relevant_open_work(conn: sqlite3.Connection, run_id: str, *, now: str) -> i
+                 run_id,
+                 *sorted(ACQUISITION_REQUEST_TYPES),
+                 *sorted(ACQUISITION_REQUEST_TYPES),
+-                now,
+             ),
+         ).fetchone()[0]
+     )
+@@ -547,15 +540,11 @@ def aggregate_run(
+-        # An explicitly incomplete verdict (PARTIAL/CANCELLED) honestly reports
+-        # unfinished collection, so open acquisition work does not block it;
+-        # accepted host-native obligations must still drain first.  A verdict
+-        # of SUCCEEDED/FAILED claims nothing is left actionable.
+-        if status in ("PARTIAL", "CANCELLED"):
+-            blocking = _relevant_native_open_work(conn, run_id)
+-        else:
+-            blocking = _relevant_open_work(conn, run_id, now=ts)
++        # Group truth may be visibly partial while accepted work remains, but
++        # RUN-01 does not permit the run itself to become terminal until every
++        # relevant acquisition and host-native obligation has drained.
++        blocking = _relevant_open_work(conn, run_id, now=ts)
+         if blocking:
+             conn.execute("COMMIT")
+             return None
+diff --git a/tests/integration/test_s39_fallback_groups.py b/tests/integration/test_s39_fallback_groups.py
+--- a/tests/integration/test_s39_fallback_groups.py
++++ b/tests/integration/test_s39_fallback_groups.py
+@@ -537,17 +537,23 @@ def _acquisition_retry(db: Database, run_id: str, plan_id: str, name: str, *, ne
+     db.conn.commit()
+ 
+ 
+-def test_dormant_retry_does_not_block_plan_or_run_terminalization(tmp_path):
+-    """RUN-01 liveness: a not-yet-due retry is neither claimable (claim path
+-    requires a valid due ``next_retry_at``) nor in flight, so it must not
+-    wedge plan terminalization or run finalization.  The retry row stays
+-    durable for a later pass (RUN-07 lease-loss shape)."""
++def test_future_retry_blocks_plan_and_run_terminalization(tmp_path):
++    """A not-yet-due retry is not claimable yet, but it remains accepted
++    durable work and therefore blocks terminal plan/run truth until resolved."""
+     db = _db(tmp_path / "dormant.db")
+     run_id, plan_ids = create_run(db.conn, profile_id=None, plans=_plans(1), now=NOW)
+     _acquisition_retry(db, run_id, plan_ids[0], "dormant", next_retry_at=FAR_FUTURE)
+-    set_group_outcome(db.conn, plan_ids[0], "FAILED", now=LATER)
+-    assert _group(db, run_id)["group_outcome"] == "FAILED"
+-    assert aggregate_run(db.conn, run_id, now=LATER) == "FAILED"
++    try:
++        set_group_outcome(db.conn, plan_ids[0], "FAILED", now=LATER)
++    except RunStateConflict:
++        pass
++    else:  # pragma: no cover - regression failure path
++        raise AssertionError("future retry incorrectly allowed plan terminalization")
++    assert _group(db, run_id)["group_outcome"] is None
++    assert aggregate_run(db.conn, run_id, now=LATER) is None
+     assert db.conn.execute(
+         "SELECT status FROM scrape_requests WHERE id='dormant'"
+     ).fetchone()[0] == "RETRY_WAIT"
+@@ -582,7 +588,7 @@ def test_partial_report_with_open_children_is_allowed_and_claimable(tmp_path):
+     )
+     set_group_outcome(db.conn, plan_ids[0], "SATISFIED_PARTIAL", now=LATER)
+     assert _group(db, run_id)["group_outcome"] == "SATISFIED_PARTIAL"
+-    assert aggregate_run(db.conn, run_id, now=LATER) == "PARTIAL"
++    assert aggregate_run(db.conn, run_id, now=LATER) is None
+     claimed = claim_next_request(db.conn, "worker", now=LATER)
+     assert claimed is not None and claimed.request_id == child_id
+     db.close()
