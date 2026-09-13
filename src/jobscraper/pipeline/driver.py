@@ -283,33 +283,42 @@ def execute_run(
 
 
 def _update_run_counters(conn: sqlite3.Connection, run_id: str) -> None:
-    """Honest run accounting derived from persisted evidence (§16.1)."""
+    """Honest run accounting derived from durable semantic effects (§16.1).
+
+    Post-S3.13 Corrective A5: saved/updated count distinct canonical jobs by
+    their immutable per-observation ``run_effect``. A job created and later
+    updated in the same run counts as saved, never double-counted.
+    """
     conn.execute(
         """
         UPDATE scrape_runs SET
             jobs_discovered = (SELECT COUNT(*) FROM job_observations WHERE run_id = ?),
             jobs_saved = (
-                SELECT COUNT(DISTINCT js.job_id) FROM job_sources js
-                JOIN jobs j ON j.id = js.job_id
-                WHERE js.last_observation_id IN
-                    (SELECT id FROM job_observations WHERE run_id = ?)
-                  AND j.created_at >= COALESCE(
-                      (SELECT started_at FROM scrape_runs WHERE id = ?), j.created_at)
+                SELECT COUNT(DISTINCT resolved_job_id) FROM job_observations
+                WHERE run_id = ?
+                  AND run_effect = 'NEW_JOB'
+                  AND resolved_job_id IS NOT NULL
             ),
             jobs_updated = (
-                SELECT COUNT(DISTINCT js.job_id) FROM job_sources js
-                JOIN jobs j ON j.id = js.job_id
-                WHERE js.last_observation_id IN
-                    (SELECT id FROM job_observations WHERE run_id = ?)
-                  AND j.created_at < COALESCE(
-                      (SELECT started_at FROM scrape_runs WHERE id = ?), j.created_at)
+                SELECT COUNT(DISTINCT o.resolved_job_id)
+                FROM job_observations o
+                WHERE o.run_id = ?
+                  AND o.run_effect = 'UPDATED_JOB'
+                  AND o.resolved_job_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM job_observations n
+                      WHERE n.run_id = o.run_id
+                        AND n.resolved_job_id = o.resolved_job_id
+                        AND n.run_effect = 'NEW_JOB'
+                  )
             ),
             requests_total = (SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?),
             requests_failed = (SELECT COUNT(*) FROM scrape_requests
                                WHERE run_id = ? AND status = 'FAILED')
         WHERE id = ?
         """,
-        (run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id),
+        (run_id, run_id, run_id, run_id, run_id, run_id),
     )
     conn.commit()
 

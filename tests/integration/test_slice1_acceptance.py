@@ -518,8 +518,10 @@ class TestVerticalPath:
         status, detail = _api(state, auth, "GET", f"/api/jobs/{job_backend}")
         assert status == 200 and detail["job"]["title"] == "Backend Engineer"
 
-        # ---- a second run resumes from the durable cursor and is
-        # idempotent: page 1 is not re-fetched, nothing is duplicated
+        # ---- a second fresh run creates a new RunSourcePlan: no validator
+        # exists, so page 1 is verified again plus the recognized terminal
+        # empty page 2. Canonical identity/event state stays idempotent;
+        # the new immutable verification observations do not count as updates.
         status, run2 = _api(
             state, auth, "POST", "/api/runs", json_body={"profile_id": profile_id}
         )
@@ -528,13 +530,15 @@ class TestVerticalPath:
         assert (
             _count(
                 state,
-                "SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?",
+                "SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?"
+                " AND request_type = 'LIST_FETCH'",
                 (run2["run_id"],),
             )
-            == 1
+            == 2
         )
         assert _count(state, "SELECT COUNT(*) FROM jobs") == 2
-        assert _count(state, "SELECT COUNT(*) FROM job_observations") == 2
+        assert _count(state, "SELECT COUNT(*) FROM job_sources") == 2
+        assert _count(state, "SELECT COUNT(*) FROM job_observations") == 4
         assert (
             _count(
                 state,

@@ -314,7 +314,7 @@ def _evidence(db, kind=None, ref_like=None):
 
 def _fetch_urls(db):
     return [r["requested_url"] for r in db.conn.execute(
-        "SELECT requested_url FROM fetch_attempts ORDER BY fetched_at, id"
+        "SELECT requested_url FROM fetch_attempts ORDER BY rowid"
     ).fetchall()]
 
 
@@ -492,7 +492,8 @@ def test_board_run_reaches_canonical_jobs_through_the_whole_spine(db, server):
     assert run["jobs_discovered"] == 3
     assert run["requests_total"] >= 1
     assert run["requests_failed"] == 0
-    assert run["jobs_saved"] + run["jobs_updated"] == 3
+    assert run["jobs_saved"] == 3
+    assert run["jobs_updated"] == 0
     assert _outcome(db, run_id) == "SATISFIED"
 
     # ---- obligations drained: the jobs are Inbox-visible for the profile
@@ -647,7 +648,7 @@ def test_a_health_probe_rides_the_same_pins_and_leaves_coverage_untouched(db, se
         "/posting-api/job-board/acme?includeCompensation=true"
     )
     parse_attempts = db.conn.execute(
-        "SELECT * FROM parse_attempts ORDER BY parsed_at, id"
+        "SELECT * FROM parse_attempts ORDER BY rowid"
     ).fetchall()
     assert len(parse_attempts) == 2
     probe = next(p for p in parse_attempts if p["outcome_kind"] == "SUCCESS_EMPTY")
@@ -994,7 +995,9 @@ def test_a_second_run_reobserves_without_duplicating_jobs(db, server):
     assert all(g["completion_state"] == "COMPLETE" for g in generations)
     second = db.conn.execute("SELECT * FROM scrape_runs WHERE id = ?", (second_run,)).fetchone()
     assert second["status"] == "SUCCEEDED"
-    assert second["jobs_saved"] + second["jobs_updated"] == 3
+    # A5.10: an unchanged second fresh run is not counted as an update.
+    assert second["jobs_saved"] == 0
+    assert second["jobs_updated"] == 0
     assert all(j["listing_status"] == "ACTIVE" for j in _jobs(db))
     assert db.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1
 

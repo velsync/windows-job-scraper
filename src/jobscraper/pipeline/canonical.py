@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 
 from jobscraper.ids import new_id
 
@@ -56,39 +57,70 @@ def presences_for_job(conn: sqlite3.Connection, job_id: str) -> list[sqlite3.Row
     return _presences(conn, job_id)
 
 
-def _latest_observation_projection(conn: sqlite3.Connection, presence: sqlite3.Row):
-    """Re-normalize the winning presence's retained payload (Slice-1 behavior).
+def _latest_observation_projection(
+    conn: sqlite3.Connection, presence: sqlite3.Row, *, normalized=None,
+):
+    """Project the latest semantic change among this presence's accepted views.
 
-    A presence that is not the freshest one still owns the canonical
-    presentation when its quality class wins, so its content — text, salary,
-    categorical fields and the derived location set — is re-projected from the
-    payload retained on its own observation.  No new fetch is performed and
-    nothing is invented: no retained payload means no re-projection.
+    Repeated LIST/DETAIL (or other request-kind) views are verification, not
+    new content authority. Collapse equal normalized states within each kind
+    before selecting the latest transition across kinds. Thus an unchanged
+    poorer view cannot undo richer evidence, while a changed view still wins.
+    The latest-observation pointer continues to record the newest sighting.
     """
+    from types import SimpleNamespace
+
+    from jobscraper.pipeline.normalize import normalize_observation
+
     observation_id = presence["last_observation_id"]
     if not observation_id:
         return None
-    row = conn.execute(
-        "SELECT raw_payload_ref, observed_at FROM job_observations WHERE id = ?",
-        (observation_id,),
-    ).fetchone()
-    if row is None or not row["raw_payload_ref"]:
-        return None
-    try:
-        fields = json.loads(row["raw_payload_ref"])
-    except ValueError:
-        return None
-    if not isinstance(fields, dict):
-        return None
+    rows = conn.execute(
+        """
+        SELECT o.id, o.raw_payload_ref, o.observed_at, r.request_type
+          FROM job_observations o
+          JOIN scrape_requests r ON r.id = o.request_id
+         WHERE o.source_id = ? AND o.source_job_id IS ?
+           AND (o.id = ? OR (? AND o.resolved_job_id = ?
+                AND o.run_effect IN ('NEW_JOB', 'UPDATED_JOB', 'UNCHANGED_JOB')))
+           AND o.rowid <= (SELECT rowid FROM job_observations WHERE id = ?)
+         ORDER BY o.rowid
+        """,
+        (presence["source_id"], presence["source_job_id"], observation_id,
+         bool(presence["source_job_id"]), presence["job_id"], observation_id),
+    )
+    previous_by_kind = {}
+    winner = None
+    for row in rows:
+        if row["id"] == observation_id and normalized is not None:
+            current = normalized
+        else:
+            try:
+                fields = json.loads(row["raw_payload_ref"] or "null")
+            except ValueError:
+                fields = None
+            if not isinstance(fields, dict):
+                # Missing retained evidence cannot authorize a re-projection.
+                if row["id"] == observation_id:
+                    return None
+                continue
+            current = normalize_observation(
+                SimpleNamespace(fields=fields), observed_at=row["observed_at"],
+            )
+        kind = row["request_type"]
+        # Compare the whole normalized projection: content_hash deliberately
+        # covers only title/company/description and misses location/salary/etc.
+        if current != previous_by_kind.get(kind):
+            winner = current
+        previous_by_kind[kind] = current
+    return winner
 
-    class _RetainedObservation:
-        """The minimal shape ``normalize_observation`` reads from a proposal."""
 
-    shim = _RetainedObservation()
-    shim.fields = fields
-    from jobscraper.pipeline.normalize import normalize_observation
-
-    return normalize_observation(shim, observed_at=row["observed_at"])
+@dataclass(frozen=True)
+class CanonicalRefreshResult:
+    projection_changed: bool
+    evaluation_changed: bool
+    change_classes: tuple[str, ...]
 
 
 def refresh_canonical_presentation(
@@ -98,7 +130,7 @@ def refresh_canonical_presentation(
     now: str,
     normalized,
     fresh_presence_id: str,
-) -> None:
+) -> CanonicalRefreshResult:
     """Re-derive the canonical projection for one job (01 §39, RUN-12/21).
 
     The winning provenance is selected by the §39 quality class (recorded per
@@ -119,12 +151,9 @@ def refresh_canonical_presentation(
 
     presences = presences_for_job(conn, job_id)
     winner = select_canonical_provenance(presences)
-    # the freshest presence is already normalized by the caller; a non-fresh
-    # winner is re-projected from its own retained payload
-    winner_norm = (
-        normalized
-        if winner["id"] == fresh_presence_id
-        else _latest_observation_projection(conn, winner)
+    winner_norm = _latest_observation_projection(
+        conn, winner,
+        normalized=normalized if winner["id"] == fresh_presence_id else None,
     )
 
     job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -189,6 +218,43 @@ def refresh_canonical_presentation(
             next_salary_currency != job["salary_currency"],
             next_salary_period != job["salary_period"],
             int(bool(next_remote_worldwide)) != int(job["remote_worldwide"]),
+        )
+    )
+
+    # A5.1: semantic projection comparison — every field the UPDATE derives
+    # from current evidence, excluding housekeeping timestamps. Version
+    # columns ride along but never alone constitute a semantic change.
+    _new_desc_md = (winner_norm.description_md if winner_norm else None) or job["description_md"]
+    _new_desc_text = (winner_norm.description_text if winner_norm else None) or job["description_text"]
+    _new_desc_lang = (winner_norm.description_lang if winner_norm else None) or job["description_lang"]
+    _new_salary_text = (winner_norm.salary_original_text if winner_norm else None) or job["salary_original_text"]
+    _new_posted = job["posted_at"] or (winner_norm.posted_at if winner_norm else None)
+    _new_remote_mode = (winner_norm.remote_mode if winner_norm else None) or job["remote_mode"]
+    _new_employment = (winner_norm.employment_type if winner_norm else None) or job["employment_type"]
+    _new_experience = (winner_norm.experience_level if winner_norm else None) or job["experience_level"]
+    projection_changed = any(
+        (
+            new_title != job["title"],
+            next_normalized_title != job["normalized_title"],
+            _new_desc_md != job["description_md"],
+            _new_desc_text != job["description_text"],
+            _new_desc_lang != job["description_lang"],
+            new_desc_hash != job["description_hash"],
+            _new_salary_text != job["salary_original_text"],
+            next_salary_min != job["salary_min"],
+            next_salary_max != job["salary_max"],
+            next_salary_currency != job["salary_currency"],
+            next_salary_period != job["salary_period"],
+            (_new_posted or None) != (job["posted_at"] or None),
+            (winner["origin_provider"] or None) != (job["origin_provider"] or None),
+            (winner["origin_board"] or None) != (job["origin_board"] or None),
+            (winner["origin_job_id"] or None) != (job["origin_job_id"] or None),
+            (_new_remote_mode or None) != (job["remote_mode"] or None),
+            int(bool(next_remote_worldwide)) != int(job["remote_worldwide"]),
+            (_new_employment or None) != (job["employment_type"] or None),
+            (_new_experience or None) != (job["experience_level"] or None),
+            (winner["id"] or None) != (job["canonical_provenance_id"] or None),
+            bool(location_changed),
         )
     )
 
@@ -257,6 +323,12 @@ def refresh_canonical_presentation(
 
     sync_search_doc(conn, job_id=job_id, now=now)
 
+    return CanonicalRefreshResult(
+        projection_changed=projection_changed,
+        evaluation_changed=evaluation_changed,
+        change_classes=tuple(changes),
+    )
+
 
 def record_change(conn: sqlite3.Connection, job_id: str, change_class: str, now: str) -> None:
     conn.execute(
@@ -268,6 +340,7 @@ def record_change(conn: sqlite3.Connection, job_id: str, change_class: str, now:
 
 __all__ = [
     "STRATEGY_QUALITY",
+    "CanonicalRefreshResult",
     "presences_for_job",
     "record_change",
     "refresh_canonical_presentation",

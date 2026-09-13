@@ -302,7 +302,7 @@ def _outcome(db, run_id):
 
 def _parses(db):
     return db.conn.execute(
-        "SELECT outcome_kind, continuation_required FROM parse_attempts ORDER BY parsed_at, id"
+        "SELECT outcome_kind, continuation_required FROM parse_attempts ORDER BY rowid"
     ).fetchall()
 
 

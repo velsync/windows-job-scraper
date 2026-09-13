@@ -484,7 +484,11 @@ def test_replaying_the_same_evidence_is_idempotent(db):
         "job_locations": 2,
         "company_resolution_events": 1,
     }
-    assert replay["job_id"] is None
+    # A5.5: idempotent replay returns the already-bound durable effect
+    # rather than recalculating it (pre-A5 contract returned job_id None).
+    assert replay["job_id"] == first["job_id"]
+    assert replay["resolved_job_id"] == first["resolved_job_id"]
+    assert replay["run_effect"] == first["run_effect"]
     assert db.conn.execute(
         "SELECT COUNT(*) FROM job_observations"
     ).fetchone()[0] == 1

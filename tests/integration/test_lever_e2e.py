@@ -335,7 +335,7 @@ def _evidence(db, kind=None, ref_like=None):
 
 def _fetch_urls(db):
     return [r["requested_url"] for r in db.conn.execute(
-        "SELECT requested_url FROM fetch_attempts ORDER BY fetched_at, id"
+        "SELECT requested_url FROM fetch_attempts ORDER BY rowid"
     ).fetchall()]
 
 
@@ -513,7 +513,8 @@ def test_site_run_reaches_canonical_jobs_through_the_whole_spine(db, server):
     assert run["jobs_discovered"] == 6
     assert run["requests_total"] >= 4
     assert run["requests_failed"] == 0
-    assert run["jobs_saved"] + run["jobs_updated"] == 3
+    assert run["jobs_saved"] == 3
+    assert run["jobs_updated"] == 0
     assert _outcome(db, run_id) == "SATISFIED"
 
     # ---- obligations drained: the jobs are Inbox-visible for the profile
@@ -593,7 +594,7 @@ def test_a_full_page_continues_through_a_host_cursor_until_a_short_page(db, serv
     assert [u.rsplit("?", 1)[1] for u in urls] == ["mode=json&skip=0&limit=2", "mode=json&skip=2&limit=2"]
     parses = db.conn.execute(
         "SELECT outcome_kind, continuation_required, coverage_proposal_json, cursor_proposal_json"
-        " FROM parse_attempts ORDER BY parsed_at, id"
+        " FROM parse_attempts ORDER BY rowid"
     ).fetchall()
     assert [(p["outcome_kind"], p["continuation_required"]) for p in parses] == [
         ("SUCCESS_WITH_JOBS", 1), ("SUCCESS_WITH_JOBS", 0),
@@ -677,7 +678,7 @@ def test_a_server_that_ignores_skip_is_a_trap_not_a_complete_enumeration(db, ser
     assert [j["title"] for j in _jobs(db)] == ["Backend Engineer", "Platform Engineer"]
     assert len(_presences(db)) == 2
     parses = db.conn.execute(
-        "SELECT outcome_kind, continuation_required FROM parse_attempts ORDER BY parsed_at, id"
+        "SELECT outcome_kind, continuation_required FROM parse_attempts ORDER BY rowid"
     ).fetchall()
     assert [(p["outcome_kind"], p["continuation_required"]) for p in parses] == [
         ("SUCCESS_WITH_JOBS", 1), ("SUCCESS_WITH_JOBS", 1),
@@ -1025,7 +1026,9 @@ def test_a_second_run_reobserves_without_duplicating_jobs(db, server):
     assert all(g["completion_state"] == "COMPLETE" for g in generations)
     second = db.conn.execute("SELECT * FROM scrape_runs WHERE id = ?", (second_run,)).fetchone()
     assert second["status"] == "SUCCEEDED"
-    assert second["jobs_saved"] + second["jobs_updated"] == 3
+    # A5.10: an unchanged second fresh run is not counted as an update.
+    assert second["jobs_saved"] == 0
+    assert second["jobs_updated"] == 0
     assert all(j["listing_status"] == "ACTIVE" for j in _jobs(db))
     assert db.conn.execute("SELECT COUNT(*) FROM companies").fetchone()[0] == 1
 

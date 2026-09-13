@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import dataclass
 
 from jobscraper.acquisition.origin import OriginResolution, OriginStatus
 from jobscraper.adapters.contract import CONTRACT_VERSION
@@ -43,6 +44,106 @@ from jobscraper.runtime.requests import enqueue_request
 _ABSENCE_AUTHORITIES = frozenset(
     {"AUTHORITATIVE_FULL_SOURCE", "AUTHORITATIVE_DECLARED_SCOPE"}
 )
+
+
+@dataclass(frozen=True)
+class PresenceUpsertResult:
+    presence_id: str
+    accepted: bool
+    created: bool
+    semantic_changed: bool
+
+
+_RUN_EFFECTS = frozenset({"NEW_JOB", "UPDATED_JOB", "UNCHANGED_JOB", "STALE_IGNORED"})
+
+
+class ObservationEffectIntegrityError(RuntimeError):
+    pass
+
+
+def _origin_evidence_substance(payload: object):
+    """Origin evidence with per-run and per-view noise removed.
+
+    ``origin_resolution_evidence_json`` embeds two kinds of non-semantic
+    churn:
+
+    * per-run verification timestamps (top-level ``resolved_at`` and
+      per-item ``observed_at``), which advance on every reverification like
+      ``last_seen_at`` and must never by themselves count as a change;
+    * the per-view corroboration path: a listing view may corroborate the
+      same origin identity through ``application_url`` while the detail view
+      of the same job corroborates through ``canonical_job_url`` (or vice
+      versa). The resolved identity, confidence and strength are identical;
+      only the diagnostic field label alternates with the view.
+
+    The substance comparison keeps the resolved projection (status,
+    identity, confidence, conflict, rejected candidates, resolver versions
+    and URL outcomes) plus, per evidence item, only its probative content
+    ``(kind, strength, value, pattern_id)``. A real change in corroboration,
+    strength, value, matching rule, conflict or resolver version still fires.
+    """
+    if payload is None:
+        return None
+    if not isinstance(payload, str):
+        return payload
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return payload
+    if not isinstance(data, dict):
+        return data
+    data = dict(data)
+    data.pop("resolved_at", None)
+    evidence = data.get("evidence")
+    if isinstance(evidence, list):
+        data["evidence"] = sorted(
+            (
+                str(item.get("kind")),
+                str(item.get("strength", "")),
+                str(item.get("value", "")),
+                str(item.get("pattern_id", "")),
+            )
+            for item in evidence
+            if isinstance(item, dict)
+        )
+    return data
+
+
+def _bind_observation_effect(
+    conn: sqlite3.Connection,
+    *,
+    observation_id: str,
+    job_id: str,
+    run_effect: str,
+) -> None:
+    if run_effect not in _RUN_EFFECTS:
+        raise ValueError("invalid run effect")
+
+    cur = conn.execute(
+        """
+        UPDATE job_observations
+           SET resolved_job_id = ?, run_effect = ?
+         WHERE id = ?
+           AND resolved_job_id IS NULL
+           AND run_effect IS NULL
+        """,
+        (job_id, run_effect, observation_id),
+    )
+    if cur.rowcount == 1:
+        return
+
+    row = conn.execute(
+        "SELECT resolved_job_id, run_effect FROM job_observations WHERE id = ?",
+        (observation_id,),
+    ).fetchone()
+    if row is None:
+        raise ObservationEffectIntegrityError("observation disappeared")
+    if row["resolved_job_id"] == job_id and row["run_effect"] == run_effect:
+        return
+
+    raise ObservationEffectIntegrityError(
+        "observation effect already bound inconsistently"
+    )
 
 
 def observation_key(source_id: str, observation, page_cursor_json: str | None) -> str:
@@ -165,9 +266,29 @@ def ingest_observation(
     )
     if inserted.rowcount == 0:
         existing = conn.execute(
-            "SELECT id FROM job_observations WHERE request_id = ? AND observation_unique_key = ?",
+            "SELECT id, resolved_job_id, run_effect FROM job_observations"
+            " WHERE request_id = ? AND observation_unique_key = ?",
             (request_id, key),
         ).fetchone()
+        _existing_job = existing["resolved_job_id"]
+        _existing_effect = existing["run_effect"]
+        if _existing_job is not None and _existing_effect is not None:
+            if _existing_effect not in _RUN_EFFECTS:
+                raise ObservationEffectIntegrityError(
+                    "observation effect already bound inconsistently"
+                )
+            return {
+                "observation_id": existing["id"],
+                "job_id": _existing_job,
+                "resolved_job_id": _existing_job,
+                "run_effect": _existing_effect,
+                "decision": "IDEMPOTENT",
+                "idempotent": True,
+            }
+        if (_existing_job is None) != (_existing_effect is None):
+            raise ObservationEffectIntegrityError(
+                "observation effect already bound inconsistently"
+            )
         return {
             "observation_id": existing["id"],
             "job_id": None,
@@ -266,6 +387,7 @@ def ingest_observation(
         origin=origin,
     )
 
+    company_filled = False
     if resolution.decision in ("CREATED", "SPLIT_REUSE"):
         job_id = _create_canonical_job(
             conn,
@@ -276,14 +398,7 @@ def ingest_observation(
         )
     else:
         job_id = resolution.job_id
-        if company.company_id:
-            # a company identified later (or a job created before company
-            # resolution existed) is filled in once, never re-pointed
-            conn.execute(
-                "UPDATE jobs SET company_id = ?, updated_at = ?"
-                " WHERE id = ? AND company_id IS NULL",
-                (company.company_id, now, job_id),
-            )
+
 
     conn.execute(
         "INSERT INTO entity_resolution_events (id, observation_id, job_id, stage,"
@@ -324,7 +439,7 @@ def ingest_observation(
             ),
         )
 
-    presence_id, presence_updated = _upsert_presence(
+    presence_result = _upsert_presence(
         conn,
         job_id=job_id,
         source_id=source_id,
@@ -345,17 +460,59 @@ def ingest_observation(
         same_host_as_source=same_host_as_source,
         source_family=source_family,
     )
+    presence_id = presence_result.presence_id
 
-    if presence_updated:
-        # RUN-21: only forward-evidence observations re-project canonical
-        # state; a stale observation stays immutable history.
-        refresh_canonical_presentation(
+    if presence_result.accepted:
+        if company.company_id:
+            # a company identified later (or a job created before company
+            # resolution existed) is filled in once, never re-pointed
+            cur = conn.execute(
+                "UPDATE jobs SET company_id = ?, updated_at = ?"
+                " WHERE id = ? AND company_id IS NULL",
+                (company.company_id, now, job_id),
+            )
+            company_filled = cur.rowcount == 1
+
+    # A5.6: classify the durable semantic run effect from the authoritative
+    # seams. The effect is bound exactly once inside this fence.
+    if resolution.decision in ("CREATED", "SPLIT_REUSE"):
+        run_effect = "NEW_JOB"
+        if presence_result.accepted:
+            # RUN-21: only forward-evidence observations re-project canonical
+            # state; a stale observation stays immutable history.
+            refresh_canonical_presentation(
+                conn,
+                job_id,
+                now=now,
+                normalized=normalized,
+                fresh_presence_id=presence_id,
+            )
+    elif not presence_result.accepted:
+        run_effect = "STALE_IGNORED"
+    else:
+        canonical_result = refresh_canonical_presentation(
             conn,
             job_id,
             now=now,
             normalized=normalized,
             fresh_presence_id=presence_id,
         )
+        if (
+            company_filled
+            or presence_result.semantic_changed
+            or canonical_result.projection_changed
+            or canonical_result.evaluation_changed
+        ):
+            run_effect = "UPDATED_JOB"
+        else:
+            run_effect = "UNCHANGED_JOB"
+
+    _bind_observation_effect(
+        conn,
+        observation_id=observation_id,
+        job_id=job_id,
+        run_effect=run_effect,
+    )
 
     # Atomic downstream obligations for the accepted observation (RUN-08:
     # created in the same fenced transaction; they drain as host-native
@@ -378,6 +535,8 @@ def ingest_observation(
     return {
         "observation_id": observation_id,
         "job_id": job_id,
+        "resolved_job_id": job_id,
+        "run_effect": run_effect,
         "decision": resolution.decision,
         "idempotent": False,
     }
@@ -467,7 +626,7 @@ def _upsert_presence(
     strategy: str | None = None,
     same_host_as_source: bool | None = None,
     source_family: str | None = None,
-) -> tuple[str, bool]:
+) -> PresenceUpsertResult:
     from jobscraper.pipeline.availability import (
         ACTIVE_OBSERVATION,
         apply_presence_evidence,
@@ -488,7 +647,7 @@ def _upsert_presence(
                 same_host_as_source, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     'ACTIVE', 1,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, COALESCE(?, '{}'), ?, ?, ?, ?, ?, ?)
             """,
             (
                 presence_id,
@@ -538,7 +697,9 @@ def _upsert_presence(
                 presence_id,
             ),
         )
-        return presence_id, True
+        return PresenceUpsertResult(
+            presence_id=presence_id, accepted=True, created=True, semantic_changed=True
+        )
 
     # RUN-14A/RUN-21: make the availability comparator the single freshness
     # gate for mutable per-source projection.  An old worker may still append
@@ -553,10 +714,46 @@ def _upsert_presence(
         evidence_ref=f"observation:{observation_id}",
     )
     if not evidence.accepted:
-        return str(existing["id"]), False
+        return PresenceUpsertResult(
+            presence_id=str(existing["id"]),
+            accepted=False,
+            created=False,
+            semantic_changed=False,
+        )
 
+    # A5.2 (kind-aware content): one presence row may be fed by several
+    # observation kinds (e.g. provider LIST_FETCH listings plus DETAIL_FETCH
+    # detail views of the same native job). Comparing a listing view against
+    # an intervening detail view would report a semantic change on every
+    # run forever, even when neither view ever changes. The honest
+    # comparison for "did this source's content change" is against the
+    # latest prior observation of the SAME acquisition kind; only when no
+    # same-kind prior exists (first detail view ever) is the overall latest
+    # observation the reference. Single-kind sources are unaffected: the
+    # same-kind prior is exactly the latest observation.
     previous_hash = None
-    if existing["last_observation_id"]:
+    _kind_prior_found = False
+    if observation.source_job_id:
+        _req_row = conn.execute(
+            "SELECT request_type FROM scrape_requests"
+            " WHERE id = (SELECT request_id FROM job_observations WHERE id = ?)",
+            (observation_id,),
+        ).fetchone()
+        if _req_row is not None:
+            _kind_row = conn.execute(
+                "SELECT o.parse_evidence_ref FROM job_observations o"
+                " JOIN scrape_requests r ON r.id = o.request_id"
+                " WHERE o.source_id = ? AND o.source_job_id = ?"
+                " AND o.id != ? AND r.request_type = ?"
+                " AND o.resolved_job_id = ?"
+                " AND o.run_effect IN ('NEW_JOB', 'UPDATED_JOB', 'UNCHANGED_JOB')"
+                " ORDER BY o.rowid DESC LIMIT 1",
+                (source_id, observation.source_job_id, observation_id, _req_row["request_type"], job_id),
+            ).fetchone()
+            if _kind_row is not None:
+                _kind_prior_found = True
+                previous_hash = _kind_row["parse_evidence_ref"]
+    if not _kind_prior_found and existing["last_observation_id"]:
         row = conn.execute(
             "SELECT parse_evidence_ref FROM job_observations WHERE id = ?",
             (existing["last_observation_id"],),
@@ -564,9 +761,79 @@ def _upsert_presence(
         previous_hash = row["parse_evidence_ref"] if row else None
     content_changed = previous_hash != normalized.content_hash
 
-    if (observation.application_url_candidate or None) != (
-        existing["application_url"] or None
-    ):
+    # A5.2: semantic change from the actual persisted post-COALESCE values,
+    # never from raw candidate inequality. A missing (None) candidate retains
+    # the stored value and is not a change.
+    _o_fields = _origin_fields(origin, resolved_at=observed_at)
+    _q_fields = _quality_fields(
+        origin,
+        content_kind=content_kind,
+        strategy=strategy,
+        same_host_as_source=same_host_as_source,
+        source_family=source_family,
+        existing=existing,
+    )
+    _canon_candidate = observation.canonical_url_candidate
+    _apply_candidate = observation.application_url_candidate
+    _new_canonical = (
+        _canon_candidate if _canon_candidate is not None else existing["canonical_job_url"]
+    )
+    _new_application = (
+        _apply_candidate if _apply_candidate is not None else existing["application_url"]
+    )
+    _o_names = (
+        "origin_provider",
+        "origin_board",
+        "origin_job_id",
+        "origin_resolution_confidence",
+        "origin_resolution_evidence_json",
+        "origin_resolved_at",
+    )
+    _new_origin = tuple(
+        cand if cand is not None else existing[name]
+        for cand, name in zip(_o_fields, _o_names)
+    )
+    _new_origin_by_name = dict(zip(_o_names, _new_origin))
+    # origin_resolved_at is a verification timestamp (it advances on every
+    # reverification like last_seen_at) and never alone signals a semantic
+    # change; identity/confidence changes are caught by their own fields.
+    # The evidence JSON embeds per-run resolved_at/observed_at stamps, so it
+    # is compared by substance with those volatile timestamps removed.
+    _origin_identity_changed = any(
+        (new_v or None) != (existing[name] or None)
+        if isinstance(existing[name], str) or isinstance(new_v, str)
+        else new_v != existing[name]
+        for name in (
+            "origin_provider",
+            "origin_board",
+            "origin_job_id",
+            "origin_resolution_confidence",
+        )
+        for new_v in (_new_origin_by_name[name],)
+    )
+    _origin_evidence_changed = _origin_evidence_substance(
+        _new_origin_by_name["origin_resolution_evidence_json"]
+    ) != _origin_evidence_substance(existing["origin_resolution_evidence_json"])
+    _q_names = ("source_quality_class", "content_kind", "same_host_as_source")
+    _new_quality = tuple(
+        cand if cand is not None else existing[name]
+        for cand, name in zip(_q_fields, _q_names)
+    )
+    semantic_changed = bool(
+        content_changed
+        or evidence.state_changed
+        or (_new_canonical or None) != (existing["canonical_job_url"] or None)
+        or (_new_application or None) != (existing["application_url"] or None)
+        or _origin_identity_changed
+        or _origin_evidence_changed
+        or any(new_v != existing[name] for new_v, name in zip(_new_quality, _q_names))
+        or (binding_id or None) != (existing["binding_id"] or None)
+    )
+
+    # Tightened: record APPLY_URL_CHANGED only when the persisted application
+    # URL actually changes; a missing candidate that retains the old URL is
+    # not a change and must not invent history.
+    if (_new_application or None) != (existing["application_url"] or None):
         record_change(conn, job_id, "APPLY_URL_CHANGED", now)
 
     conn.execute(
@@ -593,14 +860,8 @@ def _upsert_presence(
             binding_id,
             observed_at,
             observed_at,
-            *_origin_fields(origin, resolved_at=observed_at),
-            *_quality_fields(
-                origin,
-                content_kind=content_kind,
-                strategy=strategy,
-                same_host_as_source=same_host_as_source,
-                source_family=source_family,
-            ),
+            *_o_fields,
+            *_q_fields,
             observation.canonical_url_candidate,
             observation.application_url_candidate,
             content_changed,
@@ -609,40 +870,53 @@ def _upsert_presence(
             existing["id"],
         ),
     )
-    return str(existing["id"]), True
+    return PresenceUpsertResult(
+        presence_id=str(existing["id"]),
+        accepted=True,
+        created=False,
+        semantic_changed=semantic_changed,
+    )
 
 def _quality_fields(
-    origin,
+    origin: OriginResolution | None,
     *,
     content_kind: str | None,
-    strategy: str | None = None,
-    same_host_as_source: bool | None = None,
-    source_family: str | None = None,
+    strategy: str | None,
+    same_host_as_source: bool | None,
+    source_family: str | None,
+    existing: sqlite3.Row | None = None,
 ) -> tuple:
-    """Presence-level §39 quality inputs, stored so selection is replayable."""
+    """Classify from the effective retained origin and current fetch evidence."""
     from jobscraper.pipeline.provenance import classify_source_quality
 
-    # the host question is about the *posting link* versus the source's own
-    # host (01 §39 employer-vs-aggregator); the caller passes it explicitly,
-    # falling back to what the §32 resolver recorded
-    same_host = (
-        same_host_as_source
-        if same_host_as_source is not None
-        else getattr(origin, "same_host_as_source", None) if origin else None
-    )
     status = getattr(origin, "status", None)
+    provider = getattr(origin, "origin_provider", None)
+    origin_on_source_host = getattr(origin, "same_host_as_source", None)
+    if existing is not None and status is not OriginStatus.RESOLVED:
+        # An unresolved sighting supplies no replacement origin authority.
+        # Use the same resolved state that the presence UPDATE retains.
+        if existing["origin_provider"]:
+            status = OriginStatus.RESOLVED
+            provider = existing["origin_provider"]
+            retained = json.loads(existing["origin_resolution_evidence_json"])
+            origin_on_source_host = retained.get("same_host_as_source")
+        if same_host_as_source is None:
+            same_host_as_source = existing["same_host_as_source"]
+    if content_kind is None and existing is not None:
+        content_kind = existing["content_kind"]
+    same_host = (
+        same_host_as_source if same_host_as_source is not None
+        else origin_on_source_host
+    )
     quality = classify_source_quality(
         strategy=strategy,
         execution_class=None,
         content_kind=content_kind,
         same_host_as_source=bool(same_host),
         source_family=source_family,
-        # what §32 recorded: is the resolved origin on the source's own host?
-        origin_on_source_host=(
-            None if origin is None else getattr(origin, "same_host_as_source", None)
-        ),
+        origin_on_source_host=origin_on_source_host,
         origin_status=status.value if status is not None else None,
-        origin_provider=getattr(origin, "origin_provider", None) if origin else None,
+        origin_provider=provider,
     )
     return (quality, content_kind, 1 if same_host else 0 if same_host is not None else None)
 
@@ -657,9 +931,9 @@ def _origin_fields(origin: OriginResolution | None, *, resolved_at: str) -> tupl
     (03 §39), so the resolver never overloads it.
     """
     if origin is None or origin.status is not OriginStatus.RESOLVED:
-        # {} is honest here: an unresolved sighting has no resolution to
-        # record, and the column is NOT NULL by contract.
-        return (None, None, None, None, "{}", None)
+        # UPDATE retains resolved evidence; only INSERT supplies the schema
+        # default for a presence with no previously resolved origin.
+        return (None, None, None, None, None, None)
     return (
         origin.origin_provider,
         origin.origin_board,
@@ -670,4 +944,9 @@ def _origin_fields(origin: OriginResolution | None, *, resolved_at: str) -> tupl
     )
 
 
-__all__ = ["ingest_observation", "observation_key"]
+__all__ = [
+    "ObservationEffectIntegrityError",
+    "PresenceUpsertResult",
+    "ingest_observation",
+    "observation_key",
+]

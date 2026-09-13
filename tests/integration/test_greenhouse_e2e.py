@@ -503,7 +503,8 @@ def test_board_run_reaches_canonical_jobs_through_the_whole_spine(db, server):
     # obligations the run drained; the four acquisition ones are pinned above
     assert run["requests_total"] >= 4
     assert run["requests_failed"] == 0
-    assert run["jobs_saved"] + run["jobs_updated"] == 3
+    assert run["jobs_saved"] == 3
+    assert run["jobs_updated"] == 0
     plan = db.conn.execute(
         "SELECT group_outcome FROM run_source_plans WHERE run_id = ?", (run_id,)
     ).fetchone()
@@ -925,7 +926,9 @@ def test_a_second_run_reobserves_without_duplicating_jobs(db, server):
         "SELECT * FROM scrape_runs WHERE id = ?", (second_run,)
     ).fetchone()
     assert second["status"] == "SUCCEEDED"
-    assert second["jobs_saved"] + second["jobs_updated"] == 3
+    # Unchanged fresh-run observations preserve richer canonical evidence.
+    assert second["jobs_saved"] == 0
+    assert second["jobs_updated"] == 0
     # re-observation did not resurrect or expire anything
     assert all(j["listing_status"] == "ACTIVE" for j in _jobs(db))
 
