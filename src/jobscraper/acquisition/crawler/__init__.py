@@ -10,6 +10,11 @@ robots work through the ordinary host HTTP execution seam.
 from .budget import BudgetDecision, CrawlBudget, CrawlUsage, budget_from_plan, check_budget, close_unstarted_over_budget, load_usage
 from .canonicalize import CrawlUrl, crawl_identity, crawl_url
 from .cursor import CursorCompatibilityError, LoadedCursor, load_cursor, save_cursor
+from .continuation import (
+    ContinuationIdentityError,
+    assert_claimed_continuation_target,
+    build_continuation_payload,
+)
 from .frontier import FrontierDecision, enqueue_discovered_task
 from .pagination import (
     PaginationDecision,
@@ -68,6 +73,8 @@ __all__ = [
     "BudgetDecision", "CrawlBudget", "CrawlUsage", "budget_from_plan", "check_budget", "close_unstarted_over_budget", "load_usage",
     "CrawlUrl", "crawl_identity", "crawl_url",
     "CursorCompatibilityError", "LoadedCursor", "load_cursor", "save_cursor",
+    "ContinuationIdentityError", "assert_claimed_continuation_target",
+    "build_continuation_payload",
     "FrontierDecision", "enqueue_discovered_task",
     "PaginationDecision", "PaginationGuardState", "PaginationSignature", "PaginationStopKind", "advance_guard",
     "RobotsDecision", "RobotsDecisionKind", "RobotsGate", "RobotsPolicy", "RobotsPolicyStatus",

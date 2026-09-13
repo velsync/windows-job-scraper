@@ -1144,10 +1144,14 @@ def test_a_crash_between_pages_resumes_the_pending_page_from_the_cursor(db, serv
 
     cursor_state = db.conn.execute("SELECT state_json FROM crawl_cursors").fetchone()[0]
     assert json.loads(cursor_state)["skip"] == 2
+    # A4: the pending page-2 continuation durably names its next planned
+    # target (skip=2/page 2), not the already-fetched page-1 URL.
+    pending_target = json.loads(requests[1]["payload_json"] or "{}")["target_reference"]
+    assert pending_target != _fetch_urls(db)[0]
     assert requests[1]["request_unique_key"] == request_unique_key(
         run_source_plan_id=requests[1]["run_source_plan_id"],
         request_type="LIST_FETCH",
-        target_identity=_fetch_urls(db)[0],
+        target_identity=pending_target,
         strategy=requests[1]["strategy"],
         logical_key=cursor_state,
     )

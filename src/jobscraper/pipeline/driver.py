@@ -52,6 +52,11 @@ from jobscraper.acquisition.crawler.cursor import (
     load_cursor as load_crawl_cursor,
     save_cursor as save_crawl_cursor,
 )
+from jobscraper.acquisition.crawler.continuation import (
+    ContinuationIdentityError,
+    assert_claimed_continuation_target,
+    build_continuation_payload,
+)
 from jobscraper.acquisition.crawler.frontier import enqueue_discovered_task
 from jobscraper.acquisition.crawler.pagination import (
     PaginationGuardState,
@@ -862,6 +867,20 @@ def _execute_plan(
                 )
             except (ValueError, TypeError) as exc:
                 plan_refusal = f"{type(exc).__name__}: {exc}"
+            else:
+                # A4: durable continuation identity is enforced before scope
+                # evaluation, revalidation, or any network I/O. A mismatch
+                # joins the existing fail-closed plan-refusal path below:
+                # zero network, terminal FAILED, diagnostic evidence.
+                if request_plan is not None:
+                    try:
+                        assert_claimed_continuation_target(
+                            payload=claim_payload,
+                            request_plan=request_plan,
+                        )
+                    except ContinuationIdentityError as exc:
+                        plan_refusal = f"ContinuationIdentityError: {exc}"
+                        request_plan = None
 
         signal: dict = {}
         if request_plan is None:
@@ -2054,6 +2073,22 @@ def _execute_plan(
                         signal["budget_exhausted"] = True
                         return
 
+                    # A4: the durable continuation target is the next planned
+                    # target, not the just-completed page. Derive it by calling
+                    # the adapter's pure planner with the next cursor under the
+                    # same immutable planning context. The planner is
+                    # network-inert; no dispatch occurs inside the fence.
+                    next_request_plan = adapter.plan(
+                        task,
+                        next_cursor,
+                        ctx=planning_ctx,
+                    )
+                    next_target_identity = next_request_plan.url
+                    continuation_payload = build_continuation_payload(
+                        request_type=continuation_type,
+                        next_cursor=next_cursor,
+                        next_target_identity=next_target_identity,
+                    )
                     save_crawl_cursor(
                         cursor_conn,
                         run_source_plan_id=plan_id,
@@ -2069,13 +2104,9 @@ def _execute_plan(
                         source_id=plan_row["source_id"],
                         binding_id=plan_row["binding_id"],
                         request_type=continuation_type,
-                        target_identity=request_plan.url,
+                        target_identity=next_target_identity,
                         logical_key=next_cursor.state_json,
-                        payload=(
-                            {"role": "PAGE", "cursor_state": next_cursor.state_json}
-                            if continuation_type == "SOURCE_CRAWL"
-                            else {}
-                        ),
+                        payload=continuation_payload,
                         strategy=plan_row["strategy"],
                         execution_class=plan_row["execution_class"],
                         depth=claim_depth,

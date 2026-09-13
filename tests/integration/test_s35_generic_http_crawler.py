@@ -299,3 +299,262 @@ def test_cursor_and_continuation_roll_back_together_when_cursor_commit_crashes(t
         assert db.conn.execute("SELECT status FROM scrape_requests WHERE run_source_plan_id=? AND payload_json LIKE '%\"role\":\"PAGE\"%'", (plan_id,)).fetchone()[0] == 'RUNNING'
     finally:
         db.close()
+
+
+def test_overlapping_plans_advance_cursors_and_guards_independently(tmp_path, monkeypatch):
+    from jobscraper.acquisition.crawler.canonicalize import crawl_identity
+
+    db = Database(tmp_path / 's35-overlap.db')
+    try:
+        migrate_schema(db.conn, SCHEMA_VERSION)
+        run_a, plan_a = _setup(db.conn)
+        run_b, plan_b = _setup_second_run(db.conn)
+        assert plan_a != plan_b
+        import jobscraper.pipeline.driver as driver
+
+        original_claim = driver.claim_next_request
+
+        def _partial(run_id, fetched):
+            monkeypatch.setattr(
+                'jobscraper.pipeline.driver.build_adapter',
+                lambda _id, _cfg: _CrawlerAdapter(),
+            )
+
+            def _recording(envelope, policy):
+                fetched.append(envelope.payload.url)
+                return _fake_transport(envelope, policy)
+
+            monkeypatch.setattr('jobscraper.runtime.dispatch.execute_request', _recording)
+            real_claim = driver.claim_next_request
+
+            def dying_claim(*args, **kwargs):
+                if len(fetched) >= 2:
+                    raise RuntimeError('simulated crash after page 1 commit')
+                return real_claim(*args, **kwargs)
+
+            monkeypatch.setattr(driver, 'claim_next_request', dying_claim)
+            try:
+                with pytest.raises(RuntimeError, match='simulated crash'):
+                    execute_run(db.conn, run_id)
+            finally:
+                monkeypatch.setattr(driver, 'claim_next_request', original_claim)
+
+        fetched_a: list = []
+        _partial(run_a, fetched_a)
+        assert fetched_a == [
+            'http://127.0.0.1:8765/robots.txt',
+            'http://127.0.0.1:8765/p1',
+        ]
+        fetched_b: list = []
+        _partial(run_b, fetched_b)
+        assert fetched_b == [
+            'http://127.0.0.1:8765/robots.txt',
+            'http://127.0.0.1:8765/p1',
+        ]
+
+        # Both plans durably own independent page-2 continuations.
+        rows = db.conn.execute(
+            "SELECT checkpoint_run_source_plan_id, state_json, guard_state_json"
+            " FROM crawl_cursors ORDER BY checkpoint_run_source_plan_id"
+        ).fetchall()
+        assert len(rows) == 2
+        by_plan = {r['checkpoint_run_source_plan_id']: r for r in rows}
+        assert set(by_plan) == {plan_a, plan_b}
+        for pid in (plan_a, plan_b):
+            assert json.loads(by_plan[pid]['state_json'])['url'].endswith('/p2')
+            assert json.loads(by_plan[pid]['guard_state_json'])["seen_url_identities"] == [
+                crawl_identity('http://127.0.0.1:8765/p1')
+            ]
+        # A4: each pending continuation durably names its next target.
+        for pid in (plan_a, plan_b):
+            pend = db.conn.execute(
+                "SELECT payload_json, request_unique_key FROM scrape_requests"
+                " WHERE run_source_plan_id=? AND status='PENDING'",
+                (pid,),
+            ).fetchall()
+            assert len(pend) == 1
+            payload = json.loads(pend[0]['payload_json'])
+            assert payload['cursor_state'] == by_plan[pid]['state_json']
+            assert payload['target_reference'] == 'http://127.0.0.1:8765/p2'
+            assert payload['role'] == 'PAGE'
+
+        # Finish Plan B first (reverse order).
+        fetched_b2: list = []
+        _recording_transport(monkeypatch, fetched_b2)
+        assert execute_run(db.conn, run_b) == 'SUCCEEDED'
+        assert fetched_b2 == [
+            'http://127.0.0.1:8765/p2',
+            'http://127.0.0.1:8765/p3',
+        ]
+        # Plan A remains untouched while B advances.
+        row_a = db.conn.execute(
+            "SELECT state_json, guard_state_json FROM crawl_cursors"
+            " WHERE checkpoint_run_source_plan_id=?",
+            (plan_a,),
+        ).fetchone()
+        assert json.loads(row_a['state_json'])['url'].endswith('/p2')
+        assert json.loads(row_a['guard_state_json'])["seen_url_identities"] == [
+            crawl_identity('http://127.0.0.1:8765/p1')
+        ]
+        row_b = db.conn.execute(
+            "SELECT state_json, guard_state_json FROM crawl_cursors"
+            " WHERE checkpoint_run_source_plan_id=?",
+            (plan_b,),
+        ).fetchone()
+        assert json.loads(row_b['state_json'])['url'].endswith('/p3')
+        assert json.loads(row_b['guard_state_json'])["seen_url_identities"] == [
+            crawl_identity('http://127.0.0.1:8765/p1'),
+            crawl_identity('http://127.0.0.1:8765/p2'),
+        ]
+
+        # Finish Plan A second.
+        fetched_a2: list = []
+        _recording_transport(monkeypatch, fetched_a2)
+        assert execute_run(db.conn, run_a) == 'SUCCEEDED'
+        assert fetched_a2 == [
+            'http://127.0.0.1:8765/p2',
+            'http://127.0.0.1:8765/p3',
+        ]
+
+        # Cursors never overwrote each other; reverse finish did not redirect.
+        final = db.conn.execute(
+            "SELECT checkpoint_run_source_plan_id, state_json, guard_state_json"
+            " FROM crawl_cursors ORDER BY checkpoint_run_source_plan_id"
+        ).fetchall()
+        assert len(final) == 2
+        by_final = {r['checkpoint_run_source_plan_id']: r for r in final}
+        for pid in (plan_a, plan_b):
+            assert json.loads(by_final[pid]['state_json'])['url'].endswith('/p3')
+            assert json.loads(by_final[pid]['guard_state_json'])["seen_url_identities"] == [
+                crawl_identity('http://127.0.0.1:8765/p1'),
+                crawl_identity('http://127.0.0.1:8765/p2'),
+            ]
+
+        # Each coverage generation belongs to its own plan.
+        covs = db.conn.execute(
+            "SELECT id, run_source_plan_id, generation_key, completion_state"
+            " FROM enumeration_coverage ORDER BY run_source_plan_id"
+        ).fetchall()
+        assert len(covs) == 2
+        cov_by_plan = {c['run_source_plan_id']: c for c in covs}
+        assert set(cov_by_plan) == {plan_a, plan_b}
+        assert cov_by_plan[plan_a]['generation_key'] == f'run-{run_a}'
+        assert cov_by_plan[plan_b]['generation_key'] == f'run-{run_b}'
+        assert cov_by_plan[plan_a]['completion_state'] == 'COMPLETE'
+        assert cov_by_plan[plan_b]['completion_state'] == 'COMPLETE'
+
+        # Each contributing request belongs to that same plan.
+        contrib = db.conn.execute(
+            "SELECT c.run_source_plan_id AS cov_plan, r.run_source_plan_id AS req_plan,"
+            " c.id AS cov_id FROM coverage_contributing_request j"
+            " JOIN enumeration_coverage c ON c.id=j.coverage_id"
+            " JOIN scrape_requests r ON r.id=j.request_id"
+        ).fetchall()
+        assert len(contrib) > 0
+        for row in contrib:
+            assert row['cov_plan'] == row['req_plan']
+        plans_with_contrib = {r['cov_plan'] for r in contrib}
+        assert plans_with_contrib == {plan_a, plan_b}
+
+        # Seen membership union reflects each plan's requests. This fixture
+        # emits no observations, so both unions are honestly empty.
+        for pid in (plan_a, plan_b):
+            cov_id = cov_by_plan[pid]['id']
+            n_seen = db.conn.execute(
+                "SELECT COUNT(*) FROM coverage_seen_identity WHERE coverage_id=?",
+                (cov_id,),
+            ).fetchone()[0]
+            assert n_seen == 0
+
+        # Shared cache reuse still passes exact S3.7 compatibility: the cache
+        # stays binding-revision scoped (never plan-scoped) and both plans
+        # finished COMPLETE with no compatibility refusal.
+        cache_cols = [r[1] for r in db.conn.execute("PRAGMA table_info(cache_representation)").fetchall()]
+        assert 'checkpoint_run_source_plan_id' not in cache_cols
+        assert 'run_source_plan_id' not in cache_cols
+        refusals = db.conn.execute(
+            "SELECT COUNT(*) FROM acquisition_evidence WHERE ref='cache://REVALIDATION_PLAN_REFUSED'"
+        ).fetchone()[0]
+        assert refusals == 0
+
+        # No plan-scoping was added to binding/host rate protection.
+        rate_cols = [r[1] for r in db.conn.execute("PRAGMA table_info(binding_host_rate_state)").fetchall()]
+        assert 'run_source_plan_id' not in rate_cols
+        assert 'checkpoint_run_source_plan_id' not in rate_cols
+    finally:
+        db.close()
+
+
+def test_mismatched_continuation_target_fails_closed_without_network_io(tmp_path, monkeypatch):
+    # Real driver wiring (not the pure helper alone): a pending cursor
+    # continuation whose durable target_reference disagrees with adapter
+    # planning must fail closed with zero network I/O.
+    db = Database(tmp_path / 's35-mismatch.db')
+    try:
+        migrate_schema(db.conn, SCHEMA_VERSION)
+        run_id, plan_id = _setup(db.conn)
+        fetched = []
+        _recording_transport(monkeypatch, fetched)
+        real_claim = _crash_after_page_one(monkeypatch, fetched)
+        with pytest.raises(RuntimeError, match='simulated crash'):
+            execute_run(db.conn, run_id)
+        import jobscraper.pipeline.driver as driver
+        monkeypatch.setattr(driver, 'claim_next_request', real_claim)
+        assert fetched == [
+            'http://127.0.0.1:8765/robots.txt',
+            'http://127.0.0.1:8765/p1',
+        ]
+
+        pend = db.conn.execute(
+            "SELECT id, payload_json FROM scrape_requests"
+            " WHERE run_source_plan_id=? AND status='PENDING'",
+            (plan_id,),
+        ).fetchall()
+        assert len(pend) == 1
+        request_id = pend[0]['id']
+        payload = json.loads(pend[0]['payload_json'])
+        assert payload['target_reference'] == 'http://127.0.0.1:8765/p2'
+        tampered = dict(payload)
+        tampered['target_reference'] = 'http://127.0.0.1:8765/p999'
+        db.conn.execute(
+            "UPDATE scrape_requests SET payload_json=? WHERE id=?",
+            (json.dumps(tampered, sort_keys=True), request_id),
+        )
+        db.conn.commit()
+
+        fetched2: list = []
+        _recording_transport(monkeypatch, fetched2)
+        assert execute_run(db.conn, run_id) == 'FAILED'
+        # Zero network I/O for the mismatched continuation.
+        assert fetched2 == []
+
+        row = db.conn.execute(
+            "SELECT status, last_failure_kind, last_failure_json"
+            " FROM scrape_requests WHERE id=?",
+            (request_id,),
+        ).fetchone()
+        assert row['status'] == 'FAILED'
+        assert row['status'] != 'RUNNING'
+        assert row['last_failure_kind'] == 'INVALID_JOB_RECORD'
+        assert 'ContinuationIdentityError' in (row['last_failure_json'] or '')
+        assert db.conn.execute(
+            "SELECT COUNT(*) FROM fetch_attempts WHERE request_id=?",
+            (request_id,),
+        ).fetchone()[0] == 0
+
+        evidence = db.conn.execute(
+            "SELECT kind, ref, detail_json FROM acquisition_evidence WHERE request_id=?",
+            (request_id,),
+        ).fetchall()
+        assert any(r['ref'] == 'ADAPTER_PLAN_REFUSED' for r in evidence)
+        assert any(
+            'ContinuationIdentityError' in (r['detail_json'] or '') for r in evidence
+        )
+
+        coverage = db.conn.execute(
+            "SELECT completion_state FROM enumeration_coverage WHERE run_source_plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        assert coverage['completion_state'] == 'PARTIAL'
+    finally:
+        db.close()
