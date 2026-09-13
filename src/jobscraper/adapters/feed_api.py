@@ -19,6 +19,7 @@ from typing import Any, Mapping
 from jobscraper.adapters.contract import (
     AdapterTask,
     CrawlCursor,
+    EnumerationContract,
     FieldEvidenceRecord,
     ObservationRecord,
     ParseOutcome,
@@ -35,7 +36,10 @@ MANIFEST = validate_manifest(
         "id": "json_api_feed",
         "version": "1.0.0",
         "adapter_api_version": "1",
-        "capabilities": ["listing_parse", "incremental", "health", "smoke"],
+        # Corrective A2: ordinary {page:N} pagination is not a cross-run
+        # incremental watermark. The false "incremental" claim is removed;
+        # a real provider delta token would need a separate abstraction.
+        "capabilities": ["listing_parse", "health", "smoke"],
         "supported_execution_classes": ["HTTP"],
         "supported_auth_modes": ["NONE"],
         "cost_class": "LIGHT",
@@ -71,6 +75,9 @@ class FeedApiConfig:
     page_size_hint: int | None = None
     timeout_s: float = 30.0
     max_bytes: int = 2_000_000
+    #: Corrective A2: explicit immutable review flag for stable full-source
+    #: enumeration. Default omission is conservative/non-authoritative.
+    stable_full_source_enumeration: bool = False
 
     def __post_init__(self) -> None:
         if "{page}" not in self.url_template:
@@ -79,6 +86,11 @@ class FeedApiConfig:
             raise ValueError(f"unsupported terminal condition: {self.terminal_when!r}")
         if not self.fields:
             raise ValueError("fields mapping is required")
+        if not isinstance(self.stable_full_source_enumeration, bool):
+            raise ValueError(
+                "stable_full_source_enumeration must be boolean, got"
+                f" {self.stable_full_source_enumeration!r}"
+            )
 
 
 #: Accepted ``config_json`` members (an unknown key is refused, never ignored).
@@ -127,6 +139,32 @@ class FeedApiAdapter:
         if unknown:
             raise ValueError(f"unknown json_api_feed binding config keys: {unknown}")
         return cls(FeedApiConfig(**dict(config)))
+
+    @classmethod
+    def resolve_enumeration_contract(
+        cls, config: Mapping[str, Any]
+    ) -> EnumerationContract:
+        """Reviewed enumeration semantics for one binding config (A2).
+
+        Default omission is conservative/non-authoritative. Only an explicit
+        ``stable_full_source_enumeration: True`` review pins full-source
+        authority under a stable snapshot.
+        """
+        if config.get("stable_full_source_enumeration", False) is True:
+            return EnumerationContract(
+                version=1,
+                coverage_authority="AUTHORITATIVE_FULL_SOURCE",
+                scope_key="full-source",
+                pagination_stability="STABLE_SNAPSHOT",
+                listing_identity_sufficient=True,
+            )
+        return EnumerationContract(
+            version=1,
+            coverage_authority="NO_ABSENCE_INFERENCE",
+            scope_key="full-source",
+            pagination_stability="UNKNOWN",
+            listing_identity_sufficient=True,
+        )
 
     # ------------------------------------------------------------------ plan
 

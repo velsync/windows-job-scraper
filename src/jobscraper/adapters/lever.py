@@ -85,6 +85,7 @@ from jobscraper.adapters.contract import (
     AdapterTaskKind,
     CrawlCursor,
     DiscoveredTask,
+    EnumerationContract,
     FieldEvidenceRecord,
     ObservationRecord,
     ParseOutcome,
@@ -529,6 +530,16 @@ class LeverAdapter:
     #: of the absence-authority barrier.  Detail work still has to be drained
     #: before the run may terminalize (ACQ-04 child work).
     listing_identity_sufficient = True
+
+    #: Pinned enumeration authority (Corrective A2): full-source, reviewed
+    #: run-scoped offset enumeration (stable snapshot), listing sufficient.
+    enumeration_contract = EnumerationContract(
+        version=1,
+        coverage_authority="AUTHORITATIVE_FULL_SOURCE",
+        scope_key="full-source",
+        pagination_stability="STABLE_SNAPSHOT",
+        listing_identity_sufficient=True,
+    )
 
     def __init__(self, config: LeverConfig):
         self.config = config

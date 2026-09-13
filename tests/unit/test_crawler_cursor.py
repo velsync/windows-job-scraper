@@ -30,7 +30,7 @@ def _cursor(**changes):
     return CrawlCursor(**values)
 
 
-def test_cursor_round_trip_resumes_guard_for_same_plan():
+def test_same_plan_restart_loads_exact_cursor_and_guard():
     conn = _conn()
     guard = PaginationGuardState(
         consecutive_no_new_jobs_pages=1,
@@ -43,30 +43,78 @@ def test_cursor_round_trip_resumes_guard_for_same_plan():
     assert loaded.guard_state.seen_url_identities == ("https://jobs.example.test/p1",)
 
 
-def test_cross_run_resume_returns_cursor_with_fresh_guard():
+def test_fresh_plan_does_not_inherit_compatible_prior_plan_cursor():
     conn = _conn()
     guard = PaginationGuardState(
         consecutive_no_new_jobs_pages=2,
         seen_url_identities=("https://jobs.example.test/p1",),
     )
-    save_cursor(conn, run_source_plan_id="rsp1", plan_row=_plan(), cursor=_cursor(), guard_state=guard, now="now")
-    # A new run under compatible pins resumes the cursor row but never the
-    # previous run's trap/no-progress accounting.
-    loaded = load_cursor(conn, run_source_plan_id="rsp2", plan_row=_plan())
-    assert loaded.cursor.state_json == '{"page":2}'
-    assert loaded.guard_state == PaginationGuardState()
-    rows = conn.execute("SELECT COUNT(*) FROM crawl_cursors").fetchone()[0]
-    assert rows == 1
+    save_cursor(conn, run_source_plan_id="rsp1", plan_row=_plan(), cursor=_cursor(), guard_state=guard, now="t1")
+
+    assert load_cursor(conn, run_source_plan_id="rsp2", plan_row=_plan()) is None
+    row = conn.execute(
+        "SELECT state_json, guard_state_json, checkpoint_run_source_plan_id FROM crawl_cursors"
+    ).fetchone()
+    assert row["state_json"] == '{"page":2}'
+    assert row["checkpoint_run_source_plan_id"] == "rsp1"
+    assert PaginationGuardState.from_json(row["guard_state_json"]) == guard
 
 
-def test_cross_run_save_advances_checkpoint_provenance_without_duplicating_row():
+def test_two_plans_same_binding_persist_independent_cursor_rows():
     conn = _conn()
-    save_cursor(conn, run_source_plan_id="rsp1", plan_row=_plan(), cursor=_cursor(), guard_state=PaginationGuardState(), now="t1")
-    save_cursor(conn, run_source_plan_id="rsp2", plan_row=_plan(), cursor=_cursor(state_json='{"page":3}'), guard_state=PaginationGuardState(), now="t2")
-    rows = conn.execute("SELECT state_json, checkpoint_run_source_plan_id FROM crawl_cursors").fetchall()
-    assert len(rows) == 1
-    assert rows[0]["state_json"] == '{"page":3}'
-    assert rows[0]["checkpoint_run_source_plan_id"] == "rsp2"
+    guard1 = PaginationGuardState(
+        consecutive_no_new_jobs_pages=1,
+        seen_url_identities=("https://jobs.example.test/p1",),
+    )
+    guard2 = PaginationGuardState(
+        consecutive_no_new_jobs_pages=0,
+        seen_url_identities=("https://jobs.example.test/p1b",),
+    )
+    save_cursor(
+        conn,
+        run_source_plan_id="rsp1",
+        plan_row=_plan(),
+        cursor=_cursor(state_json='{"page":2}'),
+        guard_state=guard1,
+        now="t1",
+    )
+    save_cursor(
+        conn,
+        run_source_plan_id="rsp2",
+        plan_row=_plan(),
+        cursor=_cursor(state_json='{"page":3}'),
+        guard_state=guard2,
+        now="t2",
+    )
+
+    rows = conn.execute(
+        "SELECT checkpoint_run_source_plan_id, state_json, guard_state_json "
+        "FROM crawl_cursors ORDER BY checkpoint_run_source_plan_id"
+    ).fetchall()
+    assert [(r["checkpoint_run_source_plan_id"], r["state_json"]) for r in rows] == [
+        ("rsp1", '{"page":2}'),
+        ("rsp2", '{"page":3}'),
+    ]
+    assert PaginationGuardState.from_json(rows[0]["guard_state_json"]) == guard1
+    assert PaginationGuardState.from_json(rows[1]["guard_state_json"]) == guard2
+
+
+def test_exact_plan_cursor_provenance_mismatch_fails_closed():
+    conn = _conn()
+    save_cursor(
+        conn,
+        run_source_plan_id="rsp1",
+        plan_row=_plan(),
+        cursor=_cursor(),
+        guard_state=PaginationGuardState(),
+        now="t1",
+    )
+    conn.execute(
+        "UPDATE crawl_cursors SET binding_revision_id='corrupt-revision' "
+        "WHERE checkpoint_run_source_plan_id='rsp1'"
+    )
+    with pytest.raises(CursorCompatibilityError, match="binding_revision_id"):
+        load_cursor(conn, run_source_plan_id="rsp1", plan_row=_plan())
 
 
 def test_legacy_unbound_cursor_is_preserved_but_not_resumed():

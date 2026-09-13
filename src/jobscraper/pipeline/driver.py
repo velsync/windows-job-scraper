@@ -92,6 +92,7 @@ from jobscraper.adapters.contract import (
     AdapterTask,
     AdapterTaskKind,
     CrawlCursor,
+    EnumerationContract,
     ParseContext,
     ParseOutcomeKind,
     PlanningContext,
@@ -681,10 +682,12 @@ def _execute_plan(
         plan_row, source, destination_allowed_hosts=policy.allowed_hosts
     )
 
-    # 03 §40: detail completion joins the coverage barrier only when the
-    # binding contract does not already declare listing identity sufficient.
-    listing_identity_sufficient = bool(
-        getattr(adapter, "listing_identity_sufficient", False)
+    # 03 §40 + Corrective A2: authority comes only from the immutable pinned
+    # enumeration contract. The live adapter is never consulted for coverage
+    # authority at open time.
+    enumeration_contract = EnumerationContract.from_plan_row(plan_row)
+    listing_identity_sufficient = (
+        enumeration_contract.listing_identity_sufficient
     )
 
     # If enumeration alone proves stable membership, a COMPLETE generation
@@ -705,9 +708,9 @@ def _execute_plan(
             source_id=plan_row["source_id"],
             binding_id=plan_row["binding_id"],
             binding_revision_id=plan_row["binding_revision_id"],
-            scope_key="full-source",
+            scope_key=enumeration_contract.scope_key,
             generation_key=f"run-{run_id}",
-            coverage_authority="AUTHORITATIVE_FULL_SOURCE",
+            coverage_authority=enumeration_contract.coverage_authority,
             listing_identity_sufficient=listing_identity_sufficient,
             now=now,
         )

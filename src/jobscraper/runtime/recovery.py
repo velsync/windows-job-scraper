@@ -418,13 +418,50 @@ def _validate_resumable_plan_contract(
             f"RunSourcePlan {plan_id!r}: " + ", ".join(detail_parts)
         )
 
+    # Corrective A2: validate the pinned enumeration contract against the
+    # historical pinned adapter/config (local imports; keep them local).
+    from jobscraper.adapters.contract import EnumerationContract
+    from jobscraper.adapters.registry import resolve_enumeration_contract
+
+    try:
+        pinned = EnumerationContract.from_plan_row(plan)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"resumable RunSourcePlan {plan_id!r} has invalid pinned"
+            f" enumeration contract: {exc}"
+        ) from exc
+    try:
+        resolved = resolve_enumeration_contract(str(plan["adapter_id"]), config)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"resumable RunSourcePlan {plan_id!r} cannot resolve enumeration"
+            f" contract from pinned config: {exc}"
+        ) from exc
+    if pinned != resolved:
+        sentinel = EnumerationContract(
+            version=1,
+            coverage_authority="NO_ABSENCE_INFERENCE",
+            scope_key="full-source",
+            pagination_stability="UNKNOWN",
+            listing_identity_sufficient=False,
+        )
+        # Historical migration exception: the exact A1/v22 sentinel may
+        # continue non-authoritatively even when the installed reviewed
+        # adapter now resolves a stronger contract. This preserves migrated
+        # positive evidence without fabricating historical authority.
+        if pinned != sentinel:
+            raise RuntimeError(
+                f"resumable RunSourcePlan {plan_id!r} enumeration contract"
+                f" drift: pinned={pinned!r} resolved={resolved!r}"
+            )
+
     try:
         load_cursor(conn, run_source_plan_id=plan_id, plan_row=plan)
     except CursorCompatibilityError as exc:
         raise RuntimeError(
             f"pinned cursor incompatible for resumable RunSourcePlan {plan_id!r}: {exc}"
         ) from exc
-    return bool(getattr(adapter, "listing_identity_sufficient", False))
+    return bool(pinned.listing_identity_sufficient)
 
 
 def _validate_active_open_plans(conn: sqlite3.Connection) -> list[str]:

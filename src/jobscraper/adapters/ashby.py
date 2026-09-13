@@ -88,6 +88,7 @@ from jobscraper.adapters.contract import (
     AdapterTask,
     AdapterTaskKind,
     CrawlCursor,
+    EnumerationContract,
     FieldEvidenceRecord,
     ObservationRecord,
     ParseOutcome,
@@ -511,6 +512,16 @@ class AshbyAdapter:
     #: membership with source-native ids in one document.  There is no
     #: per-job endpoint to defer identity to, so no detail barrier exists.
     listing_identity_sufficient = True
+
+    #: Pinned enumeration authority (Corrective A2): full-source, single
+    #: response, listing identity sufficient.
+    enumeration_contract = EnumerationContract(
+        version=1,
+        coverage_authority="AUTHORITATIVE_FULL_SOURCE",
+        scope_key="full-source",
+        pagination_stability="SINGLE_RESPONSE",
+        listing_identity_sufficient=True,
+    )
 
     def __init__(self, config: AshbyConfig):
         self.config = config

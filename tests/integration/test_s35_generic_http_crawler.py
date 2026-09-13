@@ -167,10 +167,10 @@ def _crash_after_page_one(monkeypatch, fetched):
     return real_claim
 
 
-def test_cross_run_resume_reuses_compatible_cursor_with_fresh_guard(tmp_path, monkeypatch):
+def test_fresh_plan_starts_seed_page_and_keeps_prior_plan_cursor_isolated(tmp_path, monkeypatch):
     from jobscraper.acquisition.crawler.canonicalize import crawl_identity
 
-    db = Database(tmp_path / 's35-crossrun.db')
+    db = Database(tmp_path / 's35-fresh-plan.db')
     try:
         migrate_schema(db.conn, SCHEMA_VERSION)
         run1, plan1 = _setup(db.conn)
@@ -181,26 +181,51 @@ def test_cross_run_resume_reuses_compatible_cursor_with_fresh_guard(tmp_path, mo
             execute_run(db.conn, run1)
         import jobscraper.pipeline.driver as driver
         monkeypatch.setattr(driver, 'claim_next_request', real_claim)
-        # Page 1 committed; policy (robots) precedes page work by design.
-        assert fetched == ['http://127.0.0.1:8765/robots.txt', 'http://127.0.0.1:8765/p1']
-        g1 = json.loads(db.conn.execute("SELECT guard_state_json FROM crawl_cursors").fetchone()[0])
-        assert g1["seen_url_identities"] == [crawl_identity('http://127.0.0.1:8765/p1')]
 
-        # A new run under compatible pins resumes the same cursor row without
-        # refetching page 1, but restarts pagination-guard accounting.
+        # Plan 1 durably owns its page-2 continuation and page-1 guard history.
+        assert fetched == [
+            'http://127.0.0.1:8765/robots.txt',
+            'http://127.0.0.1:8765/p1',
+        ]
+        row1 = db.conn.execute(
+            "SELECT state_json, guard_state_json FROM crawl_cursors "
+            "WHERE checkpoint_run_source_plan_id=?",
+            (plan1,),
+        ).fetchone()
+        assert json.loads(row1['state_json'])['url'].endswith('/p2')
+        assert json.loads(row1['guard_state_json'])["seen_url_identities"] == [
+            crawl_identity('http://127.0.0.1:8765/p1')
+        ]
+
+        # A fresh RunSourcePlan under the same binding/code pins must begin at
+        # its seed page. It may not consume Plan 1's ordinary pagination state.
         run2, plan2 = _setup_second_run(db.conn)
         assert execute_run(db.conn, run2) == 'SUCCEEDED'
         assert fetched == [
             'http://127.0.0.1:8765/robots.txt', 'http://127.0.0.1:8765/p1',
-            'http://127.0.0.1:8765/robots.txt', 'http://127.0.0.1:8765/p2',
-            'http://127.0.0.1:8765/p3',
+            'http://127.0.0.1:8765/robots.txt', 'http://127.0.0.1:8765/p1',
+            'http://127.0.0.1:8765/p2', 'http://127.0.0.1:8765/p3',
         ]
-        rows = db.conn.execute("SELECT * FROM crawl_cursors").fetchall()
-        assert len(rows) == 1  # one compatible cursor shared across runs
-        assert rows[0]['checkpoint_run_source_plan_id'] == plan2
-        assert json.loads(rows[0]['state_json'])['url'].endswith('/p3')
-        g2 = json.loads(rows[0]['guard_state_json'])
-        assert g2["seen_url_identities"] == [crawl_identity('http://127.0.0.1:8765/p2')]
+
+        rows = db.conn.execute(
+            "SELECT checkpoint_run_source_plan_id, state_json, guard_state_json "
+            "FROM crawl_cursors ORDER BY checkpoint_run_source_plan_id"
+        ).fetchall()
+        assert len(rows) == 2
+        by_plan = {row['checkpoint_run_source_plan_id']: row for row in rows}
+
+        # Plan 1 remains untouched historical continuation evidence.
+        assert json.loads(by_plan[plan1]['state_json'])['url'].endswith('/p2')
+        assert json.loads(by_plan[plan1]['guard_state_json'])["seen_url_identities"] == [
+            crawl_identity('http://127.0.0.1:8765/p1')
+        ]
+
+        # Plan 2 owns its own terminal cursor and full guard history.
+        assert json.loads(by_plan[plan2]['state_json'])['url'].endswith('/p3')
+        assert json.loads(by_plan[plan2]['guard_state_json'])["seen_url_identities"] == [
+            crawl_identity('http://127.0.0.1:8765/p1'),
+            crawl_identity('http://127.0.0.1:8765/p2'),
+        ]
     finally:
         db.close()
 

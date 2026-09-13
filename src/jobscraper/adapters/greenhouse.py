@@ -52,6 +52,7 @@ from jobscraper.adapters.contract import (
     AdapterTaskKind,
     CrawlCursor,
     DiscoveredTask,
+    EnumerationContract,
     FieldEvidenceRecord,
     ObservationRecord,
     ParseOutcome,
@@ -428,6 +429,16 @@ class GreenhouseAdapter:
     #: of the absence-authority barrier.  Detail work still has to be drained
     #: before the run may terminalize (ACQ-04 child work).
     listing_identity_sufficient = True
+
+    #: Pinned enumeration authority (Corrective A2): full-source, single
+    #: response, listing identity sufficient.
+    enumeration_contract = EnumerationContract(
+        version=1,
+        coverage_authority="AUTHORITATIVE_FULL_SOURCE",
+        scope_key="full-source",
+        pagination_stability="SINGLE_RESPONSE",
+        listing_identity_sufficient=True,
+    )
 
     def __init__(self, config: GreenhouseConfig):
         self.config = config

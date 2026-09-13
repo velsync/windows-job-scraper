@@ -642,11 +642,21 @@ def test_a_later_run_never_resumes_an_earlier_runs_offset(db, server):
     assert all(g["completion_state"] == "COMPLETE" and g["pages_completed"] == 2 for g in generations)
     assert len(_jobs(db)) == 3
     assert db.conn.execute("SELECT COUNT(*) FROM job_observations").fetchone()[0] == 6
-    # still exactly one cursor row per binding, now naming the second plan
-    cursors = db.conn.execute("SELECT state_json FROM crawl_cursors").fetchall()
-    assert len(cursors) == 1
+    # Corrective A1: cursors are exact-plan scoped — two same-binding plans
+    # own two rows; the second plan starts from skip=0 and never resumes the
+    # first plan's offset.
+    cursors = db.conn.execute(
+        "SELECT state_json, checkpoint_run_source_plan_id FROM crawl_cursors"
+    ).fetchall()
+    assert len(cursors) == 2
+    first_plan = _requests(db, first_run)[0]["run_source_plan_id"]
     second_plan = _requests(db, second_run)[0]["run_source_plan_id"]
-    assert json.loads(cursors[0]["state_json"])["plan"] == second_plan
+    by_plan = {
+        c["checkpoint_run_source_plan_id"]: json.loads(c["state_json"]) for c in cursors
+    }
+    assert set(by_plan) == {first_plan, second_plan}
+    assert by_plan[first_plan]["plan"] == first_plan
+    assert by_plan[second_plan]["plan"] == second_plan
 
 
 def test_a_server_that_ignores_skip_is_a_trap_not_a_complete_enumeration(db, server):

@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from jobscraper.adapters.ashby import AshbyAdapter
+from jobscraper.adapters.contract import EnumerationContract
 from jobscraper.adapters.feed_api import FeedApiAdapter
 from jobscraper.adapters.generic_discovery import GenericDiscoveryAdapter
 from jobscraper.adapters.greenhouse import GreenhouseAdapter
@@ -45,4 +46,40 @@ def build_adapter(adapter_id: str, config: Mapping[str, Any] | None):
     return adapter_cls.from_config(dict(config or {}))
 
 
-__all__ = ["BUILTIN_ADAPTERS", "build_adapter", "get_adapter"]
+def resolve_enumeration_contract(
+    adapter_id: str,
+    config: Mapping[str, Any] | None = None,
+) -> EnumerationContract:
+    """Resolve the reviewed enumeration contract for one adapter/config (A2).
+
+    Unknown adapters and adapters without a reviewed declaration resolve to
+    the conservative no-absence contract. A declared contract of the wrong
+    type is a fail-closed ``TypeError`` (never a silent default).
+    """
+    adapter_cls = BUILTIN_ADAPTERS.get(adapter_id)
+    if adapter_cls is None:
+        return EnumerationContract(
+            1, "NO_ABSENCE_INFERENCE", "full-source", "UNKNOWN", False
+        )
+
+    resolver = getattr(adapter_cls, "resolve_enumeration_contract", None)
+    if callable(resolver):
+        contract = resolver(dict(config or {}))
+    else:
+        contract = getattr(adapter_cls, "enumeration_contract", None)
+
+    if contract is None:
+        return EnumerationContract(
+            1, "NO_ABSENCE_INFERENCE", "full-source", "UNKNOWN", False
+        )
+    if not isinstance(contract, EnumerationContract):
+        raise TypeError("invalid enumeration contract")
+    return contract
+
+
+__all__ = [
+    "BUILTIN_ADAPTERS",
+    "build_adapter",
+    "get_adapter",
+    "resolve_enumeration_contract",
+]

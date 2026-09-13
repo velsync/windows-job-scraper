@@ -121,6 +121,56 @@ def _ensure_group_states(
     )
 
 
+def _resolve_plan_enumeration_contract(
+    conn: sqlite3.Connection,
+    plan: Mapping[str, object],
+) -> "object":
+    """Resolve the pinned enumeration contract for one new plan (A2).
+
+    Loads the exact historical binding revision, proves binding/adapter pins
+    agree, decodes ``config_json`` as an object, and resolves the reviewed
+    contract. The registry import is local: ``runtime.runs`` must never import
+    ``adapters.registry`` at module scope (import cycle
+    registry -> adapter -> acquisition.envelope -> runtime.claims ->
+    runtime.runs).
+    """
+    from jobscraper.adapters.registry import resolve_enumeration_contract
+
+    try:
+        binding_revision_id = plan["binding_revision_id"]
+        binding_id = plan["binding_id"]
+        adapter_id = plan["adapter_id"]
+        adapter_version = plan["adapter_version"]
+    except KeyError as exc:
+        raise ValueError(f"run plan is missing immutable pin: {exc}") from exc
+    if not binding_revision_id or not binding_id or not adapter_id or not adapter_version:
+        raise ValueError("run plan is missing immutable binding/adapter pins")
+    revision = conn.execute(
+        "SELECT binding_id, adapter_id, adapter_version, config_json"
+        " FROM source_adapter_binding_revisions WHERE id = ?",
+        (str(binding_revision_id),),
+    ).fetchone()
+    if revision is None:
+        raise ValueError(
+            f"run plan binding revision {binding_revision_id!r} no longer resolves"
+        )
+    for key in ("binding_id", "adapter_id", "adapter_version"):
+        expected = str(plan[key])
+        actual = str(revision[key])
+        if actual != expected:
+            raise ValueError(
+                f"run plan {key} {expected!r} conflicts with historical"
+                f" binding revision {actual!r}"
+            )
+    try:
+        config = json.loads(revision["config_json"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("pinned binding config_json is not valid JSON") from exc
+    if not isinstance(config, dict):
+        raise ValueError("pinned binding config is not an object")
+    return resolve_enumeration_contract(str(adapter_id), config)
+
+
 def create_run(
     conn: sqlite3.Connection,
     *,
@@ -150,6 +200,7 @@ def create_run(
         plan_ids: list[str] = []
         for plan in plans:
             plan_id = new_id("rsp")
+            contract = _resolve_plan_enumeration_contract(conn, plan)
             conn.execute(
                 """
                 INSERT INTO run_source_plans (
@@ -159,8 +210,12 @@ def create_run(
                     strategy, execution_class, cursor_schema_version,
                     crawl_policy_snapshot_json, rate_policy_snapshot_json,
                     auth_scope_id, permission_profile_id, permission_profile_revision,
-                    run_config_hash, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    run_config_hash, created_at,
+                    enumeration_contract_version, coverage_authority,
+                    coverage_scope_key, pagination_stability,
+                    listing_identity_sufficient)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?)
                 """,
                 (
                     plan_id,
@@ -186,6 +241,11 @@ def create_run(
                     int(plan["permission_profile_revision"]),
                     plan.get("run_config_hash"),
                     ts,
+                    int(contract.version),  # type: ignore[attr-defined]
+                    str(contract.coverage_authority),  # type: ignore[attr-defined]
+                    str(contract.scope_key),  # type: ignore[attr-defined]
+                    str(contract.pagination_stability),  # type: ignore[attr-defined]
+                    1 if contract.listing_identity_sufficient else 0,  # type: ignore[attr-defined]
                 ),
             )
             plan_ids.append(plan_id)

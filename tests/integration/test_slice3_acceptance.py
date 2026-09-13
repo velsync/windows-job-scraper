@@ -412,7 +412,9 @@ def test_slice3_restart_resume_vertical_is_deterministic(
         ).fetchone()
         assert coverage is not None
         assert coverage["completion_state"] == "COMPLETE"
-        assert coverage["coverage_authority"] == "AUTHORITATIVE_FULL_SOURCE"
+        # Corrective A2: default json_api_feed is conservative (no absence
+        # authority without explicit stable_full_source_enumeration review).
+        assert coverage["coverage_authority"] == "NO_ABSENCE_INFERENCE"
         assert coverage["terminal_enumeration_proven"] == 1
 
         assert [

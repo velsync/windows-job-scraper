@@ -370,8 +370,8 @@ def test_v15_does_not_precreate_s39_group_storage(tmp_path):
 
 def test_s311_v21_is_next_unused_sequential_and_pinned():
     versions = [version for version, _name, _sql in MIGRATION_STEPS]
-    assert versions == list(range(1, 22))
-    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 21
+    assert versions[:21] == list(range(1, 22))
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == max(versions)
     name, sql = _step(21)
     assert name == "s3_11_evaluation_input_order"
     assert _digest(sql) == "d340b7c34362b2b4b2d5b7fd6aaa229a2460a98bc81dc817a6c8ba26db2b2305"
@@ -419,6 +419,367 @@ def test_s311_v21_adds_only_evaluation_order_coordinates(tmp_path):
         assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         db.close()
+
+# --- Post-S3.13 Corrective A / v22 schema + cursor-ownership foundation ---
+
+CORRECTIVE_A_V22_STEP_SHA256 = (
+    "be8ff791204f9a1b2ba832bfa9bb9991bfc240ad9cd48b0fa875f6c940a9779b"
+)
+
+
+def test_post_s313_v22_is_next_unused_and_v1_v21_remain_frozen():
+    versions = [version for version, _name, _sql in MIGRATION_STEPS]
+    assert versions == list(range(1, 23))
+    assert SCHEMA_VERSION == LATEST_SCHEMA_VERSION == 22
+
+    # Every previously accepted migration remains byte-for-byte frozen.
+    for version, pinned in PROMOTED_STEP_SHA256.items():
+        assert _digest(_step(version)[1]) == pinned
+    assert _digest(_step(15)[1]) == S3_0_STEP_SHA256[15]
+    assert _digest(_step(16)[1]) == S3_5_STEP_SHA256[16]
+    assert _digest(_step(17)[1]) == S3_7_STEP_SHA256[17]
+    assert _digest(_step(18)[1]) == (
+        "6075470c2667d581472d8c47ef1baaa8e30fda87d05dbfe996c2c948d4e2c3cf"
+    )
+    assert _digest(_step(19)[1]) == (
+        "e7028ec8fd11ba751bfc3a3e0145d3f1df31f34bb257c38f6fa00979f671ff68"
+    )
+    assert _digest(_step(20)[1]) == (
+        "bd4c690eab18938604f49fd894c4b25c2cdda1a29f62d14d6c678f211faf6c9b"
+    )
+    assert _digest(_step(21)[1]) == (
+        "d340b7c34362b2b4b2d5b7fd6aaa229a2460a98bc81dc817a6c8ba26db2b2305"
+    )
+
+    name, sql = _step(22)
+    assert name == "post_s313_corrective_a_plan_scoped_cursor_foundation"
+    assert _digest(sql) == CORRECTIVE_A_V22_STEP_SHA256
+    assert "DROP INDEX idx_crawl_cursors_compatible_identity" in sql
+    assert "CREATE UNIQUE INDEX idx_crawl_cursors_plan_identity" in sql
+    assert "ADD COLUMN enumeration_contract_version" in sql
+    assert "ADD COLUMN coverage_authority" in sql
+    assert "ADD COLUMN coverage_scope_key" in sql
+    assert "ADD COLUMN pagination_stability" in sql
+    assert "ADD COLUMN listing_identity_sufficient" in sql
+    assert "ADD COLUMN resolved_job_id" in sql
+    assert "ADD COLUMN run_effect" in sql
+
+
+def test_v22_schema_reserves_plan_contract_and_run_effect_foundation(tmp_path):
+    db = Database(tmp_path / "corrective-a-v22-foundation.db")
+    try:
+        migrate_schema(db.conn, 21)
+        migrate_schema(db.conn, 22)
+
+        plan_columns = {
+            row[1]: row
+            for row in db.conn.execute("PRAGMA table_info(run_source_plans)")
+        }
+        assert {
+            "enumeration_contract_version",
+            "coverage_authority",
+            "coverage_scope_key",
+            "pagination_stability",
+            "listing_identity_sufficient",
+        } <= set(plan_columns)
+
+        observation_columns = {
+            row[1] for row in db.conn.execute("PRAGMA table_info(job_observations)")
+        }
+        assert {"resolved_job_id", "run_effect"} <= observation_columns
+
+        indexes = {
+            row[1]: row
+            for row in db.conn.execute("PRAGMA index_list(crawl_cursors)")
+        }
+        assert "idx_crawl_cursors_compatible_identity" not in indexes
+        assert indexes["idx_crawl_cursors_plan_identity"][2] == 1
+
+        observation_indexes = {
+            row[1] for row in db.conn.execute("PRAGMA index_list(job_observations)")
+        }
+        assert "idx_job_observations_run_effect" in observation_indexes
+        assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        db.close()
+
+
+def _seed_pre_v22_coverage(
+    conn: sqlite3.Connection,
+    *,
+    finalized: bool,
+) -> tuple[str, str, str]:
+    suffix = "final" if finalized else "open"
+    source_id = f"v22-src-{suffix}"
+    binding_id = f"v22-bnd-{suffix}"
+    binding_revision_id = f"v22-bndrev-{suffix}"
+    run_id = f"v22-run-{suffix}"
+    plan_id = f"v22-plan-{suffix}"
+    request_id = f"v22-req-{suffix}"
+    coverage_id = f"v22-cov-{suffix}"
+
+    conn.execute(
+        "INSERT INTO sources("
+        "id,display_name,source_family,entry_url,created_at,updated_at"
+        ") VALUES(?,?, 'CAREERS', ?, ?, ?)",
+        (
+            source_id,
+            f"v22 {suffix} source",
+            f"https://{suffix}.example.test/jobs",
+            NOW,
+            NOW,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO adapter_definitions("
+        "adapter_id,adapter_version,adapter_api_version,manifest_json,created_at"
+        ") VALUES(?,?,?,?,?)",
+        (f"v22-adapter-{suffix}", "1.0.0", "1", "{}", NOW),
+    )
+    conn.execute(
+        "INSERT INTO adapter_permission_profiles(id,display_name,created_at) "
+        "VALUES(?,?,?)",
+        (f"v22-perm-{suffix}", f"v22 {suffix} permission", NOW),
+    )
+    conn.execute(
+        "INSERT INTO adapter_permission_profile_revisions("
+        "id,permission_profile_id,revision,policy_json,created_at"
+        ") VALUES(?,?,?,?,?)",
+        (
+            f"v22-permrev-{suffix}",
+            f"v22-perm-{suffix}",
+            1,
+            "{}",
+            NOW,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO source_adapter_bindings("
+        "id,source_id,display_name,created_at"
+        ") VALUES(?,?,?,?)",
+        (binding_id, source_id, f"v22 {suffix} binding", NOW),
+    )
+    conn.execute(
+        "INSERT INTO source_adapter_binding_revisions("
+        "id,binding_id,revision,adapter_id,adapter_version,strategy,"
+        "execution_class,permission_profile_id,permission_profile_revision,"
+        "config_json,created_at"
+        ") VALUES(?,?,?,?,?,'HTTP_HTML','HTTP',?,?, '{}',?)",
+        (
+            binding_revision_id,
+            binding_id,
+            1,
+            f"v22-adapter-{suffix}",
+            "1.0.0",
+            f"v22-perm-{suffix}",
+            1,
+            NOW,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO scrape_runs(id,status,created_at,started_at) "
+        "VALUES(?, 'RUNNING', ?, ?)",
+        (run_id, NOW, NOW),
+    )
+    conn.execute(
+        "INSERT INTO run_source_plans("
+        "id,run_id,source_id,source_plan_group_id,fallback_rank,binding_id,"
+        "binding_revision_id,adapter_id,adapter_version,adapter_api_version,"
+        "strategy,execution_class,cursor_schema_version,"
+        "crawl_policy_snapshot_json,rate_policy_snapshot_json,"
+        "permission_profile_id,permission_profile_revision,created_at"
+        ") VALUES(?,?,?,?,0,?,?,?,?,?,'HTTP_HTML','HTTP',1,'{}','{}',?,?,?)",
+        (
+            plan_id,
+            run_id,
+            source_id,
+            f"v22-group-{suffix}",
+            binding_id,
+            binding_revision_id,
+            f"v22-adapter-{suffix}",
+            "1.0.0",
+            "1",
+            f"v22-perm-{suffix}",
+            1,
+            NOW,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO scrape_requests("
+        "id,run_id,run_source_plan_id,source_id,binding_id,request_type,"
+        "request_unique_key,payload_json,status,created_at,updated_at"
+        ") VALUES(?,?,?,?,?,'SOURCE_CRAWL',?,'{}','SUCCEEDED',?,?)",
+        (
+            request_id,
+            run_id,
+            plan_id,
+            source_id,
+            binding_id,
+            f"v22-request-key-{suffix}",
+            NOW,
+            NOW,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO enumeration_coverage("
+        "id,run_source_plan_id,source_plan_group_id,source_id,binding_id,"
+        "binding_revision_id,scope_key,generation_key,started_at,finished_at,"
+        "completion_state,coverage_authority,pages_completed,items_observed,"
+        "cursor_terminal,terminal_enumeration_proven,"
+        "contributing_request_count,absence_inference_allowed,finalized_at,"
+        "applied_at,created_at,listing_identity_sufficient,generation_order_key"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            coverage_id,
+            plan_id,
+            f"v22-group-{suffix}",
+            source_id,
+            binding_id,
+            binding_revision_id,
+            "FULL_SOURCE",
+            f"v22-generation-{suffix}",
+            NOW,
+            NOW if finalized else None,
+            "COMPLETE" if finalized else None,
+            "AUTHORITATIVE_FULL_SOURCE",
+            1,
+            1,
+            1 if finalized else 0,
+            1 if finalized else 0,
+            1,
+            1,
+            NOW if finalized else None,
+            NOW if finalized else None,
+            NOW,
+            1,
+            f"{NOW}|{coverage_id}",
+        ),
+    )
+    conn.execute(
+        "INSERT INTO coverage_contributing_request(coverage_id,request_id) "
+        "VALUES(?,?)",
+        (coverage_id, request_id),
+    )
+    conn.execute(
+        "INSERT INTO coverage_seen_identity("
+        "coverage_id,stable_source_identity,source_identity_generation,"
+        "observation_or_listing_evidence_ref"
+        ") VALUES(?,?,1,?)",
+        (coverage_id, f"native-{suffix}", f"listing:{suffix}"),
+    )
+    conn.commit()
+    return plan_id, request_id, coverage_id
+
+
+def test_v22_unfinished_pre_v22_coverage_loses_absence_authority(tmp_path):
+    assert LATEST_SCHEMA_VERSION >= 22
+    db = Database(tmp_path / "corrective-a-v22-open-coverage.db")
+    try:
+        migrate_schema(db.conn, 21)
+        plan_id, request_id, coverage_id = _seed_pre_v22_coverage(
+            db.conn,
+            finalized=False,
+        )
+
+        before = db.conn.execute(
+            "SELECT coverage_authority,absence_inference_allowed,finalized_at "
+            "FROM enumeration_coverage WHERE id=?",
+            (coverage_id,),
+        ).fetchone()
+        assert tuple(before) == ("AUTHORITATIVE_FULL_SOURCE", 1, None)
+
+        migrate_schema(db.conn, 22)
+
+        coverage = db.conn.execute(
+            "SELECT coverage_authority,absence_inference_allowed,finalized_at "
+            "FROM enumeration_coverage WHERE id=?",
+            (coverage_id,),
+        ).fetchone()
+        assert tuple(coverage) == ("NO_ABSENCE_INFERENCE", 0, None)
+
+        # Positive membership and request provenance survive the conservative
+        # authority downgrade exactly as required.
+        assert db.conn.execute(
+            "SELECT stable_source_identity FROM coverage_seen_identity "
+            "WHERE coverage_id=?",
+            (coverage_id,),
+        ).fetchone()[0] == "native-open"
+        assert db.conn.execute(
+            "SELECT request_id FROM coverage_contributing_request "
+            "WHERE coverage_id=?",
+            (coverage_id,),
+        ).fetchone()[0] == request_id
+
+        plan = db.conn.execute(
+            "SELECT enumeration_contract_version,coverage_authority,"
+            "coverage_scope_key,pagination_stability,"
+            "listing_identity_sufficient "
+            "FROM run_source_plans WHERE id=?",
+            (plan_id,),
+        ).fetchone()
+        assert tuple(plan) == (
+            1,
+            "NO_ABSENCE_INFERENCE",
+            "full-source",
+            "UNKNOWN",
+            0,
+        )
+        assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        db.close()
+
+
+def test_v22_finalized_pre_v22_coverage_remains_historical(tmp_path):
+    assert LATEST_SCHEMA_VERSION >= 22
+    db = Database(tmp_path / "corrective-a-v22-final-coverage.db")
+    try:
+        migrate_schema(db.conn, 21)
+        _plan_id, request_id, coverage_id = _seed_pre_v22_coverage(
+            db.conn,
+            finalized=True,
+        )
+
+        before = tuple(
+            db.conn.execute(
+                "SELECT completion_state,coverage_authority,"
+                "absence_inference_allowed,finalized_at,applied_at,"
+                "pages_completed,items_observed,cursor_terminal,"
+                "terminal_enumeration_proven "
+                "FROM enumeration_coverage WHERE id=?",
+                (coverage_id,),
+            ).fetchone()
+        )
+
+        migrate_schema(db.conn, 22)
+
+        after = tuple(
+            db.conn.execute(
+                "SELECT completion_state,coverage_authority,"
+                "absence_inference_allowed,finalized_at,applied_at,"
+                "pages_completed,items_observed,cursor_terminal,"
+                "terminal_enumeration_proven "
+                "FROM enumeration_coverage WHERE id=?",
+                (coverage_id,),
+            ).fetchone()
+        )
+        assert after == before
+        assert after[:3] == ("COMPLETE", "AUTHORITATIVE_FULL_SOURCE", 1)
+        assert db.conn.execute(
+            "SELECT stable_source_identity FROM coverage_seen_identity "
+            "WHERE coverage_id=?",
+            (coverage_id,),
+        ).fetchone()[0] == "native-final"
+        assert db.conn.execute(
+            "SELECT request_id FROM coverage_contributing_request "
+            "WHERE coverage_id=?",
+            (coverage_id,),
+        ).fetchone()[0] == request_id
+        assert db.conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        db.close()
+
+
+# --- end Post-S3.13 Corrective A / v22 foundation ---
 # --- S3.13 final promoted-v14 -> Slice-3 migration acceptance proof ---
 
 def test_s313_promoted_v14_migrates_to_latest_with_integrity_and_effective_pragmas(

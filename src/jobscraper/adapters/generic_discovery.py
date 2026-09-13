@@ -21,6 +21,7 @@ from jobscraper.adapters.contract import (
     AdapterTask,
     AdapterTaskKind,
     CrawlCursor,
+    EnumerationContract,
     validate_manifest,
 )
 
@@ -65,6 +66,16 @@ class GenericDiscoveryAdapter:
 
     manifest = MANIFEST
     listing_identity_sufficient = True
+
+    #: Pinned enumeration authority (Corrective A2): generic discovery never
+    #: carries absence authority.
+    enumeration_contract = EnumerationContract(
+        version=1,
+        coverage_authority="NO_ABSENCE_INFERENCE",
+        scope_key="full-source",
+        pagination_stability="UNKNOWN",
+        listing_identity_sufficient=True,
+    )
 
     def __init__(self, config: GenericDiscoveryConfig):
         self.config = config

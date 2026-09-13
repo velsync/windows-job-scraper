@@ -33,6 +33,7 @@ from jobscraper.adapters import registry as registry_module
 from jobscraper.adapters.contract import (
     AdapterTaskKind,
     CrawlCursor,
+    EnumerationContract,
     ObservationRecord,
     ParseOutcome,
     ParseOutcomeKind,
@@ -82,6 +83,16 @@ class _ProbeAdapter:
 
     manifest = _MANIFEST
     listing_identity_sufficient = True
+    # Corrective A2 test-only authoritative control: this adversarial fixture
+    # intentionally needs full-source authority so the test can prove PARTIAL
+    # removes it. Production unknown adapters never gain implicit authority.
+    enumeration_contract = EnumerationContract(
+        1,
+        "AUTHORITATIVE_FULL_SOURCE",
+        "full-source",
+        "STABLE_SNAPSHOT",
+        True,
+    )
 
     def __init__(self, config):
         self.config = config

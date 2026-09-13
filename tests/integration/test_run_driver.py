@@ -232,10 +232,12 @@ def test_driver_collects_two_pages_and_aggregates_success(db):
     assert len(requests) == 2
     assert all(r["status"] == "SUCCEEDED" for r in requests)
     assert [r["page_class"] for r in requests] == ["VALID_LIST", "EMPTY"]
-    # coverage COMPLETE + absence-authoritative
+    # coverage COMPLETE + conservative generic feed (Corrective A2: default
+    # json_api_feed carries NO_ABSENCE_INFERENCE; absence authority requires
+    # an explicit stable_full_source_enumeration review).
     cov = db.conn.execute("SELECT * FROM enumeration_coverage").fetchone()
     assert cov["completion_state"] == "COMPLETE"
-    assert cov["coverage_authority"] == "AUTHORITATIVE_FULL_SOURCE"
+    assert cov["coverage_authority"] == "NO_ABSENCE_INFERENCE"
     assert cov["items_observed"] >= 0
     # obligations drained: eligibility + scores exist for the profile
     elig = db.conn.execute("SELECT COUNT(*) FROM job_eligibility").fetchone()[0]

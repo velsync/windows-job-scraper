@@ -404,6 +404,107 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+# ------------------------------------------------- enumeration authority (A2)
+
+_COVERAGE_AUTHORITIES = frozenset(
+    {
+        "AUTHORITATIVE_FULL_SOURCE",
+        "AUTHORITATIVE_DECLARED_SCOPE",
+        "NON_AUTHORITATIVE_QUERY",
+        "DETAIL_ONLY",
+        "NO_ABSENCE_INFERENCE",
+    }
+)
+
+_PAGINATION_STABILITIES = frozenset(
+    {"SINGLE_RESPONSE", "STABLE_SNAPSHOT", "UNKNOWN"}
+)
+
+_AUTHORITATIVE_STABILITIES_REQUIRED = frozenset(
+    {"AUTHORITATIVE_FULL_SOURCE", "AUTHORITATIVE_DECLARED_SCOPE"}
+)
+
+
+@dataclass(frozen=True)
+class EnumerationContract:
+    """Immutable enumeration authority pinned into each RunSourcePlan (A2).
+
+    Resolved from the adapter/binding at run creation, then pinned into
+    ``run_source_plans``. The driver consumes these pins; it never
+    recalculates authority from live adapter attributes.
+    """
+
+    version: int
+    coverage_authority: str
+    scope_key: str
+    pagination_stability: str
+    listing_identity_sufficient: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.version, int)
+            or isinstance(self.version, bool)
+            or self.version < 1
+        ):
+            raise ValueError(f"invalid enumeration contract version: {self.version!r}")
+        if self.coverage_authority not in _COVERAGE_AUTHORITIES:
+            raise ValueError(
+                f"invalid coverage_authority: {self.coverage_authority!r}"
+            )
+        if not isinstance(self.scope_key, str) or not self.scope_key:
+            raise ValueError(f"invalid scope_key: {self.scope_key!r}")
+        if self.pagination_stability not in _PAGINATION_STABILITIES:
+            raise ValueError(
+                f"invalid pagination_stability: {self.pagination_stability!r}"
+            )
+        if (
+            self.coverage_authority in _AUTHORITATIVE_STABILITIES_REQUIRED
+            and self.pagination_stability == "UNKNOWN"
+        ):
+            raise ValueError(
+                f"authoritative {self.coverage_authority!r} requires"
+                " non-UNKNOWN pagination_stability"
+            )
+        if not isinstance(self.listing_identity_sufficient, bool):
+            raise ValueError(
+                "listing_identity_sufficient must be boolean, got"
+                f" {self.listing_identity_sufficient!r}"
+            )
+
+    @classmethod
+    def from_plan_row(cls, row) -> "EnumerationContract":
+        """Build the pinned contract from a ``run_source_plans`` row.
+
+        Accepts a database row or any mapping with the exact v22 column names.
+        Integer 0/1 durability bits become strict booleans.
+        """
+        try:
+            version = row["enumeration_contract_version"]
+            authority = row["coverage_authority"]
+            scope_key = row["coverage_scope_key"]
+            stability = row["pagination_stability"]
+            listing = row["listing_identity_sufficient"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"plan row is missing enumeration contract pins: {exc}") from exc
+        if isinstance(listing, bool):
+            listing_bool = listing
+        elif listing == 1:
+            listing_bool = True
+        elif listing == 0:
+            listing_bool = False
+        else:
+            raise ValueError(
+                f"invalid listing_identity_sufficient pin: {listing!r}"
+            )
+        return cls(
+            version=int(version),
+            coverage_authority=str(authority),
+            scope_key=str(scope_key),
+            pagination_stability=str(stability),
+            listing_identity_sufficient=listing_bool,
+        )
+
+
 __all__ = [
     "ACQ02_REQUEST_TASK_MAP",
     "CONTRACT_VERSION",
@@ -416,6 +517,7 @@ __all__ = [
     "CONTRACT_VERSION",
     "CrawlCursor",
     "DiscoveredTask",
+    "EnumerationContract",
     "FieldEvidenceRecord",
     "ObservationRecord",
     "PageSignature",

@@ -1966,6 +1966,66 @@ ALTER TABLE job_scores
 ) -> None:
     return sql
 
+# -------- Post-S3.13 Corrective A: plan-scoped cursor + v22 schema foundation
+@_step(22, "post_s313_corrective_a_plan_scoped_cursor_foundation")
+def _(sql: str = '''
+-- Post-S3.13 Corrective A: exact-RunSourcePlan cursor ownership and the
+-- complete v22 schema foundation reserved for A1-A5. v1-v21 remain frozen.
+
+DROP INDEX idx_crawl_cursors_compatible_identity;
+
+CREATE UNIQUE INDEX idx_crawl_cursors_plan_identity
+    ON crawl_cursors(
+        checkpoint_run_source_plan_id,
+        adapter_id,
+        adapter_version,
+        cursor_schema_version
+    )
+    WHERE checkpoint_run_source_plan_id IS NOT NULL;
+
+ALTER TABLE run_source_plans
+    ADD COLUMN enumeration_contract_version INTEGER NOT NULL DEFAULT 1
+    CHECK (enumeration_contract_version >= 1);
+ALTER TABLE run_source_plans
+    ADD COLUMN coverage_authority TEXT NOT NULL DEFAULT 'NO_ABSENCE_INFERENCE'
+    CHECK (coverage_authority IN (
+        'AUTHORITATIVE_FULL_SOURCE', 'AUTHORITATIVE_DECLARED_SCOPE',
+        'NON_AUTHORITATIVE_QUERY', 'DETAIL_ONLY', 'NO_ABSENCE_INFERENCE'
+    ));
+ALTER TABLE run_source_plans
+    ADD COLUMN coverage_scope_key TEXT NOT NULL DEFAULT 'full-source';
+ALTER TABLE run_source_plans
+    ADD COLUMN pagination_stability TEXT NOT NULL DEFAULT 'UNKNOWN'
+    CHECK (pagination_stability IN (
+        'SINGLE_RESPONSE', 'STABLE_SNAPSHOT', 'UNKNOWN'
+    ));
+ALTER TABLE run_source_plans
+    ADD COLUMN listing_identity_sufficient INTEGER NOT NULL DEFAULT 0
+    CHECK (listing_identity_sufficient IN (0, 1));
+
+ALTER TABLE job_observations
+    ADD COLUMN resolved_job_id TEXT REFERENCES jobs(id);
+ALTER TABLE job_observations
+    ADD COLUMN run_effect TEXT
+    CHECK (run_effect IS NULL OR run_effect IN (
+        'NEW_JOB', 'UPDATED_JOB', 'UNCHANGED_JOB', 'STALE_IGNORED'
+    ));
+CREATE INDEX idx_job_observations_run_effect
+    ON job_observations(run_id, run_effect, resolved_job_id);
+
+-- Pre-v22 unfinished generations may have been opened under the old
+-- unconditional full-source assumption. Keep their positive membership and
+-- contributing-request evidence, but strip disappearance authority. Finalized
+-- historical generations are intentionally untouched.
+UPDATE enumeration_coverage
+   SET absence_inference_allowed = 0,
+       coverage_authority = 'NO_ABSENCE_INFERENCE'
+ WHERE finalized_at IS NULL;
+'''
+) -> None:
+    return sql
+
+
 def _finalize() -> None:
     global MIGRATION_STEPS
     MIGRATION_STEPS = sorted((version, *_STEP[version]) for version in _STEP)
@@ -1980,6 +2040,6 @@ REBUILD_STEPS: frozenset[int] = frozenset({10, 16})
 
 LATEST_SCHEMA_VERSION = MIGRATION_STEPS[-1][0] if MIGRATION_STEPS else 0
 
-assert LATEST_SCHEMA_VERSION == 21, (
-    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18; S3.9 appends v19; S3.10 appends v20; S3.11 appends v21"
+assert LATEST_SCHEMA_VERSION == 22, (
+    "Slice 1 ships versions 1-10; Slice 2 appends v11-v14; S3.0 appends v15; S3.5 appends v16; S3.7 appends v17; S3.8 appends v18; S3.9 appends v19; S3.10 appends v20; S3.11 appends v21; Post-S3.13 Corrective A appends v22"
 )

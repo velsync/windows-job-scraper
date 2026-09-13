@@ -460,7 +460,9 @@ class TestVerticalPath:
         assert _count(state, "SELECT COUNT(*) FROM parse_attempts") == 2
         coverage = db.execute("SELECT * FROM enumeration_coverage").fetchone()
         assert coverage["completion_state"] == "COMPLETE"
-        assert coverage["coverage_authority"] == "AUTHORITATIVE_FULL_SOURCE"
+        # Corrective A2: default json_api_feed is conservative (no absence
+        # authority without explicit stable_full_source_enumeration review).
+        assert coverage["coverage_authority"] == "NO_ABSENCE_INFERENCE"
         assert _count(state, "SELECT COUNT(*) FROM job_eligibility") == 2
         assert _count(state, "SELECT COUNT(*) FROM job_scores") == 2
         assert (
