@@ -5,13 +5,16 @@ request-authentication, session + CSRF-equivalent checks, bounded JSON
 bodies (04 §5). Private reads also require an authenticated session;
 only the non-sensitive liveness endpoint stays public.
 
-Runs execute synchronously and bounded (single-user local product; the
-driver's stop policy caps pages/requests). The driver never holds a DB
-transaction across network waits (03 §50).
+Runs remain bounded and the HTTP request still waits for terminal run truth,
+but execution is dispatched to one service-owned worker thread with its own
+SQLite connection. This keeps the FastAPI event loop responsive to durable
+cancellation while preserving a single active run execution. The driver never
+holds a DB transaction across network waits (03 §50).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from fastapi import HTTPException, Request
@@ -25,6 +28,7 @@ from jobscraper.applications.core import (
     list_applications,
     update_application,
 )
+from jobscraper.db.connection import connect_db
 from jobscraper.inbox.events import inbox_feed
 from jobscraper.inbox.state import DispositionConflict, set_disposition
 from jobscraper.net.safelinks import safe_external_url
@@ -67,6 +71,30 @@ def install_slice1_routes(app, state) -> None:
 
     def conn():
         return state.db.conn
+
+    # Preserve the product's effective one-run-at-a-time execution model while
+    # keeping the FastAPI event loop free for cancellation and other control
+    # requests. The worker owns a separate SQLite connection so the cancel
+    # route never concurrently uses the same sqlite3.Connection object.
+    run_execution_lock = asyncio.Lock()
+
+    def _execute_run_worker(run_id: str):
+        worker_conn = connect_db(
+            state.db.path,
+            busy_timeout_ms=state.db.busy_timeout_ms,
+        )
+        try:
+            return execute_run(
+                worker_conn,
+                run_id,
+                guard=state.clock_guard,
+            )
+        finally:
+            worker_conn.close()
+
+    async def _execute_run_off_loop(run_id: str):
+        async with run_execution_lock:
+            return await asyncio.to_thread(_execute_run_worker, run_id)
 
     def require_session(request: Request):
         session = state.validate_session(request)
@@ -199,7 +227,7 @@ def install_slice1_routes(app, state) -> None:
             )
         # Production claims run through the service-lifetime clock guard
         # (§50): anomaly detection cannot be bypassed on the run path.
-        status = execute_run(conn(), run_id, guard=state.clock_guard)
+        status = await _execute_run_off_loop(run_id)
         counts = conn().execute(
             "SELECT jobs_saved, jobs_updated, requests_total, requests_failed"
             " FROM scrape_runs WHERE id = ?",
