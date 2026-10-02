@@ -661,6 +661,61 @@ def _relevant_open_work(conn: sqlite3.Connection, run_id: str, *, now: str) -> i
     )
 
 
+def rebuild_run_counters(
+    conn: sqlite3.Connection, run_id: str, *, commit: bool = True
+) -> None:
+    """Rebuild run accounting from durable requests and semantic effects.
+
+    Terminal aggregation calls this inside its existing transaction so a run
+    cannot commit terminal status with counters older than its durable work.
+    Other callers may request the historical eager refresh with commit=True.
+
+    Historical migration tests may exercise runtime finalization against
+    pre-v22 schemas. Those schemas predate durable run_effect/resolved_job_id,
+    so they retain their original aggregation behavior.
+    """
+    observation_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(job_observations)").fetchall()
+    }
+    if not {"resolved_job_id", "run_effect"}.issubset(observation_columns):
+        return
+
+    conn.execute(
+        """
+        UPDATE scrape_runs SET
+            jobs_discovered = (SELECT COUNT(*) FROM job_observations WHERE run_id = ?),
+            jobs_saved = (
+                SELECT COUNT(DISTINCT resolved_job_id) FROM job_observations
+                WHERE run_id = ?
+                  AND run_effect = 'NEW_JOB'
+                  AND resolved_job_id IS NOT NULL
+            ),
+            jobs_updated = (
+                SELECT COUNT(DISTINCT o.resolved_job_id)
+                FROM job_observations o
+                WHERE o.run_id = ?
+                  AND o.run_effect = 'UPDATED_JOB'
+                  AND o.resolved_job_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM job_observations n
+                      WHERE n.run_id = o.run_id
+                        AND n.resolved_job_id = o.resolved_job_id
+                        AND n.run_effect = 'NEW_JOB'
+                  )
+            ),
+            requests_total = (SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?),
+            requests_failed = (SELECT COUNT(*) FROM scrape_requests
+                               WHERE run_id = ? AND status = 'FAILED')
+        WHERE id = ?
+        """,
+        (run_id, run_id, run_id, run_id, run_id, run_id),
+    )
+    if commit:
+        conn.commit()
+
+
 def aggregate_run(
     conn: sqlite3.Connection, run_id: str, *, now: str | None = None
 ) -> str | None:
@@ -722,6 +777,7 @@ def aggregate_run(
             conn.execute("COMMIT")
             return None
 
+        rebuild_run_counters(conn, run_id, commit=False)
         conn.execute(
             "UPDATE scrape_runs SET status = ?, finished_at = COALESCE(finished_at, ?)"
             " WHERE id = ?",
@@ -742,6 +798,7 @@ __all__ = [
     "TERMINAL_GROUP_OUTCOMES",
     "active_plan_sql_predicate",
     "aggregate_run",
+    "rebuild_run_counters",
     "cancel_open_groups",
     "create_run",
     "mark_run_started",

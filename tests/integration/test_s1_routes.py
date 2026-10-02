@@ -284,9 +284,11 @@ def test_run_cancel_finalizes_interrupted_run(service):
     assert response.status_code == 200
     assert response.json()["status"] == "CANCELLED"
     run = conn.execute(
-        "SELECT status FROM scrape_runs WHERE id = ?", (run_id,)
+        "SELECT status, requests_total, requests_failed FROM scrape_runs WHERE id = ?",
+        (run_id,),
     ).fetchone()
     assert run["status"] == "CANCELLED"
+    assert (run["requests_total"], run["requests_failed"]) == (1, 0)
     requests = conn.execute(
         "SELECT status FROM scrape_requests WHERE run_id = ?", (run_id,)
     ).fetchall()

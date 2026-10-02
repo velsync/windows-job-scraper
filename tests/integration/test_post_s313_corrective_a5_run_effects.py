@@ -17,7 +17,6 @@ from jobscraper.adapters.contract import FieldEvidenceRecord, ObservationRecord
 from jobscraper.db.connection import Database
 from jobscraper.db.migrations import LATEST_SCHEMA_VERSION, migrate_schema
 from jobscraper.pipeline.canonical import refresh_canonical_presentation
-from jobscraper.pipeline.driver import _update_run_counters
 from jobscraper.pipeline.ingest import (
     ObservationEffectIntegrityError,
     _bind_observation_effect,
@@ -27,7 +26,12 @@ from jobscraper.pipeline.normalize import normalize_observation
 from jobscraper.runtime.claims import claim_next_request
 from jobscraper.runtime.fence import fenced_commit
 from jobscraper.runtime.requests import enqueue_request
-from jobscraper.runtime.runs import create_run
+from jobscraper.runtime.runs import (
+    create_run,
+    mark_run_started,
+    rebuild_run_counters,
+    set_group_outcome,
+)
 
 NOW = "2026-09-08T09:00:00.000000Z"
 LATER = "2026-09-08T10:00:00.000000Z"
@@ -167,7 +171,7 @@ def _ingest(db, observation, request_id, attempt_id, now=NOW, observed_at=None,
 
 
 def _counters(db, run_id):
-    _update_run_counters(db.conn, run_id)
+    rebuild_run_counters(db.conn, run_id)
     return db.conn.execute("SELECT * FROM scrape_runs WHERE id = ?", (run_id,)).fetchone()
 
 
@@ -180,6 +184,59 @@ def _effects(db, run_id):
             (run_id,),
         ).fetchall()
     }
+
+
+# ----------------------------------------------------- A5 closure regression
+
+def test_startup_recovery_rebuilds_counters_before_terminalizing_crash_window(db):
+    """Durable effects survive a crash before the driver's counter refresh."""
+    from jobscraper.runtime.clock import begin_service_epoch
+    from jobscraper.runtime.recovery import recover_startup_state
+
+    run_id, plan_id = _new_run(db, now=NOW)
+    mark_run_started(db.conn, run_id, now=NOW)
+
+    request_id, attempt_id = _new_request(db, run_id, plan_id, now=NOW)
+    result = _ingest(
+        db, _obs(), request_id, attempt_id, now=NOW, observed_at=NOW
+    )
+    assert result["run_effect"] == "NEW_JOB"
+    set_group_outcome(db.conn, plan_id, "SATISFIED", now=NOW)
+
+    durable_request_counts = db.conn.execute(
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed "
+        "FROM scrape_requests WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    expected_requests_total = int(durable_request_counts["total"])
+    expected_requests_failed = int(durable_request_counts["failed"] or 0)
+    assert expected_requests_total > 0
+
+    before = db.conn.execute(
+        "SELECT status, jobs_discovered, jobs_saved, jobs_updated, "
+        "requests_total, requests_failed FROM scrape_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    assert tuple(before) == ("RUNNING", 0, 0, 0, 0, 0)
+
+    begin_service_epoch(db.conn, now=LATER)
+    report = recover_startup_state(db.conn, now=LATER)
+    assert {"run_id": run_id, "status": "SUCCEEDED"} in report["reaggregated_terminal_runs"]
+
+    after = db.conn.execute(
+        "SELECT status, jobs_discovered, jobs_saved, jobs_updated, "
+        "requests_total, requests_failed FROM scrape_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    assert tuple(after) == (
+        "SUCCEEDED",
+        1,
+        1,
+        0,
+        expected_requests_total,
+        expected_requests_failed,
+    )
 
 
 # ---------------------------------------------------------------- locked A5

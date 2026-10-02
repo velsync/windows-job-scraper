@@ -154,6 +154,7 @@ from jobscraper.runtime.requests import (
 from jobscraper.runtime.runs import (
     TERMINAL_GROUP_OUTCOMES,
     aggregate_run,
+    rebuild_run_counters,
     mark_run_started,
     plan_actionable_open_work,
     plan_is_active,
@@ -278,49 +279,9 @@ def execute_run(
     # Host-native obligations drain before the run finalizes (a run must
     # not report finished while accepted observations are unprocessed).
     drain_all_obligations(conn, now=now)
-    _update_run_counters(conn, run_id)
+    rebuild_run_counters(conn, run_id)
     return aggregate_run(conn, run_id, now=ts)
 
-
-def _update_run_counters(conn: sqlite3.Connection, run_id: str) -> None:
-    """Honest run accounting derived from durable semantic effects (§16.1).
-
-    Post-S3.13 Corrective A5: saved/updated count distinct canonical jobs by
-    their immutable per-observation ``run_effect``. A job created and later
-    updated in the same run counts as saved, never double-counted.
-    """
-    conn.execute(
-        """
-        UPDATE scrape_runs SET
-            jobs_discovered = (SELECT COUNT(*) FROM job_observations WHERE run_id = ?),
-            jobs_saved = (
-                SELECT COUNT(DISTINCT resolved_job_id) FROM job_observations
-                WHERE run_id = ?
-                  AND run_effect = 'NEW_JOB'
-                  AND resolved_job_id IS NOT NULL
-            ),
-            jobs_updated = (
-                SELECT COUNT(DISTINCT o.resolved_job_id)
-                FROM job_observations o
-                WHERE o.run_id = ?
-                  AND o.run_effect = 'UPDATED_JOB'
-                  AND o.resolved_job_id IS NOT NULL
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM job_observations n
-                      WHERE n.run_id = o.run_id
-                        AND n.resolved_job_id = o.resolved_job_id
-                        AND n.run_effect = 'NEW_JOB'
-                  )
-            ),
-            requests_total = (SELECT COUNT(*) FROM scrape_requests WHERE run_id = ?),
-            requests_failed = (SELECT COUNT(*) FROM scrape_requests
-                               WHERE run_id = ? AND status = 'FAILED')
-        WHERE id = ?
-        """,
-        (run_id, run_id, run_id, run_id, run_id, run_id),
-    )
-    conn.commit()
 
 
 def _claim_target_reference(claim) -> str | None:
